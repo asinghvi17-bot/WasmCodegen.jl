@@ -224,6 +224,14 @@ function replacement_targets(codeinfos::Vector{Any}, replacement::Replacements)
     return targets
 end
 
+# whether `mi` is `Runtime.map_type_value`, whose calls the code generator compiles to a table
+# of its function's values, computed natively when it builds the module (`overlays.jl`): its
+# body runs natively only
+function compile_time_instance(mi::Core.MethodInstance)
+    m = mi.def
+    return m isa Method && m.module === Runtime && m.name === :map_type_value
+end
+
 # whether `mi` is `Runtime.original` (or its keyword body), which only the native bodies of
 # replaced methods call, or a method of `Runtime.WASM_METHODS`: neither runs in the module
 # unless the module's code reaches it
@@ -261,6 +269,10 @@ function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodI
             ci = get(src, mi, nothing)
             ci === nothing && continue
             for callee in invoked_instances(ci)
+                if !native && compile_time_instance(callee)
+                    push!(replaced, callee)
+                    continue
+                end
                 r = native ? nothing : replacement(callee)
                 r === nothing ? push!(work, callee) : (push!(replaced, callee); push!(work, r))
             end
@@ -298,7 +310,8 @@ function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.Method
         d isa TV.CallMissing || return true
         mi = CC.get_ci_mi(d.codeinst)
         return !(mi in native_only ||
-                 ((only_if_reached(mi) || replacement(mi) !== nothing) && !(mi in compiled)))
+                 ((only_if_reached(mi) || compile_time_instance(mi) || replacement(mi) !== nothing) &&
+                  !(mi in compiled)))
     end
     # (the rest as `verify_typeinf_trim`)
     counts = [0, 0]
