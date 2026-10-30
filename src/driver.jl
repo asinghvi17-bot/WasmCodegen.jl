@@ -54,6 +54,13 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
         config.host === :wasi && e.name in WASI_EXPORTS &&
             throw(ArgumentError("the entry point $(e.f) is exported as \"$(e.name)\", a name WASI reserves: give it another (`Entry(f, argtypes; name)`)"))
     end
+    if config.abi_version !== nothing
+        name = first(config.abi_version)
+        config.host === :wasi && name in WASI_EXPORTS &&
+            throw(ArgumentError("Config(abi_version): \"$name\" is a name WASI reserves"))
+        any(e -> e.name == name, entries) &&
+            throw(ArgumentError("Config(abi_version): \"$name\" is the export of an entry point"))
+    end
     # (the module's gensyms continue the build process's: none repeats one the image holds)
     Runtime.sync_gensym_counter!()
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
@@ -72,19 +79,19 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
         rethrow()
     end
     failure = run_restores(restores)
-    failure === nothing || throw(failure)
+    failure === nothing || throw(something(failure))
     return result
 end
 
 # call every restore of the pre-image hooks, in reverse order, also when one fails: the first
-# failure (each is reported), or nothing
+# failure (`Some` of what it threw; each is reported), or nothing
 function run_restores(restores::Vector{Any})
     failure = nothing
     for r in Iterators.reverse(restores)
         try
             Base.invokelatest(r)
         catch e
-            failure === nothing && (failure = e)
+            failure === nothing && (failure = Some{Any}(e))
             @error "a restore of Config(pre_image_hooks) failed" exception=(e, catch_backtrace())
         end
     end

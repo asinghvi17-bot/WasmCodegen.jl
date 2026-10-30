@@ -1,10 +1,28 @@
 # The abstract interpreter that infers code for Wasm: Julia's native inference, with its own
-# code cache. There is no overlay method table: what Wasm needs replaced is replaced by
-# method definitions in a newer world (`patches.jl`), as juliac does, so inference (and its
-# concrete evaluation) is the native one.
+# code cache. What Wasm needs replaced is mostly replaced by method definitions in a newer
+# world (`patches.jl`), as juliac does, so inference (and its concrete evaluation) is the
+# native one. The methods of `Runtime.WASM_METHODS` (an overlay method table, `methods.jl`)
+# replace those whose native method the build process needs itself (`WasmMethodTable`).
 
-"The owner of the CodeInstances inferred for Wasm in Julia's code cache."
-struct WasmCacheOwner end
+"""
+The owner of the CodeInstances inferred for Wasm in Julia's code cache, for the methods of
+`Runtime.WASM_METHODS` as they are: how many were defined, and how many are in force. Code
+inferred before one was defined or deleted is not reused, since that does not invalidate it
+(a caller that found the native method has no backedge to the overlay method table).
+"""
+struct WasmCacheOwner
+    defined::Int
+    in_force::Int
+end
+
+function WasmCacheOwner()
+    defined = in_force = 0
+    Base.visit(Runtime.WASM_METHODS) do m
+        defined += 1
+        m.dispatch_status == 0 || (in_force += 1)
+    end
+    return WasmCacheOwner(defined, in_force)
+end
 
 """
     CodegenSources
@@ -16,14 +34,15 @@ native code, `CC.ci_has_source` accepts a cached CodeInstance by its `inferred` 
 without putting its source here, which `CC.compile!` requires.)
 """
 struct CodegenSources <: AbstractDict{Core.CodeInstance,Core.CodeInfo}
+    owner::WasmCacheOwner
     dict::IdDict{Core.CodeInstance,Core.CodeInfo}
 end
-CodegenSources() = CodegenSources(IdDict{Core.CodeInstance,Core.CodeInfo}())
+CodegenSources(owner::WasmCacheOwner) = CodegenSources(owner, IdDict{Core.CodeInstance,Core.CodeInfo}())
 
 function cached_source(d::CodegenSources, ci::Core.CodeInstance)
     src = get(d.dict, ci, nothing)
     src === nothing || return src
-    ci.owner === WasmCacheOwner() || return nothing
+    ci.owner === d.owner || return nothing
     inf = @atomic :monotonic ci.inferred
     inf isa String && (inf = CC._uncompressed_ir(ci, inf))
     inf isa Core.CodeInfo || return nothing
@@ -41,13 +60,32 @@ Base.length(d::CodegenSources) = length(d.dict)
 Base.iterate(d::CodegenSources, s...) = iterate(d.dict, s...)
 
 """
+    WasmMethodTable(world)
+
+The methods of `world`, with those of `Runtime.WASM_METHODS` in place of the native ones they
+replace (an overlay method table), reported as not overlaid: inference evaluates calls at
+compile time with the native methods, as for native code. (Compiler does not evaluate code
+an overlay method table could reach, which includes every dynamic call, so reflection code
+evaluated at compile time would no longer be.) That is sound because no method of
+`WASM_METHODS` is more `:consistent` than the native one it replaces (see `@wasm_method`).
+"""
+struct WasmMethodTable <: CC.MethodTableView
+    table::CC.OverlayMethodTable
+end
+WasmMethodTable(world::UInt) = WasmMethodTable(CC.OverlayMethodTable(world, Runtime.WASM_METHODS))
+CC.findall(@nospecialize(sig::Type), t::WasmMethodTable; limit::Int=-1) = CC.findall(sig, t.table; limit)
+CC.findsup(@nospecialize(sig::Type), t::WasmMethodTable) = CC.findsup(sig, t.table)
+CC.isoverlayed(::WasmMethodTable) = false
+
+"""
     WasmInterpreter(; world)
 
-Julia's native inference and optimization in `world`, with its own code cache.
+Julia's native inference and optimization in `world`, with its own code cache and the
+methods of `Runtime.WASM_METHODS`.
 """
 struct WasmInterpreter <: CC.AbstractInterpreter
     world::UInt
-    method_table::CC.CachedMethodTable{CC.InternalMethodTable}
+    method_table::CC.CachedMethodTable{WasmMethodTable}
     inf_cache::Vector{CC.InferenceResult}
     inf_params::CC.InferenceParams
     opt_params::CC.OptimizationParams
@@ -56,7 +94,7 @@ struct WasmInterpreter <: CC.AbstractInterpreter
 end
 
 function WasmInterpreter(; world::UInt=Base.get_world_counter())
-    mt = CC.CachedMethodTable(CC.InternalMethodTable(world))
+    mt = CC.CachedMethodTable(WasmMethodTable(world))
     inf_params = CC.InferenceParams(; force_enable_inference=true)
     # calls target the method instance of their argument types, not the signature native
     # code would be compiled for, which widens arguments of type Function, Type and Vararg
@@ -64,7 +102,7 @@ function WasmInterpreter(; world::UInt=Base.get_world_counter())
     # `down::Function`): a closed world has no dynamic dispatch to fall back on
     opt_params = CC.OptimizationParams(; compilesig_invokes=false)
     return WasmInterpreter(world, mt, CC.InferenceResult[], inf_params, opt_params,
-                           CodegenSources())
+                           CodegenSources(WasmCacheOwner()))
 end
 
 CC.InferenceParams(interp::WasmInterpreter) = interp.inf_params
@@ -72,7 +110,7 @@ CC.OptimizationParams(interp::WasmInterpreter) = interp.opt_params
 CC.get_inference_world(interp::WasmInterpreter) = interp.world
 CC.get_inference_cache(interp::WasmInterpreter) = interp.inf_cache
 CC.method_table(interp::WasmInterpreter) = interp.method_table
-CC.cache_owner(::WasmInterpreter) = WasmCacheOwner()
+CC.cache_owner(interp::WasmInterpreter) = interp.codegen.owner
 CC.codegen_cache(interp::WasmInterpreter) = interp.codegen
 CC.may_discard_trees(::WasmInterpreter) = false
 

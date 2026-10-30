@@ -21,12 +21,13 @@ end
 """
     entry_instance(f, argtypes; world) -> MethodInstance
 
-The method instance a call of `f` with arguments of types `argtypes` dispatches to.
+The method instance a call of `f` with arguments of types `argtypes` dispatches to in the
+module (a method of `Runtime.WASM_METHODS` where it has one).
 """
 function entry_instance(@nospecialize(f), @nospecialize(argtypes::Tuple);
                         world::UInt=Base.get_world_counter())
     tt = Tuple{Core.Typeof(f),argtypes...}
-    matches = CC.findall(tt, CC.InternalMethodTable(world); limit=1)
+    matches = CC.findall(tt, WasmMethodTable(world); limit=1)
     (matches === nothing || length(matches) != 1) &&
         error("no unique method for $tt")
     match = CC.getindex(matches, 1)::Core.MethodMatch
@@ -89,10 +90,14 @@ types, stay unresolved invokes.)
 function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_world_counter(),
                     onlywarn::Bool=false)
     args = VERSION >= v"1.13-" ? (CC.TRIM_UNSAFE, false) : (CC.TRIM_UNSAFE,)
+    replacement = Replacements(world)
     roots = Any[entries...]
     codeinfos = CC.typeinf_ext_toplevel(copy(roots), UInt[world], args...)
     for _ in 1:MAX_INVOKE_ROUNDS
-        targets = filter(mi -> !(mi in roots), uncompiled_invoke_targets(codeinfos))
+        # (and the methods of `Runtime.WASM_METHODS` the module compiles in place of the
+        # native ones called, verified as entries)
+        targets = filter(mi -> !(mi in roots),
+                         [uncompiled_invoke_targets(codeinfos); replacement_targets(codeinfos, replacement)])
         isempty(targets) && break
         append!(roots, targets)
         codeinfos = CC.typeinf_ext_toplevel(copy(roots), UInt[world], args...)
@@ -101,7 +106,7 @@ function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_w
     io = IOBuffer()
     try
         redirect_stdout(devnull) do
-            verify_trim(io, codeinfos, entries, onlywarn)
+            verify_trim(io, codeinfos, entries, replacement, onlywarn)
         end
     catch err
         err isa Core.TrimFailure || rethrow()
@@ -166,80 +171,134 @@ function link_invoke_targets!(codeinfos::Vector{Any})
     return codeinfos
 end
 
-# whether `mi` is a method of a runtime twin (`Runtime.WASM_IMPLS`), whose calls the code
-# generator replaces by calls of its Wasm implementation (`overlays.jl`)
-function twin_instance(mi::Core.MethodInstance)
-    F = mi.specTypes isa DataType ? mi.specTypes.parameters[1] : nothing
-    return F isa DataType && Base.issingletontype(F) && haskey(Runtime.WASM_IMPLS, F.instance)
+"""
+    Replacements(world)
+
+The methods of `Runtime.WASM_METHODS` that the module compiles in place of native method
+instances (by `r(mi)`: the instance of the replacement, or `nothing`), looked up once each.
+"""
+struct Replacements
+    world::UInt
+    found::IdDict{Core.MethodInstance,Union{Nothing,Core.MethodInstance}}
+end
+Replacements(world::UInt) = Replacements(world, IdDict{Core.MethodInstance,Union{Nothing,Core.MethodInstance}}())
+
+function (r::Replacements)(mi::Core.MethodInstance)
+    get!(r.found, mi) do
+        m = mi.def
+        m isa Method && !isdefined(m, :external_mt) || return nothing
+        # (only the method a call of these types dispatches to is replaced: a less specific one
+        # reached by `invoke` is compiled as it is)
+        native = CC.findsup(mi.specTypes, CC.InternalMethodTable(r.world))[1]
+        native isa Core.MethodMatch && native.method === m || return nothing
+        match = CC.findsup(mi.specTypes, WasmMethodTable(r.world))[1]
+        match isa Core.MethodMatch && isdefined(match.method, :external_mt) &&
+            match.method.external_mt === Runtime.WASM_METHODS || return nothing
+        return CC.specialize_method(match)
+    end
 end
 
-# whether `mi` is a twin's native body or `Twins.original` (or its keyword body), which only
-# those call
-function twin_body(mi::Core.MethodInstance)
+# the callees of the `:invoke`s of `src`
+function invoked_instances(src::Core.CodeInfo)
+    callees = Core.MethodInstance[]
+    for st in src.code
+        Meta.isexpr(st, :(=)) && (st = st.args[2])
+        Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify) || continue
+        t = st.args[1]
+        callee = t isa Core.CodeInstance ? CC.get_ci_mi(t) : t
+        callee isa Core.MethodInstance && push!(callees, callee)
+    end
+    return callees
+end
+
+# the replacements of the native method instances `codeinfos` invoke
+function replacement_targets(codeinfos::Vector{Any}, replacement::Replacements)
+    targets = Core.MethodInstance[]
+    for i in 1:length(codeinfos)
+        codeinfos[i] isa Core.CodeInstance || continue
+        for callee in invoked_instances(codeinfos[i + 1]::Core.CodeInfo)
+            r = replacement(callee)
+            r === nothing || r in targets || push!(targets, r)
+        end
+    end
+    return targets
+end
+
+# whether `mi` is `Runtime.original` (or its keyword body), which only the native bodies of
+# replaced methods call, or a method of `Runtime.WASM_METHODS`: neither runs in the module
+# unless the module's code reaches it
+function only_if_reached(mi::Core.MethodInstance)
     m = mi.def
-    m isa Method && m.module === Runtime.Twins &&
-        (m.name === :original || startswith(String(m.name), "#original#")) && return true
-    return twin_instance(mi)
+    m isa Method || return false
+    isdefined(m, :external_mt) && m.external_mt === Runtime.WASM_METHODS && return true
+    return m.module === Runtime && (m.name === :original || startswith(String(m.name), "#original#"))
 end
 
 """
-    compiled_instances(codeinfos, entries) -> (compiled, native_only)
+    compiled_instances(codeinfos, entries, replacement) -> (compiled, native_only)
 
 The method instances of `codeinfos` (native inference's) that the module compiles: those the
-entries reach through `:invoke`s, not entering the calls of runtime twins, which the code
-generator replaces; and those reached only through twins' native bodies (`native_only`).
+entries reach through `:invoke`s, where a call of a native method that a method of
+`Runtime.WASM_METHODS` replaces reaches the replacement instead; and those reached only
+through such native methods (`native_only`).
 """
-function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance})
+function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance},
+                            replacement::Replacements)
     src = IdDict{Core.MethodInstance,Core.CodeInfo}()
     for i in 1:length(codeinfos)
         item = codeinfos[i]
         item isa Core.CodeInstance && (src[CC.get_ci_mi(item)] = codeinfos[i + 1]::Core.CodeInfo)
     end
-    # the instances reached from `roots`, not entering twins (whose callees are `twins`)
-    function reach(roots, twins)
+    # the instances reached from `from`; unless `native`, a replaced one is pushed to
+    # `replaced`, and its replacement reached instead
+    function reach(from, replaced, native::Bool)
         reached = IdSet{Core.MethodInstance}()
-        work = Core.MethodInstance[roots...]
+        work = Core.MethodInstance[from...]
         while !isempty(work)
             mi = pop!(work)
             mi in reached && continue
             push!(reached, mi)
             ci = get(src, mi, nothing)
             ci === nothing && continue
-            for st in ci.code
-                Meta.isexpr(st, :invoke) || Meta.isexpr(st, :invoke_modify) || continue
-                t = st.args[1]
-                callee = t isa Core.CodeInstance ? CC.get_ci_mi(t) : t
-                callee isa Core.MethodInstance || continue
-                twin_instance(callee) ? push!(twins, callee) : push!(work, callee)
+            for callee in invoked_instances(ci)
+                r = native ? nothing : replacement(callee)
+                r === nothing ? push!(work, callee) : (push!(replaced, callee); push!(work, r))
             end
         end
         return reached
     end
-    twins = Core.MethodInstance[]
-    compiled = reach(entries, twins)
-    # (from the twins' native bodies, which call more twins in turn)
-    native = reach(twins, Core.MethodInstance[])
+    replaced = Core.MethodInstance[]
+    compiled = reach(entries, replaced, false)
+    # (from the replaced native methods: what they call, replaced or not, runs natively only)
+    native = reach(replaced, nothing, true)
     return compiled, IdSet{Core.MethodInstance}(mi for mi in native if !(mi in compiled))
 end
 
 """
-    verify_trim(io, codeinfos, entries, onlywarn)
+    verify_trim(io, codeinfos, entries, replacement, onlywarn)
 
-juliac's verifier (`Compiler.verify_typeinf_trim`), without the errors in the native bodies
-of the runtime's twins, and in the code only they reach, that the module does not compile: in Wasm, the code generator calls
-each twin's Wasm implementation instead (`overlays.jl`). (Natively, those bodies call the
-method before the patches with `invoke_in_world`, which the verifier rejects.) A twin body
-reached otherwise (an entry, a direct call of `Twins.original`) is still verified.
+juliac's verifier (`Compiler.verify_typeinf_trim`) of what the module compiles: the methods
+of `Runtime.WASM_METHODS` in place of the native methods they replace (`trim_check` infers
+them as entries), without the errors in those native methods, and in the code only they
+reach. (Natively, such a method may call the method before the patches with
+`Runtime.original`, which the verifier rejects.) A replaced method or `Runtime.original`
+reached otherwise (from an entry) is verified too.
+
+The calls are those of native inference: a replacement whose call native inference folds
+away or inlines is not verified (its dynamic calls are still unsupported constructs when the
+module is emitted).
 """
-function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance}, onlywarn::Bool)
+function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance},
+                     replacement::Replacements, onlywarn::Bool)
     TV = CC.TrimVerifier
     errors, parents = TV.get_verify_typeinf_trim(codeinfos)
-    compiled, native_only = compiled_instances(codeinfos, entries)
+    compiled, native_only = compiled_instances(codeinfos, entries, replacement)
     filter!(errors) do e
         d = e.second
         d isa TV.CallMissing || return true
         mi = CC.get_ci_mi(d.codeinst)
-        return !(mi in native_only || (twin_body(mi) && !(mi in compiled)))
+        return !(mi in native_only ||
+                 ((only_if_reached(mi) || replacement(mi) !== nothing) && !(mi in compiled)))
     end
     # (the rest as `verify_typeinf_trim`)
     counts = [0, 0]

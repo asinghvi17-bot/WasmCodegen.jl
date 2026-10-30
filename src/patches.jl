@@ -16,8 +16,7 @@ const TRIM_PATCHES = [joinpath(@__DIR__, "trim", "juliac-trim-base.jl"),
                       joinpath(@__DIR__, "trim", "wasm-paths.jl"),
                       joinpath(@__DIR__, "trim", "wasm-random.jl"),
                       joinpath(@__DIR__, "trim", "wasm-memory.jl"),
-                      joinpath(@__DIR__, "trim", "wasm-versions.jl"),
-                      joinpath(@__DIR__, "trim", "wasm-runtime.jl")]
+                      joinpath(@__DIR__, "trim", "wasm-versions.jl")]
 
 # the constants the patches rebind (methods are restored by deleting their replacements)
 const PATCHED_CONSTS = [(Base, :invokelatest)]
@@ -72,8 +71,8 @@ function with_trim_patches(f; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}[])
     w1 = w0
     try
         Core.eval(sandbox, :(Core.Compiler._verify_trim_world_age[] = $w0))
-        # (the twins of patched functions call the originals natively in this world)
-        Runtime.Twins.PRE_PATCH_WORLD[] = w0
+        # (runtime functions the patches call can call the originals natively in this world)
+        Runtime.PRE_PATCH_WORLD[] = w0
         Core.eval(sandbox, :(const WasmCodegen = $(@__MODULE__)))
         for (name, value) in bindings
             Core.eval(sandbox, :(const $name = $(QuoteNode(value))))
@@ -90,7 +89,7 @@ function with_trim_patches(f; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}[])
         return f(COMPILER_WORLD[], Base.get_world_counter())
     finally
         PATCH_SESSION[] = nothing
-        Runtime.Twins.PRE_PATCH_WORLD[] = typemax(UInt)
+        Runtime.PRE_PATCH_WORLD[] = typemax(UInt)
         added = Method[]
         Base.visit(Core.methodtable) do m
             w0 < m.primary_world <= w1 && push!(added, m)

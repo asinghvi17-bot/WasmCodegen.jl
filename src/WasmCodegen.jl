@@ -24,7 +24,7 @@ include("errors.jl")
 module Runtime
 include("runtime/int128.jl")
 include("runtime/io.jl")
-include("runtime/twins.jl")
+include("runtime/methods.jl")
 include("runtime/pointers.jl")
 include("runtime/libc.jl")
 include("runtime/reinterpret.jl")
@@ -68,6 +68,7 @@ export compile, Entry, Config, UnsupportedConstructs
 
 function __init__()
     COMPILER_WORLD[] = Base.get_world_counter()
+    Runtime.BUILD_JLOPTIONS[] = Runtime.sanitized_jloptions()
 end
 
 end

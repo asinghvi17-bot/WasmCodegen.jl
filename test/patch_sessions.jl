@@ -69,27 +69,76 @@ end
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(H.untrimmable, (Int,);
                                                                       config=WasmCodegen.Config(pre_image_hooks=Any[hook]))
     @test H.state == 1 && calls == ["hook", "restore"]
+    # a restore that fails fails the compilation, whatever it throws (here `nothing`)
+    thrown = try
+        WasmCodegen.compile(H.read_state, (); config=WasmCodegen.Config(pre_image_hooks=Any[() -> () -> throw(nothing)]))
+        :returned
+    catch e
+        e
+    end
+    @test thrown === nothing
+    # the interface version's export may not be another export's
+    @test_throws ArgumentError WasmCodegen.compile(H.read_state, ();
+                                                   config=WasmCodegen.Config(abi_version="read_state" => Int32(1)))
+    @test_throws ArgumentError WasmCodegen.compile(H.read_state, ();
+                                                   config=WasmCodegen.Config(host=:wasi, abi_version="memory" => Int32(1)))
 end
 
-# a runtime function with a native twin: its native body (and what only it reaches) is not
-# verified, as the module compiles the Wasm implementation instead; the same code reached
-# from an entry is
-module TwinTarget
+# a method of `Runtime.WASM_METHODS`: the native method it replaces (and what only that
+# reaches) is not verified, as the module compiles the replacement instead; the same code
+# reached from an entry is
+module ReplacedTarget
+import WasmCodegen
 @noinline helper(x::Int) = Base.inferencebarrier(x) + 1
-@noinline twin(x::Int)::Int = helper(x)
-@noinline twin_wasm(x::Int) = x + 1
-through_twin(x::Int) = twin(x) * 2
+@noinline replaced(x::Int)::Int = helper(x)
+WasmCodegen.Runtime.@wasm_method replaced(x::Int) = x + 1
+through_replaced(x::Int) = replaced(x) * 2
 direct(x::Int) = helper(x)::Int * 2
+# a replacement is verified: this one calls the dynamic helper
+@noinline replaced_dynamic(x::Int)::Int = x + 1
+WasmCodegen.Runtime.@wasm_method replaced_dynamic(x::Int) = helper(x)::Int
+through_dynamic(x::Int) = replaced_dynamic(x) * 2
+# a replaced method whose native body calls another one, whose native body calls the helper
+@noinline outer(x::Int)::Int = inner(x)
+@noinline inner(x::Int)::Int = helper(x)
+WasmCodegen.Runtime.@wasm_method outer(x::Int) = x + 1
+WasmCodegen.Runtime.@wasm_method inner(x::Int) = x + 2
+through_outer(x::Int) = outer(x) * 2
+# a less specific method reached by `invoke` is not the one a replacement replaces
+@noinline invoked(x::Number)::Int = helper(Int(x))
+invoked(x::Int) = x + 1
+WasmCodegen.Runtime.@wasm_method invoked(x::Int) = x + 1
+through_invoke(x::Int) = invoke(invoked, Tuple{Number}, x)
 end
 
-@testset "twins and the verifier" begin
-    T = TwinTarget
-    WasmCodegen.Runtime.WASM_IMPLS[T.twin] = T.twin_wasm
-    try
-        c = WasmCodegen.compile(T.through_twin, (Int,); config=WasmCodegen.Config(verify=:error))
-        @test wasm_run(c, "through_twin", 20; rettype=Int) == T.through_twin(20) == 42
-        @test_throws WasmCodegen.TrimFailure WasmCodegen.compile(T.direct, (Int,); config=WasmCodegen.Config(verify=:error))
-    finally
-        delete!(WasmCodegen.Runtime.WASM_IMPLS, T.twin)
+@testset "methods of WASM_METHODS and the verifier" begin
+    T = ReplacedTarget
+    c = WasmCodegen.compile(T.through_replaced, (Int,); config=WasmCodegen.Config(verify=:error))
+    @test wasm_run(c, "through_replaced", 20; rettype=Int) == T.through_replaced(20) == 42
+    @test_throws WasmCodegen.TrimFailure WasmCodegen.compile(T.direct, (Int,); config=WasmCodegen.Config(verify=:error))
+    @test_throws WasmCodegen.TrimFailure WasmCodegen.compile(T.through_dynamic, (Int,); config=WasmCodegen.Config(verify=:error))
+    c = WasmCodegen.compile(T.through_outer, (Int,); config=WasmCodegen.Config(verify=:error))
+    @test wasm_run(c, "through_outer", 20; rettype=Int) == T.through_outer(20) == 42
+    @test_throws WasmCodegen.TrimFailure WasmCodegen.compile(T.through_invoke, (Int,); config=WasmCodegen.Config(verify=:error))
+end
+
+# no method of `WASM_METHODS` is more `:consistent` than the native one it replaces: inference
+# evaluates calls at compile time with the native methods (see `@wasm_method`)
+@testset "methods of WASM_METHODS" begin
+    ms = Method[]
+    Base.visit(m -> Base.moduleroot(m.module) === WasmCodegen && push!(ms, m), WasmCodegen.Runtime.WASM_METHODS)
+    @test !isempty(ms)
+    WasmCodegen.with_trim_patches() do _, w
+        interp = WasmCodegen.WasmInterpreter(; world=w)
+        for m in ms
+            sig = Base.unwrap_unionall(m.sig)
+            ft = sig.parameters[1]
+            ft === typeof(Core.kwcall) && continue
+            f = Base.issingletontype(ft) ? ft.instance : ft.parameters[1]
+            tt = Tuple(sig.parameters[2:end])
+            replacement = Base.infer_effects(f, tt; interp, world=w)
+            native = Base.infer_effects(f, tt; world=w)
+            @test !Base.Compiler.is_consistent(replacement) || Base.Compiler.is_consistent(native)
+        end
     end
 end
