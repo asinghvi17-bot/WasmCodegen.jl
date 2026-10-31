@@ -144,7 +144,7 @@ function structurize_prepared(cgm::CGModule, mi::Core.MethodInstance)
         structurize(ir)
     catch err
         err isa Unsupported && rethrow()
-        unsupported("structurizing the IR: ", sprint(showerror, err))
+        unsupported("structurizing the IR: ", limited_sprint(showerror, err))
     end
 end
 
@@ -271,7 +271,7 @@ function emit_block!(fc::FnCtx, block)
                         convert_repr(fc, res, typ)
                     catch err
                         err isa Unsupported || rethrow()
-                        push!(err.context, string("the result of ", sprint(show, stmt; context=:limit => true), "::", typ))
+                        push!(err.context, string("the result of ", limited_sprint(show, stmt), "::", limited_sprint(show, typ)))
                         rethrow()
                     end
                 end
@@ -376,7 +376,7 @@ function emit_stmt_or_trap!(fc::FnCtx, @nospecialize(stmt), @nospecialize(typ))
         fc.b.frames = frames
         fc.b.inits = inits
         fc.depth = depth
-        push!(err.context, string("the statement ", sprint(show, stmt; context=:limit => true), "::", typ))
+        push!(err.context, string("the statement ", limited_sprint(show, stmt), "::", limited_sprint(show, typ)))
         push!(err.context, fc.info.mi)
         push!(fc.cgm.diagnostics, fc.info.mi => err)
         unreachable!(fc.b)
@@ -920,7 +920,7 @@ function emit_call!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return bottom()
     else
         unsupported("a dynamic call of ", fv, " with argument types (",
-                    join([a isa CGVal ? string(a.typ) : "?" for a in args], ", "), ")")
+                    join([a isa CGVal ? diagnostic_string(a.typ) : "?" for a in args], ", "), ")")
     end
 end
 
