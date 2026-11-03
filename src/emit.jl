@@ -151,7 +151,7 @@ end
 # counting `ForOp`s gains nothing on Wasm, and a `ForOp` has neither the signedness of the
 # comparison it came from (`ult_int`) nor room for an inclusive bound at `typemax`
 function structurize(ir::CC.IRCode)
-    sci = StructuredIRCode(ir; validate=false, promote=false)
+    sci = StructuredIRCode(ir; validate=false, promote=false, exceptions=:structured)
     IRStructurizer.validate_scf(sci.entry)
     IRStructurizer.validate_no_phis(sci.entry)
     return sci

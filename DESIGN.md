@@ -164,7 +164,7 @@ object, `throw`, and `try_table`. What a program needs is decided for its closed
   runtime functions (`runtime/errors.jl`). Errors Wasm checks itself (a failed cast, an
   array index out of range) remain traps, which no handler catches.
 
-A `TryOp` (IRStructurizer branch `eh-tryop`) is
+A `TryOp` (IRStructurizer with `exceptions = :structured`) is
 
     block $exit
       block $handler (result exception)
