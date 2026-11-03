@@ -1,6 +1,6 @@
 # The fixtures of test/printing.jl and their results natively, computed here, before the trim
 # patches, with Base's own printing. Printing in a closed world (trim/wasm-base.jl,
-# wasm-show.jl, wasm-runtime.jl): types known
+# wasm-show.jl, wasm-print.jl): types known
 # only at run time (through a table of the module's types), enums and functions (their
 # module prefixes: the bindings' visibility, computed at compile time), values shown in the
 # context of their type (`:typeinfo`), and `print`/`string` of many arguments.
@@ -23,8 +23,14 @@ struct T; x::Int; end
 end
 end
 
-# types known only at run time
-const TYPES = Any[Int, Vector{String}, Dict{String,Int}, Union{Nothing,Int}, Outer.Inner.T, Pair{Symbol,Any}]
+# types known only at run time, and their names as juliac prints them (`show(io, ::Type)` of
+# juliac-trim-base.jl: no modules, no aliases, `?` for a parameter other than a type, an
+# `Int`, a `Symbol` or a type variable, a `where` without bounds)
+const TYPES = Any[Int, Vector{String}, Dict{String,Int}, Union{Nothing,Int}, Outer.Inner.T, Pair{Symbol,Any},
+                  Val{true}, Val{:a}, Union{Int,String,Nothing}, Vector{T} where T]
+const TYPE_NAMES = ["Int64", "Array{String, 1}", "Dict{String, Int64}", "Union{Nothing, Int64}", "T",
+                    "Pair{Symbol, Any}", "Val{?}", "Val{:a}", "Union{Nothing, Union{Int64, String}}",
+                    "Array{T, 1} where T"]
 type_str(i::Int) = (io = IOBuffer(); show(io, TYPES[i]::Type); s = String(take!(io)); (sizeof(s), hash(s)))
 
 # enums and functions

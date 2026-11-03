@@ -5,15 +5,14 @@ module PrintingTests2
 using Test
 using ..Main: wcompile, wasm_run, WasmCodegen, LAST_OUTPUT
 
-using ..PrintingTests: TYPES, ENUMS, FUNCS, REFS, type_str, enum_shown, fruit_shown, invalid_shown,
+using ..PrintingTests: TYPES, TYPE_NAMES, ENUMS, FUNCS, REFS, type_str, enum_shown, fruit_shown, invalid_shown,
     func_shown, func_printed, show_typeinfo, show_typeinfo_wasm, many
 
 @testset "printing in a closed world" begin
     @testset "type names" begin
-        # (Wasm prints types without their modules, juliac's way: compared with that text)
+        # (Wasm prints types as juliac does: compared with that text)
         c = wcompile(type_str, (Int,))
-        for i in 1:length(TYPES)
-            s = String(WasmCodegen.Runtime.simple_type_name(TYPES[i]))
+        for (i, s) in enumerate(TYPE_NAMES)
             @test wasm_run(c, "type_str", i; rettype=Tuple{Int,UInt}) == (sizeof(s), hash(s))
         end
     end
