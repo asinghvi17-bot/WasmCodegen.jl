@@ -89,9 +89,9 @@ parameters, `examples/mtk` simulates a ModelingToolkit model with sliders, and
 - **Collecting.** `Core.Compiler.compile!` with a Wasm interpreter, as juliac's
   `typeinf_ext_toplevel` does, so the code compiled is the code juliac compiles.
 - **Structuring.** Each function's IR is turned into structured control flow by
-  [IRStructurizer.jl](https://github.com/maleadt/IRStructurizer.jl). For now this is the
-  `eh-tryop` branch of [a fork](https://github.com/gbaraldi/IRStructurizer.jl/tree/eh-tryop),
-  which adds structured exception handling; `Project.toml` installs it from there.
+  [IRStructurizer.jl](https://github.com/maleadt/IRStructurizer.jl), with structured exception
+  handling (`exceptions = :structured`). Until a release has it, `Project.toml` installs it
+  from a commit of its main branch.
 - **Emitting.** Values follow JuliaCodegen.jl's representations. Isbits values are inline
   (Wasm locals, multi-value returns), everything else is a WasmGC object with a type tag.
   `Memory` is a Wasm array, and Base's `Array` code compiles from its Julia source.
