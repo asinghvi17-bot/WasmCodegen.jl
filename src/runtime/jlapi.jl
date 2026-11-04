@@ -324,3 +324,38 @@ const N_THREADS = Ref{Cint}(1)
 const N_THREADPOOLS = Ref{Cint}(2)
 "`jl_n_gcthreads`: no GC threads besides the one thread (`Threads.ngcthreads() == 1`)."
 const N_GCTHREADS = Ref{Cint}(0)
+
+## C structs Base reads through pointers (`cglobal`s of non-scalars), which the module does
+## not have: methods the module compiles in place of Base's (see `methods.jl`), whose answers
+## are the module's constants.
+
+"""
+The options of the process that builds the module (`Base.JLOptions()`), with one thread (as
+natively with `-t 1`: `nthreads` and `nthreadpools` 1) and without strings or arrays (null
+pointer fields: the image holds no pointers of the build process, `nthreads_per_pool`
+included): taken when WasmCodegen is loaded, serialized into the module.
+"""
+const BUILD_JLOPTIONS = Ref{Base.JLOptions}()
+
+"The build process's options, sanitized as `BUILD_JLOPTIONS` holds them."
+function sanitized_jloptions()
+    opts = Base.JLOptions()
+    fields = Any[]
+    for (name, T) in zip(fieldnames(Base.JLOptions), fieldtypes(Base.JLOptions))
+        v = getfield(opts, name)
+        push!(fields, T <: Ptr ? T(0) : name === :nthreads || name === :nthreadpools ? T(1) : v)
+    end
+    return Base.JLOptions(fields...)
+end
+
+"`Base.JLOptions()`: the build process's options (a program compiled into a module runs with the options it was built with)."
+@wasm_method Base.JLOptions() = BUILD_JLOPTIONS[]
+
+"`jl_n_threads_per_pool`: as natively with `-t 1`, the interactive pool (0) empty, the default one (1) the one thread."
+const N_THREADS_PER_POOL = Cint[0, 1]
+
+"""
+`Threads._nthreads_in_pool(tpid)` (`jl_n_threads_per_pool[tpid]`): read from
+`N_THREADS_PER_POOL`, as natively from the C runtime's memory (see `@wasm_method`).
+"""
+@wasm_method Threads._nthreads_in_pool(tpid::Int8) = Int(N_THREADS_PER_POOL[tpid + 1])

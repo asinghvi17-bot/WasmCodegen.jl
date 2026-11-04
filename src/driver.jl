@@ -40,7 +40,8 @@ function compile(entries::Vector; config::Config=Config(), validate::Bool=true,
                                               config, validate, program_world)
     if config.trim_patches && world === nothing
         # the program in the latest world, with juliac's patches
-        return with_trim_patches() do _, _
+        return with_trim_patches(; patches=[TRIM_PATCHES; config.extra_patches],
+                                 bindings=config.patch_bindings) do _, _
             run(Base.get_world_counter())
         end
     end
@@ -53,10 +54,52 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
         config.host === :wasi && e.name in WASI_EXPORTS &&
             throw(ArgumentError("the entry point $(e.f) is exported as \"$(e.name)\", a name WASI reserves: give it another (`Entry(f, argtypes; name)`)"))
     end
+    if config.abi_version !== nothing
+        name = first(config.abi_version)
+        config.host === :wasi && name in WASI_EXPORTS &&
+            throw(ArgumentError("Config(abi_version): \"$name\" is a name WASI reserves"))
+        any(e -> e.name == name, entries) &&
+            throw(ArgumentError("Config(abi_version): \"$name\" is the export of an entry point"))
+    end
     # (the module's gensyms continue the build process's: none repeats one the image holds)
     Runtime.sync_gensym_counter!()
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
     w = collect_world(mis; world, verify=config.verify)
+    restores = Any[]
+    local result
+    try
+        for hook in config.pre_image_hooks
+            r = Base.invokelatest(hook)
+            r isa Function && push!(restores, r)
+        end
+        result = emit_module(w, mis, entries, config, validate)
+    catch
+        # (the compilation's error is the one thrown; a failing restore is reported)
+        run_restores(restores)
+        rethrow()
+    end
+    failure = run_restores(restores)
+    failure === nothing || throw(something(failure))
+    return result
+end
+
+# call every restore of the pre-image hooks, in reverse order, also when one fails: the first
+# failure (`Some` of what it threw; each is reported), or nothing
+function run_restores(restores::Vector{Any})
+    failure = nothing
+    for r in Iterators.reverse(restores)
+        try
+            Base.invokelatest(r)
+        catch e
+            failure === nothing && (failure = Some{Any}(e))
+            @error "a restore of Config(pre_image_hooks) failed" exception=(e, catch_backtrace())
+        end
+    end
+    return failure
+end
+
+function emit_module(w::ClosedWorld, mis::Vector{Core.MethodInstance}, entries::Vector{Entry},
+                     config::Config, validate::Bool)
     mode = exception_mode(w)
     local cgm
     while true
@@ -107,6 +150,7 @@ end
 
 # (the image first, then the type maps, which add types: the tables over types after them)
 function finish_module!(cgm::CGModule)
+    finish_exports!(cgm)
     finish_gensym_counter!(cgm)
     finish_modules!(cgm)
     finish_image!(cgm)
@@ -121,4 +165,21 @@ function finish_module!(cgm::CGModule)
     finish_types!(cgm)
     finish_subtype!(cgm)
     finish_host!(cgm)
+end
+
+"""
+    finish_exports!(cgm)
+
+The exports of the module beyond its entry points: the interface version
+(`Config(abi_version = name => version)`).
+"""
+function finish_exports!(cgm::CGModule)
+    if cgm.config.abi_version !== nothing
+        name, version = cgm.config.abi_version
+        f = add_func!(cgm.mod, name, ValType[], ValType[I32])
+        b = Builder(cgm.mod, f)
+        emit!(b, :i32_const, version)
+        finish!(b)
+        add_export!(cgm.mod, name, f)
+    end
 end
