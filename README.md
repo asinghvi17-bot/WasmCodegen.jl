@@ -183,7 +183,9 @@ output with Node's and native Julia's.
 
 - **WASI from `js/julia.mjs`.** workerd's `node:wasi` throws `ERR_METHOD_NOT_IMPLEMENTED`
   from its constructor. `createHost({ env, args })` provides WASI preview 1 instead: the
-  arguments, the environment, the clocks, randomness and the standard streams. It exposes
+  environment, the clocks, randomness and the standard streams, and arguments, which
+  WasmCodegen doesn't read yet (a module's `ARGS` are still those of the process that
+  compiled it, where `juliac` empties them and fills them from the command line). It exposes
   no filesystem: no directory is preopened (workerd's own `/tmp` and `/bundle` included),
   so file operations fail as for a path out of the preopens.
 - **Modules compiled ahead of time.** Compiling at request time is disallowed ("Wasm code

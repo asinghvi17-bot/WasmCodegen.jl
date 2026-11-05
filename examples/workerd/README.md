@@ -36,8 +36,9 @@ It is not run by CI, which would download workerd.
   it is imported as a `WebAssembly.Module`, which `instantiate` of `js/julia.mjs` and
   `WebAssembly.instantiate` take.
 - **WASI from `js/julia.mjs`.** workerd's `node:wasi` throws on construction. `createHost()`'s
-  `wasi_snapshot_preview1` imports give a `host = :wasi` module its arguments and
-  environment (`createHost({ env, args })`), the clocks, randomness and stdout/stderr. It
+  `wasi_snapshot_preview1` imports give a `host = :wasi` module its environment
+  (`createHost({ env })`), the clocks, randomness and stdout/stderr (not yet its arguments:
+  its `ARGS` are still those of the process that compiled it). It
   exposes no filesystem (workerd's own `/tmp` and `/bundle` included): no directory is
   preopened, stdin is empty, and file operations fail as for a path out of the preopens
   (`isfile` is false, `open` throws a `SystemError`).

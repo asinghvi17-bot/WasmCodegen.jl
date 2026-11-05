@@ -62,7 +62,20 @@ check('fd_datasync(2)', w.fd_datasync(2), 28);
 check('fd_filestat_set_size(1)', w.fd_filestat_set_size(1, 0n), 28);
 check('fd_readdir(1)', w.fd_readdir(1, 64, 16, 0n, 32), 54);
 check('sock_recv(1)', w.sock_recv(1, 0, 1, 0, 32, 48), 57);
-check('fd_fdstat_set_flags(1)', w.fd_fdstat_set_flags(1, 0), 58);
+// a stream's flags and times, as set (of the flags, those a stream keeps natively)
+check('fd_fdstat_set_flags(1)', w.fd_fdstat_set_flags(1, 4 | 16), 0);
+check('fd_fdstat_get(1) after', [w.fd_fdstat_get(1, 8), view().getUint16(10, true)], [0, 4]);
+check('fd_filestat_set_times(1, both now and given)', w.fd_filestat_set_times(1, 0n, 0n, 1 | 2), 28);
+check('fd_filestat_set_times(1, an unknown flag)', w.fd_filestat_set_times(1, 100n, 200n, 1 | 16), 28);
+check('fd_filestat_set_times(1)', w.fd_filestat_set_times(1, 100n, 200n, 1 | 4), 0);
+check('fd_filestat_get(1) after', [w.fd_filestat_get(1, 8), view().getBigUint64(8 + 40, true), view().getBigUint64(8 + 48, true)],
+      [0, 100n, 200n]);
+check('fd_filestat_set_times(1, mtime now)', w.fd_filestat_set_times(1, 0n, 0n, 8), 0);
+check('mtime now', w.fd_filestat_get(1, 8) === 0 && view().getBigUint64(8 + 40, true) === 100n &&
+      Math.abs(Number(view().getBigUint64(8 + 48, true)) / 1e9 - Date.now() / 1000) < 60, true);
+check('fd_advise(0)', w.fd_advise(0, 0n, 0n, 0), 70);
+check('fd_allocate(1)', w.fd_allocate(1, 0n, 1n), 70);
+check('fd_fdstat_set_flags(3)', w.fd_fdstat_set_flags(3, 0), 8);
 
 // no other descriptor is open; no directory is preopened
 check('fd_prestat_get(3)', w.fd_prestat_get(3, 0), 8);
@@ -101,4 +114,17 @@ for (const [code, want] of [[3, 3], [-1, 4294967295]]) {
   catch (e) { check(`proc_exit(${code})`, [e instanceof WasiExit, e.code], [true, want]); }
 }
 check('flushes at proc_exit', flushed, 2);
+
+// a write that grows the memory: the next iovec and the count written read from the new one
+const growing = new WebAssembly.Memory({ initial: 1 });
+const grown = [];
+const gh = createHost({ write: (fd, b) => { grown.push([...b]); growing.grow(1); } });
+gh.attach({ exports: { memory: growing } });
+{
+  const v = new DataView(growing.buffer), b = new Uint8Array(growing.buffer);
+  b.set([104, 105], 100); b.set([33], 200);
+  v.setUint32(0, 100, true); v.setUint32(4, 2, true); v.setUint32(8, 200, true); v.setUint32(12, 1, true);
+}
+check('fd_write growing the memory', gh.imports.wasi_snapshot_preview1.fd_write(1, 0, 2, 16), 0);
+check('written', [grown, new DataView(growing.buffer).getUint32(16, true)], [[[104, 105], [33]], 3]);
 process.stdout.write(failures.map((f) => f + '\n').join(''));

@@ -14,7 +14,9 @@ host_clock() = time()
 env_clock_text(now::Float64) =
     string("greeting ", get(ENV, "WCG_GREETING", "-"), "; keys ",
            join(sort([k for (k, _) in ENV if startswith(k, "WCG_")]), ","), "; unset ", haskey(ENV, "WCG_UNSET"),
-           "; clock ", abs(time() - now) < 60, "; file ", isfile("/wcg/no/such/file"), "\n")
+           "; clock ", abs(time() - now) < 60, "; file ", isfile("/wcg/no/such/file"), "; open ",
+           try close(open("/wcg/no/such/file")); "opened" catch e; e isa SystemError ? "SystemError" : "other" end,
+           "; touch stdout ", try touch(Base.Filesystem.File(RawFD(1))); "ok" catch e; e isa SystemError ? "SystemError" : "other" end, "\n")
 host_env_clock(now::Float64) = (print(Core.stdout, env_clock_text(now)); Int32(0))
 # an image object completed by initialization (a cycle), which calls no host function
 mutable struct HostNode; next::Any; v::Int; end
@@ -138,7 +140,7 @@ end
     wenv = Dict("WCG_GREETING" => "hello", "WCG_TARGET" => "js")
     native = withenv(() -> env_clock_text(time()),
                      [k => nothing for k in keys(ENV) if startswith(k, "WCG_")]..., wenv...)
-    @test native == "greeting hello; keys WCG_GREETING,WCG_TARGET; unset false; clock true; file false\n"
+    @test native == "greeting hello; keys WCG_GREETING,WCG_TARGET; unset false; clock true; file false; open SystemError; touch stdout ok\n"
     @test run_julia_mjs(envc, "host_env_clock", time(); env=wenv) == ("0", native)
     # its WASI functions called directly: records, errnos and strings (prints the failed checks)
     @test read(`$(node_cmd()) $(joinpath(@__DIR__, "wasi_host.mjs"))`, String) == ""
