@@ -370,9 +370,11 @@ one Wasm form in a signature, argument or result, an address and an object, beca
 sides declare them differently; a result declared `Ref{S}` is the object of its `S`. Unsupported: a `cfunction` of a closure value (`$f`), of a function not known at
 compile time, or of abstract types; `Ref{T}` of an abstract `T`; a function whose result is not
 the declared one; variadic calls; a call through a constant pointer, or of a signature no
-`cfunction` of the module has. They are reported when the module is compiled. A pointer that
-is not a `cfunction` of its call's signature is a run-time error. Natively, two `@cfunction`s
-of one function at different call sites may differ; here they are one pointer. The pointers
+`cfunction` of the module has; the C types native Julia copies (a mutable struct by value)
+or cannot compile (an argument of no size, a result by value that holds references). They are
+reported when the module is compiled. A call through a null pointer throws as natively; through
+a pointer that is not a `cfunction` of its call's signature, an error of the program. Each
+compiled `cfunction` has a slot of its own, as natively a function of its own. The pointers
 are the module's own (no interoperation with a host's or another module's functions), and the
 image holds none: a `cfunction`'s pointer in a value built at compile time is reported, as other
 pointers of the build process are.

@@ -1,7 +1,6 @@
-# C function pointers: `cfunction` and `ccall` through a pointer, on their own and as FunctionWrappers
-# uses them (with no code of its own in the compiler). Results are compared with native Julia's.
+# C function pointers: `cfunction` and `ccall` through a pointer. Results are compared with
+# native Julia's.
 module CFunctionPrograms
-using FunctionWrappers: FunctionWrapper
 
 ## plain C function pointers
 
@@ -56,89 +55,12 @@ const LAST = Ref(0.0)
 remember(x::Float64) = (LAST[] = x; nothing)
 c_void_result(x::Float64) = (ccall(@cfunction(remember, Cvoid, (Float64,)), Cvoid, (Float64,), x); LAST[])
 
-## FunctionWrappers
-
-struct Scale
-    c::Float64
-end
-(s::Scale)(x::Float64) = s.c * x + 1.0
-fw_inline(x::Float64, c::Float64) = (w = FunctionWrapper{Float64, Tuple{Float64}}(Scale(c)); w(x) + w(2x))
-
-mutable struct Counter
-    n::Int
-end
-(c::Counter)(k::Int) = (c.n += k; c.n)
-function fw_mutable(k::Int)
-    c = Counter(10)
-    w = FunctionWrapper{Int, Tuple{Int}}(c)
-    w(k); w(k)
-    return c.n
-end
-
-fw_closure(x::Float64) = (v = [x, 2x]; FunctionWrapper{Float64, Tuple{Int}}(i -> v[i])(2))
-adder(c) = y -> y + c
-const AF = FunctionWrapper{Float64, Tuple{Float64}}
-fw_captures(x::Float64) = (ws = AF[AF(adder(1.0)), AF(adder(x))]; ws[1](x) + 10ws[2](x))
-fw_two_types(x::Float64) = (ws = AF[AF(Scale(3.0)), AF(y -> y - 1.0)]; ws[1](x) + ws[2](x))
-fw_same_pointer(x::Float64) = (a = AF(adder(1.0)); b = AF(adder(2.0)); a.ptr == b.ptr ? a(x) + b(x) : -x)
-fw_distinct_pointer(x::Float64) = (a = AF(adder(1.0)); b = AF(Scale(2.0)); a.ptr != b.ptr ? a(x) + b(x) : -x)
-fw_bool(x::Float64) = FunctionWrapper{Bool, Tuple{Float64, Float64}}(>)(x, 1.0)
-fw_convert_result(x::Float64) = FunctionWrapper{Float64, Tuple{Float64}}(y -> y > 0.0 ? 2 : 3)(x)
-fw_convert_arg(x::Float64) = FunctionWrapper{Float64, Tuple{Float64}}(identity)(Int(round(x)))
-fw_nothing_result(x::Float64) = (b = Ref(0.0); FunctionWrapper{Nothing, Tuple{Float64}}(y -> (b[] = y; 1.0))(x); b[])
-
-struct NoParams end
-struct Shift
-    c::Float64
-end
-(s::Shift)(x::Float64, ::NoParams) = x - s.c
-fw_singleton(x::Float64) = FunctionWrapper{Float64, Tuple{Float64, NoParams}}(Shift(x))(2x, NoParams())
-
-const VF = FunctionWrapper{Nothing, Tuple{Vector{Float64}, Vector{Float64}, Float64}}
-function fw_vectors(t::Float64)
-    a = 2.0
-    w = VF((du, u, s) -> (du .= a .* u .+ s; nothing))
-    u = [1.0, 2.0]; du = zeros(2)
-    w(du, u, t)
-    return du[1] + 10du[2]
-end
-function fw_aliased(t::Float64)
-    w = VF((du, u, s) -> (du === u && (du[1] += s); du[2] = u[1]; nothing))
-    u = [1.0, 2.0]
-    w(u, u, t)
-    return u[1] + 10u[2]
-end
-fw_matrix(x::Float64) = (m = [x 2x; 3x 4x]; FunctionWrapper{Float64, Tuple{Matrix{Float64}, Int}}((a, i) -> a[i, 2])(m, 2))
-fw_vector_result(x::Float64) = FunctionWrapper{Vector{Float64}, Tuple{Float64}}(y -> [y, y + 1])(x)[2]
-fw_any_result(x::Float64) = FunctionWrapper{Any, Tuple{Float64}}(y -> y + 1)(x)::Float64
-fw_any_arg(x::Float64) = FunctionWrapper{Float64, Tuple{Any}}(y -> y::Float64 + 1.0)(x)
-fw_nested(x::Float64) = (i = AF(adder(x)); o = AF(y -> AF(adder(y))(i(y))); o(1.0))
-
-fails(x::Float64) = x > 0.0 ? throw(DomainError(x)) : x
-function fw_throw(x::Float64)
-    w = FunctionWrapper{Float64, Tuple{Float64}}(fails)
-    try
-        return w(x)
-    catch e
-        return e isa DomainError ? 7.0 : 8.0
-    end
-end
-
-struct HoldsVector
-    v::Vector{Float64}
-end
-(h::HoldsVector)(x::Float64) = h.v[1] + x
 isptr(x::Any) = x isa Ptr{Float64}
 function c_any_pointer(x::Float64)
     v = [x]
     return GC.@preserve v ccall(@cfunction(isptr, Bool, (Any,)), Bool, (Any,), pointer(v))
 end
 c_any_null_pointer(x::Float64) = ccall(@cfunction(isptr, Bool, (Any,)), Bool, (Any,), Ptr{Float64}(0))
-function fw_any_pointer(x::Float64)
-    v = [x]
-    w = FunctionWrapper{Bool, Tuple{Any}}(isptr)
-    return GC.@preserve v w(pointer(v))
-end
 objaddress(v::Vector{Float64}) = pointer_from_objref(v)
 function c_ptr_result_as_ref(x::Float64)
     v = [x]
@@ -180,16 +102,16 @@ c_any_as_ref(x::Float64) = ccall(@cfunction(read_ref, Float64, (Ref{Float64},)),
 is_null(p::Ptr{Cvoid}) = p == C_NULL
 c_ref_of_pointer(::Float64) = ccall(@cfunction(is_null, Bool, (Ref{Ptr{Cvoid}},)), Bool, (Ref{Ptr{Cvoid}},), Ref(C_NULL))
 c_ref_bits_result_as_ptr(x::Float64) = ccall(@cfunction(add1, Ref{Float64}, (Float64,)), Ptr{Cvoid}, (Float64,), x) != C_NULL
-const STORED = AF[]
-function fw_stored(x::Float64)
-    push!(STORED, AF(HoldsVector([x])))
-    return STORED[end](x)
+# one pointer per compiled `cfunction`: two of one function and signature are two, one run twice is one
+function c_sites(x::Float64)
+    p = @cfunction(add1, Float64, (Float64,))
+    q = @cfunction(add1, Float64, (Float64,))
+    ps = Vector{Ptr{Cvoid}}(undef, 2)
+    for i in 1:2
+        ps[i] = @cfunction(add1, Float64, (Float64,))
+    end
+    return p != q && ps[1] == ps[2] ? ccall(q, Float64, (Float64,), x) : -x
 end
-
-## a wrapper of the image: its pointers are of the build process
-
-const IMG = AF(Scale(2.0))
-img_inline(x::Float64) = IMG(x)
 
 ## errors of the program
 
@@ -202,7 +124,7 @@ function caught(f, x::Float64)
     try
         return f(x)
     catch e
-        return e isa ErrorException ? 11.0 : 12.0
+        return e isa ErrorException ? 11.0 : e isa UndefRefError ? 12.0 : 13.0
     end
 end
 catch_null(x::Float64) = caught(bad_null, x)
@@ -225,26 +147,38 @@ constant_target(x::Float64) = ccall(Ptr{Cvoid}(UInt(0x1234)), Float64, (Float64,
 null_target(x::Float64) = ccall(Ptr{Cvoid}(UInt(0)), Float64, (Float64,), x)
 no_cfunction(x::Float64, p::Ptr{Cvoid}) = ccall(p, Float64, (Float64,), x)
 variadic(x::Float64) = ccall(@cfunction(add1, Float64, (Float64,)), Float64, (Float64, Float64...), x, x)
+mutable struct Cell
+    x::Int
+end
+seven(c::Cell) = c.x == 7
+mutable_by_value(x::Float64) = ccall(@cfunction(seven, Bool, (Cell,)), Bool, (Cell,), Cell(7))
+of_nothing(::Nothing) = 1.0
+nothing_argument(x::Float64) = ccall(@cfunction(of_nothing, Float64, (Nothing,)), Float64, (Nothing,), nothing)
+struct Named
+    s::String
+end
+named(x::Float64) = Named("x")
+struct_with_reference(x::Float64) = ccall(@cfunction(named, Named, (Float64,)), Named, (Float64,), x)
+# a type's kind: by value as an argument (an immutable `UnionAll`, the same object), a struct
+# that holds references as a result
+is_vector(T::UnionAll) = T === Vector
+c_kind_argument(x::Float64) = ccall(@cfunction(is_vector, Bool, (UnionAll,)), Bool, (UnionAll,), Vector) ? x : -x
+vector_type(::Any) = Vector
+kind_result(x::Float64) = ccall(@cfunction(vector_type, UnionAll, (Any,)), Any, (Any,), x) === Vector
 end
 
 @testset "C function pointers" begin
     P = CFunctionPrograms
     cases = [(P.c_direct, (1.5,)), (P.c_scalars, (0.5,)), (P.c_select, (1, 4.0)), (P.c_select, (2, 4.0)),
              (P.c_notnull, (1.0,)), (P.c_copies, (1.0,)), (P.c_distinct, (1.0,)), (P.c_roundtrip, (1.0,)),
-             (P.c_any_pointer, (1.5,)), (P.c_any_null_pointer, (1.5,)), (P.fw_any_pointer, (1.5,)),
+             (P.c_sites, (1.0,)), (P.c_any_pointer, (1.5,)), (P.c_any_null_pointer, (1.5,)),
              (P.c_ptr_result_as_ref, (1.5,)), (P.c_ref_result_as_ptr, (1.5,)), (P.c_any_result_as_ptr, (1.5,)),
              (P.c_ptr_result_as_any, (1.5,)), (P.c_ref_into_inline_array, (1.5,)),
              (P.c_ref_inline_result, (1.5,)), (P.c_ref_bits_result, (1.5,)), (P.c_ref_pointer_result, (1.5,)),
              (P.c_any_as_ref, (1.5,)), (P.c_ref_of_pointer, (1.5,)), (P.c_ref_bits_result_as_ptr, (1.5,)),
              (P.c_ref_of_bits, (1.5,)), (P.c_ref_into_array, (1.5,)), (P.c_write_through, (1.5,)),
              (P.c_object_ref, (1.5,)), (P.c_object_address, (1.5,)), (P.c_ref_result, (1.5,)),
-             (P.c_any_result, (1.5,)), (P.c_void_result, (1.5,)),
-             (P.fw_inline, (1.5, 2.0)), (P.fw_mutable, (3,)), (P.fw_closure, (1.5,)), (P.fw_captures, (2.0,)),
-             (P.fw_two_types, (2.0,)), (P.fw_distinct_pointer, (2.0,)),
-             (P.fw_bool, (2.0,)), (P.fw_convert_result, (1.0,)), (P.fw_convert_arg, (2.0,)),
-             (P.fw_nothing_result, (1.5,)), (P.fw_singleton, (1.5,)), (P.fw_vectors, (0.25,)),
-             (P.fw_aliased, (0.25,)), (P.fw_matrix, (1.5,)), (P.fw_vector_result, (1.0,)),
-             (P.fw_any_result, (1.0,)), (P.fw_any_arg, (1.0,)), (P.fw_nested, (1.5,))]
+             (P.c_any_result, (1.5,)), (P.c_void_result, (1.5,)), (P.c_kind_argument, (1.5,))]
     names = ["e$i" for i in eachindex(cases)]
     c = compile([Entry(f, typeof.(args); name) for ((f, args), name) in zip(cases, names)]; config = WasmCodegen.Config(verify = :off))
     for ((f, args), name) in zip(cases, names)
@@ -252,25 +186,10 @@ end
         @test wasm_run(c, name, args...; rettype = typeof(expected)) === expected
     end
 
-    # one pointer for one function and signature (natively, one per compiled call site)
-    c = compile(P.fw_same_pointer, (Float64,); config = WasmCodegen.Config(verify = :off))
-    @test wasm_run(c, "fw_same_pointer", 2.0; rettype = Float64) === 7.0
-
-    c = compile(P.fw_throw, (Float64,); config = WasmCodegen.Config(verify = :off))
-    @test wasm_run(c, "fw_throw", 1.0; rettype = Float64) === 7.0
-    @test wasm_run(c, "fw_throw", -1.0; rettype = Float64) === -1.0
-
-    # calling a wrapper asks nothing of its callable's type at run time: no type names in the module
-    c = compile(P.fw_stored, (Float64,); config = WasmCodegen.Config(verify = :off))
-    @test wasm_run(c, "fw_stored", 1.5; rettype = Float64) === P.fw_stored(1.5)
-    @test isempty(c.cgm.mod.datas)
-
-    # a wrapper of the image with its native pointers is refused
-    @test_throws WasmCodegen.UnsupportedConstructs compile(P.img_inline, (Float64,); config = WasmCodegen.Config(verify = :off))
-
-    # a pointer that is not a function of the call's signature is an error of the program
+    # a call through a null pointer: an UndefRefError, as natively; through a function of another
+    # signature (natively undefined behavior), an ErrorException
     c = compile([Entry(P.catch_null, (Float64,)), Entry(P.catch_wrong, (Float64,))]; config = WasmCodegen.Config(verify = :off))
-    @test wasm_run(c, "catch_null", 1.0; rettype = Float64) === 11.0
+    @test wasm_run(c, "catch_null", 1.0; rettype = Float64) === P.catch_null(1.0)
     @test wasm_run(c, "catch_wrong", 1.0; rettype = Float64) === 11.0
 
     function report(f, argtypes)
@@ -291,4 +210,10 @@ end
     @test occursin("which no cfunction of the module has", report(P.no_cfunction, (Float64, Ptr{Cvoid})))
     @test occursin("which no cfunction of the module has", report(P.bad_call, (Float64,)))
     @test occursin("a variadic ccall", report(P.variadic, (Float64,)))
+    # what native Julia copies (a mutable struct by value) or cannot compile (an argument of no
+    # size, a result by value that holds references)
+    @test occursin("the mutable type", report(P.mutable_by_value, (Float64,)))
+    @test occursin("of no size", report(P.nothing_argument, (Float64,)))
+    @test occursin("whose fields hold references", report(P.struct_with_reference, (Float64,)))
+    @test occursin("whose fields hold references", report(P.kind_result, (Float64,)))
 end

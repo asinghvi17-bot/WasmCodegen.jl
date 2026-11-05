@@ -16,8 +16,15 @@ const CFUNCTION_BASE = Int64(0x4a4c_0000)
 
 is_ref_type(@nospecialize(T)) = T isa DataType && T.name === Ref.body.name
 
-"Whether values of type `T` in a C signature are C pointers."
-c_pointer_slot(@nospecialize(T)) = T === Any || is_ptr_type(T) || is_ref_type(T) || !Base.allocatedinline(T)
+"""
+Whether values of type `T` in a C signature are C pointers: `Any`, a `Ptr`, a `Ref`, and the
+types natively passed as their object: arrays, memories and the types of an opaque layout
+(`jl_type_mappable_to_c`). Other structs are passed by value, mutable ones and the kinds of
+types included (as Julia 1.12 and 1.13 pass them, `_julia_struct_to_llvm`).
+"""
+c_pointer_slot(@nospecialize(T)) =
+    T === Any || is_ptr_type(T) || is_ref_type(T) || T <: Array || T <: GenericMemory ||
+    T === String || T === Symbol || T === Core.SimpleVector || T === Module
 
 "The type a Julia function receives for an argument of type `T` of a C signature."
 c_julia_type(@nospecialize(T)) = is_ref_type(T) ? T.parameters[1] : T
@@ -27,12 +34,22 @@ function check_c_type(@nospecialize(T))
     T isa Type || unsupported("a C signature with ", T, ", which is not a type known at compile time")
     isconcretetype(c_julia_type(T)) ||
         unsupported("a C signature with the type ", T, ", which is not concrete")
+    # (natively a copy of the object, which the other side makes anew)
+    c_pointer_slot(T) || !ismutabletype(T) ||
+        unsupported("a C signature with the mutable type ", T, " by value")
 end
 
 function check_c_signature(@nospecialize(rt), argts::Vector{Any})
     rt === Union{} && unsupported("a C signature that does not return")
     check_c_type(rt)
-    foreach(check_c_type, argts)
+    # (natively errors: "return type struct fields cannot contain a reference", "argument
+    # type doesn't correspond to a C type")
+    c_pointer_slot(rt) || rt === Nothing || Base.datatype_pointerfree(rt) ||
+        unsupported("a C signature returning ", rt, " by value, whose fields hold references")
+    for T in argts
+        check_c_type(T)
+        c_pointer_slot(T) || Base.issingletontype(T) && unsupported("a C signature with an argument of the type ", T, ", of no size")
+    end
 end
 
 "The Wasm values of a C value of type `T`."
@@ -186,12 +203,10 @@ function emit_cfunction!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     argts = collect(Any, ex.args[4]::Core.SimpleVector)
     check_c_signature(rt, argts)
     cgm = fc.cgm
-    slot = get!(cgm.helpers, (:cfunction, f, rt, Tuple(argts))) do
-        t = cfunction_thunk!(fc, f, rt, argts)
-        _, _, funcs = cfunction_table!(cgm)
-        push!(funcs, t)
-        length(funcs)
-    end
+    # a slot of its own, as natively each compiled `cfunction` has a function of its own
+    _, _, funcs = cfunction_table!(cgm)
+    push!(funcs, cfunction_thunk!(fc, f, rt, argts))
+    slot = length(funcs)
     o = new_local!(fc, jlvalue_ref(cgm.types))
     emit!(fc.b, :i64_const, CFUNCTION_BASE + slot)
     return new_ptr!(fc, Ptr{Cvoid}, o, nothing)
@@ -206,6 +221,10 @@ function cfunction_target!(fc::FnCtx, sig::TypeRef)
         h = FnCtx(cgm, fc.info, nothing, Builder(cgm.mod, f))
         i = new_local!(h, I64)
         fr = new_local!(h, RefType(:func, true))
+        # a null pointer: an UndefRefError, as natively
+        emit!(h.b, :local_get, 0)
+        emit!(h.b, :i64_eqz)
+        if!(h.b); throw_error!(h, Runtime.throw_undefref_error); end!(h.b)
         emit!(h.b, :local_get, 0)
         emit!(h.b, :i64_const, CFUNCTION_BASE + 1)
         emit!(h.b, :i64_sub)
