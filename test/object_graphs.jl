@@ -27,6 +27,12 @@ module HoldsCodeInstance
     kinds(x::Float64) = typeof(DEFS.mi) === Core.MethodInstance && typeof(DEFS.m) === Method &&
                         typeof(REC.ci) === Core.CodeInstance ? x : -x
     probe_mi(x::Float64) = isdefined(DEFS.mi::Core.MethodInstance, :cache) ? x : -x
+    # a GlobalRef, whose binding refers back to it (`globalref`): the binding with its header only
+    const GR = Ref(GlobalRef(Base, :sin))
+    const GR2 = GlobalRef(Base, :sin)
+    globalref(x::Float64) = (g = GR[]; g.mod === Base && g.name === :sin && isdefined(g, :binding) &&
+                             g.binding === GR2.binding && typeof(g.binding) === Core.Binding ? x : -x)
+    back(x::Float64) = GR[].binding.globalref === GR[] ? x : -x
 end
 
 @testset "runtime objects held by the image" begin
@@ -34,9 +40,11 @@ end
     @wtest HoldsCodeInstance.same(2.0)
     @wtest HoldsCodeInstance.defs(3.0)
     @wtest HoldsCodeInstance.kinds(4.0)
+    @wtest HoldsCodeInstance.globalref(5.0)
     # no fields are serialized, so their definedness is not known
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(HoldsCodeInstance.probe, (Float64,); config = WasmCodegen.Config(verify = :off))
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(HoldsCodeInstance.probe_mi, (Float64,); config = WasmCodegen.Config(verify = :off))
+    @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(HoldsCodeInstance.back, (Float64,); config = WasmCodegen.Config(verify = :off))
 end
 
 # a mutable object reached again through a closure it holds (an integrator holding a callback whose

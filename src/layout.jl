@@ -212,7 +212,7 @@ memory_eltype(@nospecialize T) = T.parameters[2]
 # the runtime's own objects, which have no Julia-level layout to follow
 const RUNTIME_TYPES = Any[DataType, UnionAll, Union, Core.TypeofBottom, TypeVar,
                           Core.SimpleVector, Module, Method, Core.MethodInstance,
-                          Core.CodeInstance, Core.TypeName]
+                          Core.CodeInstance, Core.TypeName, Core.Binding]
 
 # the types of type objects: a module has one object per type it represents, in its image,
 # whose `objectid` is the native one (immutable or not)
