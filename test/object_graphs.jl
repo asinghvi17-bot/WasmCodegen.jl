@@ -112,6 +112,8 @@ module DeferredFailure
     const REC = let r = Rec(TypeVar(:T), 2.0, nothing); r.self = r; r end
     read(x::Float64) = x * (REC.self::Rec).k
     read2(x::Float64) = x + (REC.self::Rec).k
+    plain1(x::Float64) = x + 1.0
+    plain2(x::Float64) = x - 1.0
     const OUTER = let r = Rec(nothing, 3.0, nothing); r.self = Rec(TypeVar(:S), 0.5, r); r end
     nested(x::Float64) = x * OUTER.k
     VAR::Rec = Rec(TypeVar(:U), 4.0, nothing)
@@ -220,6 +222,24 @@ end
     @test queued in cgm.image.failed_owners
     @test !cgm.image.failed
     @test isempty(cgm.diagnostics)
+    # one that two optional functions need, the second after it is emitted: a program function
+    # that needs the second needs it too
+    mis = [W.entry_instance(f, (Float64,); world) for f in (D.plain1, D.plain2, D.read)]
+    cgm = W.CGModule(W.collect_world(mis; world, verify = :off), config)
+    cgm.image.optional_mode = true
+    a, b = W.get_function!(cgm, mis[1]), W.get_function!(cgm, mis[2])
+    W.process_worklist!(cgm)
+    cgm.image.optional_mode = false
+    h = W.with_image_owner(() -> W.get_function!(cgm, mis[3]), cgm.image, a)
+    W.process_worklist!(cgm)
+    while W.prepare_image_patches!(cgm) || !isempty(cgm.worklist)
+        W.process_worklist!(cgm)
+    end
+    @test W.with_image_owner(() -> W.get_function!(cgm, mis[3]), cgm.image, b) === h
+    @test h in cgm.image.optional && !cgm.image.failed
+    W.get_function!(cgm, mis[2])
+    @test !(h in cgm.image.optional)
+    @test cgm.image.failed
 end
 
 @testset "optional functions and the program's settings" begin
@@ -252,6 +272,15 @@ end
     @test W.get_function!(cgm, cyc) === first
     @test !(first in cgm.image.optional)
     @test any(d -> d.first === cyc, cgm.diagnostics)
+end
+
+# the runtime's generators, seeded from the host's entropy at the start, after the shells' fields
+# are set (as `rt_rand_seeded` of runtime.jl)
+shell_rand_seeded(x::Float64) = Libc.rand() != UInt32(362437) && Base.Partr.get_ptls_rng() != 0 ? x : -x
+
+@testset "the host's seeds with shell-first serialization" begin
+    c = WasmCodegen.compile(shell_rand_seeded, (Float64,); config = SHELL_FIRST)
+    @test wasm_run(c, "shell_rand_seeded", 1.5; rettype = Float64) === shell_rand_seeded(1.5) === 1.5
 end
 
 # a pointer field allowlisted in `Config(image_pointer_fields)` keeps its address with shell-first

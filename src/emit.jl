@@ -55,8 +55,16 @@ function get_function!(cgm::CGModule, mi::Core.MethodInstance)
     info = get(cgm.funcs, mi, nothing)
     if info !== nothing
         img = cgm.image
-        # an optional function that a program function needs too is no longer optional
-        info in img.optional && !(img.optional_mode || img.owner in img.optional) && promote_optional!(cgm, info)
+        if info in img.optional
+            if !(img.optional_mode || img.owner in img.optional)
+                # an optional function that a program function needs too is no longer optional
+                promote_optional!(cgm, info)
+            elseif img.owner in img.optional && img.owner !== info
+                # one that another optional function needs too: promoted with either
+                cs = get!(() -> Any[], img.optional_children, img.owner)
+                any(c -> c === info, cs) || push!(cs, info)
+            end
+        end
         return info
     end
     src = get(cgm.world.sources, mi, nothing)

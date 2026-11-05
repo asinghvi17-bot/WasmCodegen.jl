@@ -172,7 +172,7 @@ function seed_from_host!(cgm::CGModule, ref::Base.RefValue{UInt64})
         g = object_global!(cgm.image, ref)
         l = layout(cgm.types, typeof(ref))
         w = first(l.fields[1]) - 1
-        push!(cgm.image.init, Inst(:global_get, g), Inst(:call, host_func!(cgm, :entropy)),
+        push!(cgm.image.late, Inst(:global_get, g), Inst(:call, host_func!(cgm, :entropy)),
               Inst(:struct_set, l.wtype, w))
         nothing
     end

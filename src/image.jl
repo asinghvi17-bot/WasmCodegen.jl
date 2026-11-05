@@ -24,6 +24,9 @@ mutable struct Image
     inprogress::IdSet{Any}
     "Instructions of the start function: stores of the references of cycles, array fills."
     init::Vector{Inst}
+    "Instructions of the start function once the objects are complete: the runtime's state the
+    host seeds (`seed_from_host!`), which no field of a shell may overwrite."
+    late::Vector{Inst}
     "References to set by the start function, once every global exists: (global of the
     object, Wasm type, field or element index, value, declared type)."
     patches::Vector{Any}
@@ -53,7 +56,7 @@ mutable struct Image
 end
 
 Image(cgm) = Image(cgm, IdDict{Any,Global}(), IdDict{Any,Global}(), IdDict{Any,Global}(),
-                   IdSet{Any}(), Inst[], Any[],
+                   IdSet{Any}(), Inst[], Inst[], Any[],
                    Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global},Union{Nothing,Global}}}(), IdDict{Any,Global}(), 0,
                    UInt64[], nothing, false, false, IdSet{Any}(), IdDict{Any,Any}(), IdDict{Any,Vector{Any}}(),
                    IdSet{Any}(), IdDict{Any,Vector{Any}}(), IdDict{Any,Vector{Any}}())
@@ -707,7 +710,7 @@ large arrays): for WASI, the exported `_initialize` instead (`host.jl`).
 function finish_image!(cgm::CGModule)
     img = cgm.image
     ts = types(img)
-    isempty(img.init) && isempty(img.patches) && !img.failed && return
+    isempty(img.init) && isempty(img.patches) && isempty(img.late) && !img.failed && return
     f = add_func!(cgm.mod, "jl_init_image", ValType[], ValType[])
     b = Builder(cgm.mod, f)
     for inst in img.init
@@ -746,6 +749,9 @@ function finish_image!(cgm::CGModule)
         end
     end
     empty!(img.patches)
+    for inst in img.late
+        emit!(b, inst.op, inst.imm...)
+    end
     img.failed && unreachable!(b)
     finish!(b)
     if cgm.config.host === :wasi
