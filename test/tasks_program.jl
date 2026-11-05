@@ -48,10 +48,16 @@ function sleeps()
     t = @async (sleep(0.02); 6 * 7)
     println(Core.stdout, "fetch2 ", fetch(t)::Int)
     out = String[]
+    # (the sleeps start together, once each task runs: natively, compiling a task's code when it
+    # first runs may take longer than the sleeps differ; and the wide gaps make the order less
+    # sensitive to the program being paused between their starts)
+    go = Base.Event()
     # (Task handles kept typed: `@sync`'s Vector{Any} is a dynamic `wait`, not trim-safe)
-    ts = Task[@async((sleep(0.06); push!(out, "slow"))),
-              @async((sleep(0.01); push!(out, "fast"))),
-              @async((sleep(0.03); push!(out, "mid")))]
+    ts = Task[@async((wait(go); sleep(0.2); push!(out, "slow"))),
+              @async((wait(go); sleep(0.01); push!(out, "fast"))),
+              @async((wait(go); sleep(0.1); push!(out, "mid")))]
+    yield()
+    notify(go)
     foreach(wait, ts)
     println(Core.stdout, join(out, ","))
 end
