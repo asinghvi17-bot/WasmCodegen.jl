@@ -118,10 +118,9 @@ uses exception handling with `exnref`; one that catches none traps on a throw in
 
 Node 24 is the reference host: the tests run there. Node 24.21 enables `exnref` and JSPI
 (JavaScript Promise Integration) by default, so the tests pass no Wasm flags. JSPI is
-needed by the host's events of
-[#36](https://github.com/gbaraldi/WasmCodegen.jl/pull/36) and by Tasks on JSPI of
-[#37](https://github.com/gbaraldi/WasmCodegen.jl/pull/37) (both not merged). On a Node
-without JSPI by default, these need `--experimental-wasm-jspi`.
+needed by the host's events (`host_extensions = [:julia_io]`, `js/julia_io.mjs`) and by
+Tasks on JSPI (`tasks = :jspi`, `js/julia_task.mjs`). On a Node without JSPI by default,
+these need `--experimental-wasm-jspi`.
 
 For speed, keep the defaults: `wasm-opt -O3` and Node's own tiering. Node's
 `--liftoff-only`, `--no-liftoff` and `--no-wasm-dynamic-tiering` were each slower in
@@ -182,8 +181,8 @@ Partly supported. Tested locally with workerd 1.20261031.1 (V8 15.7) and not dep
 - **Doesn't run:** Node's WASI driver. workerd's `node:wasi` throws
   `ERR_METHOD_NOT_IMPLEMENTED` from its constructor, so `host = :wasi` modules need another
   implementation of their WASI imports. `js/julia.mjs` has one; in workerd only its
-  `random_get` has been exercised. The host's events of #36 (`js/julia_io.mjs`) fail too:
-  they detect the platform from Node's diagnostic report, which workerd doesn't fill in.
+  `random_get` has been exercised. The host's events (`js/julia_io.mjs`) and Tasks on
+  JSPI (`js/julia_task.mjs`) haven't been tried in workerd.
 - **Compiling at request time is disallowed** ("Wasm code generation disallowed by
   embedder"). Configure modules as Wasm modules of the Worker and instantiate the
   `WebAssembly.Module` they import. `instantiate(bytes)` of `js/julia.mjs` compiles bytes,
