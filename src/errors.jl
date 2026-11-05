@@ -69,15 +69,21 @@ Base.show(io::IO, s::StreamedInstance) = print_instance(io, s.x)
 
 function streamed_instances(@nospecialize(x))
     x isa Union{Core.MethodInstance,Core.CodeInstance} && return StreamedInstance(x)
+    x isa QuoteNode && return QuoteNode(streamed_instances(x.value))
     x isa Expr || return x
     return Expr(x.head, Any[streamed_instances(a) for a in x.args]...)
 end
 
 # as `show` prints a method or code instance, writing the signature as it goes
 function print_instance(io::IO, ci::Core.CodeInstance)
-    ci.def isa Core.MethodInstance || return show(io, ci)
     print(io, "CodeInstance for ")
-    print_instance(io, ci.def)
+    def = ci.def
+    if def isa Core.ABIOverride
+        print_instance(io, def.def)
+        print(io, " (ABI Overridden)")
+    else
+        print_instance(io, def::Core.MethodInstance)
+    end
 end
 
 function print_instance(io::IO, mi::Core.MethodInstance)

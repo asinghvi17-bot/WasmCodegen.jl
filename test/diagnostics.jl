@@ -66,6 +66,9 @@ end
     for x in (small, small.cache, unspecialized)
         stmt = Expr(:invoke, x, Core.Argument(2))
         @test WasmCodegen.diagnostic_statement(stmt, Int) == sprint(show, stmt) * "::Int64"
+        # (and quoted, a constant operand)
+        stmt = Expr(:call, Core.Argument(1), QuoteNode(x))
+        @test WasmCodegen.diagnostic_statement(stmt, Int) == sprint(show, stmt) * "::Int64"
     end
     # the work of rendering, as allocations: `show` of the statement renders the whole 2.6 MB
     # signature in a buffer first; its diagnostic, no more than it prints
@@ -73,6 +76,9 @@ end
     @test B.allocated(WasmCodegen.limited_sprint, show, stmt) > 2_000_000
     @test B.allocated(WasmCodegen.diagnostic_statement, stmt, Int) < 200_000
     @test B.allocated(WasmCodegen.diagnostic_string, instance(B.id, B.big())) < 200_000
+    stmt = Expr(:call, Core.Argument(1), QuoteNode(instance(B.id, B.big())))
+    @test B.allocated(WasmCodegen.limited_sprint, show, stmt) > 2_000_000
+    @test B.allocated(WasmCodegen.diagnostic_statement, stmt, Int) < 200_000
 
     # an error of the structurizer
     ir = Base.code_ircode(B.loop, (Int,))[1][1]
