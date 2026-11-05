@@ -224,12 +224,12 @@ function replacement_targets(codeinfos::Vector{Any}, replacement::Replacements)
     return targets
 end
 
-# whether `mi` is `Runtime.map_type_value`, whose calls the code generator compiles to a table
-# of its function's values, computed natively when it builds the module (`overlays.jl`): its
-# body runs natively only
+# whether `mi` is `Runtime.map_type`, `map_type_symbol` or `map_type_value`, whose calls the
+# code generator compiles to a table of its function's values, computed natively when it builds
+# the module (`overlays.jl`): its body runs natively only
 function compile_time_instance(mi::Core.MethodInstance)
     m = mi.def
-    return m isa Method && m.module === Runtime && m.name === :map_type_value
+    return m isa Method && m.module === Runtime && m.name in (:map_type, :map_type_symbol, :map_type_value)
 end
 
 # whether `mi` is `Runtime.original` (or its keyword body), which only the native bodies of
