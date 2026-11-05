@@ -396,8 +396,9 @@ them: a case that cannot be compiled traps there, and is not an error of the pro
 """
 function compile_runtime_cases!(cgm::CGModule)
     config, ndiag = cgm.config, length(cgm.diagnostics)
-    cgm.config = Config(; on_unsupported=:trap, trim=:unsafe, verify=config.verify,
-                        trim_patches=config.trim_patches, optimize=config.optimize)
+    # (the program's options, but a case that cannot be compiled traps)
+    cgm.config = Config(; (k => getfield(config, k) for k in fieldnames(Config))...,
+                        on_unsupported=:trap, trim=:unsafe)
     try
         while true
             n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm) +
