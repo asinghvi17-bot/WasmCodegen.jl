@@ -75,6 +75,11 @@ Base.@kwdef struct Config
     the `:julia_io` extension: the host provides the `julia_task` imports (`js/julia_task.mjs`)."
     tasks::Symbol = :none
     import_libraries::Vector{String} = String[]
+    "Mutable objects of the image are created as shells (header and default fields) whose fields
+    the start function sets, so that a cycle back to a mutable object through closures or
+    immutable objects (an ODE integrator holding callbacks whose closures capture it) can be
+    serialized."
+    shell_first_mutables::Bool = false
 end
 
 """
