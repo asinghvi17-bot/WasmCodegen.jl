@@ -10,7 +10,9 @@ const check = (what, got, want) => {
 const SENTINEL = 0xa5;
 const memory = new WebAssembly.Memory({ initial: 1 });
 const out = [];
-const host = createHost({ args: ['prog', '', 'ünï'], env: { A: '1', EMPTY: '', U: 'λ=x' }, write: (fd, b) => out.push([fd, ...b]) });
+// (an undefined value is no variable)
+const host = createHost({ args: ['prog', '', 'ünï'], env: { A: '1', EMPTY: '', GONE: undefined, U: 'λ=x' },
+                         write: (fd, b) => out.push([fd, ...b]) });
 host.attach({ exports: { memory } });
 const w = host.imports.wasi_snapshot_preview1;
 const bytes = () => new Uint8Array(memory.buffer);
@@ -52,18 +54,32 @@ check('fd_write(2)', [w.fd_write(2, 0, 1, 32), view().getUint32(32, true), out.a
 check('fd_write(0)', w.fd_write(0, 0, 1, 32), 8);
 check('fd_seek(1)', w.fd_seek(1, 0n, 0, 32), 70);
 check('fd_tell(0)', w.fd_tell(0, 32), 70);
+// (as a terminal's or a pipe's natively)
+check('fd_pread(0)', w.fd_pread(0, 0, 1, 0n, 32), 70);
+check('fd_pwrite(1)', w.fd_pwrite(1, 0, 1, 0n, 32), 70);
+check('fd_sync(1)', w.fd_sync(1), 28);
+check('fd_datasync(2)', w.fd_datasync(2), 28);
+check('fd_filestat_set_size(1)', w.fd_filestat_set_size(1, 0n), 28);
+check('fd_readdir(1)', w.fd_readdir(1, 64, 16, 0n, 32), 54);
+check('sock_recv(1)', w.sock_recv(1, 0, 1, 0, 32, 48), 57);
+check('fd_fdstat_set_flags(1)', w.fd_fdstat_set_flags(1, 0), 58);
 
 // no other descriptor is open; no directory is preopened
 check('fd_prestat_get(3)', w.fd_prestat_get(3, 0), 8);
 check('fd_write(3)', w.fd_write(3, 0, 1, 32), 8);
 check('fd_close(5)', w.fd_close(5), 8);
-check('fd_close(1)', w.fd_close(1), 58);
 check('path_open(3)', w.path_open(3, 0, 64, 2, 0, 0n, 0n, 0, 32), 8);
 check('path_open(1)', w.path_open(1, 0, 64, 2, 0, 0n, 0n, 0, 32), 54);
 check('path_symlink(.., fd 1, ..)', w.path_symlink(64, 2, 1, 64, 2), 54);
 check('path_symlink(.., fd 9, ..)', w.path_symlink(1, 2, 9, 64, 2), 8);
 check('poll_oneoff', w.poll_oneoff(0, 32, 1, 48), 52);
 check('sock_recv(3)', w.sock_recv(3, 0, 1, 0, 32, 48), 8);
+// a standard stream closed: closed as natively
+check('fd_close(1)', w.fd_close(1), 0);
+check('closed: fd_write(1)', w.fd_write(1, 0, 1, 32), 8);
+check('closed: fd_fdstat_get(1)', w.fd_fdstat_get(1, 8), 8);
+check('closed: fd_close(1)', w.fd_close(1), 8);
+check('fd_write(2) after', w.fd_write(2, 0, 1, 32), 0);
 
 // the clocks; after the memory grows
 memory.grow(1);
@@ -76,9 +92,13 @@ check('clock_time_get(2)', w.clock_time_get(2, 1n, 8), 28);
 check('clock_res_get(3)', w.clock_res_get(3, 8), 28);
 check('sched_yield', w.sched_yield(), 0);
 
-// proc_exit: thrown, its code unsigned
+// proc_exit: thrown, its code unsigned, the output flushed first
+let flushed = 0;
+const exiting = createHost({ write: Object.assign(() => {}, { flush: () => flushed++ }) });
+exiting.attach({ exports: { memory } });
 for (const [code, want] of [[3, 3], [-1, 4294967295]]) {
-  try { w.proc_exit(code); failures.push(`proc_exit(${code}) returned`); }
+  try { exiting.imports.wasi_snapshot_preview1.proc_exit(code); failures.push(`proc_exit(${code}) returned`); }
   catch (e) { check(`proc_exit(${code})`, [e instanceof WasiExit, e.code], [true, want]); }
 }
+check('flushes at proc_exit', flushed, 2);
 process.stdout.write(failures.map((f) => f + '\n').join(''));

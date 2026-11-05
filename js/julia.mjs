@@ -17,8 +17,8 @@
 // Uint8Array of UTF-8; by default it is written to the console line by line. `args` (an
 // array of strings) and `env` (an object of strings) are WASI's arguments and environment.
 
-const WASI_EBADF = 8, WASI_EINVAL = 28, WASI_ENOSYS = 52, WASI_ENOTDIR = 54, WASI_ENOTSUP = 58,
-  WASI_ESPIPE = 70;
+const WASI_EBADF = 8, WASI_EINVAL = 28, WASI_ENOSYS = 52, WASI_ENOTDIR = 54, WASI_ENOTSOCK = 57,
+  WASI_ENOTSUP = 58, WASI_ESPIPE = 70;
 const FILETYPE_CHARACTER_DEVICE = 2;
 const RIGHT_FD_READ = 1n << 1n, RIGHT_FD_WRITE = 1n << 6n, RIGHT_POLL_FD_READWRITE = 1n << 27n;
 
@@ -84,7 +84,8 @@ const cStrings = (strs) => strs.map((x) => new TextEncoder().encode(x + '\0'));
 export function createHost({ write, args = [], env = {} } = {}) {
   const out = write ?? consoleWriter();
   const argv = cStrings(args.map(String));
-  const environ = cStrings(Object.entries(env).map(([k, v]) => `${k}=${v}`));
+  // (an undefined value is no variable, as for Node's WASI)
+  const environ = cStrings(Object.entries(env).filter(([, v]) => v !== undefined).map(([k, v]) => `${k}=${v}`));
   let memory = null;
   const view = () => new DataView(memory.buffer);
   const julia = {
@@ -116,7 +117,9 @@ export function createHost({ write, args = [], env = {} } = {}) {
     });
     return 0;
   };
-  const isStdio = (fd) => fd === 0 || fd === 1 || fd === 2;
+  // the standard streams, until the module closes them
+  const open = new Set([0, 1, 2]);
+  const isStdio = (fd) => open.has(fd);
   // a function of a descriptor: no other descriptor than the standard streams is open
   const onFd = (f = () => WASI_ENOTSUP) => (fd, ...a) => (isStdio(fd) ? f(fd, ...a) : WASI_EBADF);
   const clockNs = (id) => (id === 0 ? realtimeNs() : id === 1 ? monotonicNs() : null);
@@ -156,10 +159,17 @@ export function createHost({ write, args = [], env = {} } = {}) {
       view().setBigUint64(ptr + 24, 1n, true);
       return 0;
     }),
+    // (the errnos of a terminal's or a pipe's descriptor, natively)
     fd_seek: onFd(() => WASI_ESPIPE),
     fd_tell: onFd(() => WASI_ESPIPE),
-    fd_sync: onFd(() => 0),
-    fd_datasync: onFd(() => 0),
+    fd_pread: onFd(() => WASI_ESPIPE),
+    fd_pwrite: onFd(() => WASI_ESPIPE),
+    fd_sync: onFd(() => WASI_EINVAL),
+    fd_datasync: onFd(() => WASI_EINVAL),
+    fd_filestat_set_size: onFd(() => WASI_EINVAL),
+    fd_readdir: onFd(() => WASI_ENOTDIR),
+    // (a stream closed is EBADF from then on)
+    fd_close: onFd((fd) => { open.delete(fd); return 0; }),
     // (no directory is preopened: the descriptors after the standard streams are not open)
     fd_prestat_get: () => WASI_EBADF,
     fd_prestat_dir_name: () => WASI_EBADF,
@@ -180,7 +190,8 @@ export function createHost({ write, args = [], env = {} } = {}) {
       return 0;
     },
     sched_yield: () => 0,
-    proc_exit(code) { throw new WasiExit(code); },
+    // (the output written, as natively at an exit)
+    proc_exit(code) { out.flush?.(); throw new WasiExit(code); },
     proc_raise: () => WASI_ENOSYS,
     poll_oneoff: () => WASI_ENOSYS,
     // (its directory's descriptor is its third argument)
@@ -188,8 +199,9 @@ export function createHost({ write, args = [], env = {} } = {}) {
   };
   for (const name of WASI_FUNCTIONS) {
     if (name in wasi) continue;
-    // a path is relative to a directory's descriptor: none is open
-    wasi[name] = name.startsWith('path_') ? onFd(() => WASI_ENOTDIR) : onFd();
+    // a path is relative to a directory's descriptor: none is open; no stream is a socket
+    wasi[name] = onFd(name.startsWith('path_') ? () => WASI_ENOTDIR :
+                      name.startsWith('sock_') ? () => WASI_ENOTSOCK : undefined);
   }
   return {
     imports: { julia, wasi_snapshot_preview1: wasi },
