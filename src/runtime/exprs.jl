@@ -1,5 +1,5 @@
-# The arguments of `Expr`s the code generator builds: `Core._expr` (`Expr(head, args...)`)
-# and splatting into `Expr` (see `builtins.jl`).
+# The arguments of `Expr`s the code generator builds: `Core._expr` (`Expr(head, args...)`, see
+# `builtins.jl`), with native Julia's errors (`jl_f__expr`).
 
 module Exprs
 
@@ -7,24 +7,11 @@ module Exprs
 expr_args(n::Int) = Vector{Any}(undef, n)
 
 set_arg!(v::Vector{Any}, i::Int, @nospecialize(x)) = (@inbounds v[i] = x; nothing)
-push_arg!(v::Vector{Any}, @nospecialize(x)) = (push!(v, x); nothing)
 
-"Append the elements of the iterable `x` to `v`."
-function append_args!(v::Vector{Any}, x)
-    for a in x
-        push!(v, a)
-    end
-    return nothing
-end
+"The head `h` of an `Expr`: a `Symbol`, else a TypeError."
+expr_head(@nospecialize(h)) = h isa Symbol ? h : throw(TypeError(:Expr, "", Symbol, h))
 
-"`Expr(v...)`: the head (a `Symbol`, else a `TypeError` as natively), then the arguments."
-function expr_from_args(v::Vector{Any})
-    isempty(v) && throw(ArgumentError("too few arguments to Expr"))
-    head = popfirst!(v)
-    head isa Symbol || throw(TypeError(:Expr, "", Symbol, head))
-    ex = Expr(head)
-    ex.args = v
-    return ex
-end
+"`Core._expr()`, without a head."
+@noinline throw_no_head() = throw(ArgumentError("Expr: too few arguments (expected 1)"))
 
 end
