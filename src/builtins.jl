@@ -390,6 +390,8 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return outlined_memorynew!(fc, constant_value(args[1]), args[2])
     elseif f === Core._apply_iterate
         return emit_apply_iterate!(fc, args, typ)
+    elseif f === Core._expr
+        return new_expr!(fc, CGVal[a for a in args])
     elseif f === Core.fieldtype && length(args) == 2 && args[1] isa CGVal && isconstant(args[1]) &&
            constant_value(args[1]) isa DataType && isconcretetype(constant_value(args[1])) &&
            args[2] isa CGVal && (args[2].typ === Symbol || args[2].typ <: Integer)
@@ -1003,6 +1005,27 @@ end
 memory_type(@nospecialize(R)) = GenericMemory{R.parameters[1],R.parameters[2],R.parameters[3]}
 
 eltype_intersects(@nospecialize(A), @nospecialize(B)) = typeintersect(A, B) !== Union{}
+
+"""
+    new_expr!(fc, args) -> CGVal
+
+`Core._expr(head, args...)`, what `Expr(head, args...)` calls: an `Expr` whose arguments are a
+new `Vector{Any}` of the values `args`; as natively (`jl_f__expr`), without a head an
+ArgumentError, of a head that is not a `Symbol` a TypeError.
+"""
+function new_expr!(fc::FnCtx, args::Vector{CGVal})
+    isempty(args) && return throw_error!(fc, Runtime.Exprs.throw_no_head)
+    head = args[1]
+    if !(head.typ <: Symbol)
+        head = call_runtime!(fc, Runtime.Exprs.expr_head, CGVal[convert_repr(fc, head, Any)])
+        head.kind === Bottom && return head
+    end
+    v = call_runtime!(fc, Runtime.Exprs.expr_args, CGVal[const_value(fc, length(args) - 1)])
+    for i in 2:length(args)
+        call_runtime!(fc, Runtime.Exprs.set_arg!, CGVal[v, const_value(fc, i - 1), convert_repr(fc, args[i], Any)])
+    end
+    return emit_new!(fc, Expr, CGVal[convert_repr(fc, head, Symbol), v])
+end
 
 """
     emit_apply_iterate!(fc, args, typ) -> CGVal

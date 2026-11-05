@@ -868,8 +868,9 @@ function trap_function!(cgm::CGModule, info)
     finish!(b)
 end
 
-# runtime objects serialized with their header only (modules are named objects, above)
-const OPAQUE_RUNTIME_TYPES = Any[Core.CodeInstance, Core.MethodInstance, Method]
+# runtime objects serialized with their header only (modules are named objects, above): a
+# `GlobalRef`'s binding too (whose `globalref` refers back to it)
+const OPAQUE_RUNTIME_TYPES = Any[Core.CodeInstance, Core.MethodInstance, Method, Core.Binding]
 
 function opaque_object_global!(img::Image, @nospecialize(x))
     ts = types(img)
