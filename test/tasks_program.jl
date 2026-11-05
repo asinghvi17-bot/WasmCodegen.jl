@@ -521,6 +521,26 @@ function sync_typed_channel()
     println(Core.stdout, "sync of a Channel{Int}: ", isready(c))
 end
 
+# a type of the program's own with a `wait` of its own, which `@sync` waits for (its case is
+# compiled with the program's options: the host's clock)
+struct Turn end
+function Base.wait(::Turn)
+    time() > 0 || error("no clock")
+    yield()
+    return nothing
+end
+function sync_own_wait()
+    q = Channel{Any}(1)
+    put!(q, Turn())
+    r = try
+        Base.sync_end(q)
+        "no error"
+    catch e
+        e isa CompositeException ? string(typeof(first(e.exceptions))) : "other"
+    end
+    println(Core.stdout, "sync of a type's own wait: ", r)
+end
+
 # an exception of the program's, with its `showerror`: on stderr as natively (`errormonitor`)
 struct MyError <: Exception
     code::Int
@@ -568,6 +588,7 @@ function main()::Int32
     waiting_threads()
     many_timers()
     sync_typed_channel()
+    sync_own_wait()
     println(Core.stdout, "done")
     return Int32(0)
 end

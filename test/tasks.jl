@@ -32,6 +32,9 @@ const P = TasksProgram
                             config=WasmCodegen.Config(host=:wasi, host_extensions=[:julia_io], tasks=:jspi,
                                                       verify=:error))
     @test isempty(c.cgm.diagnostics)
+    # none of the JavaScript host's imports (`julia`) in a module for WASI, the runtime's cases
+    # included (`@sync`'s `wait` of the program's own type, `sync_own_wait`, reads the clock)
+    @test !any(f -> f.imported !== nothing && f.imported[1] == "julia", c.cgm.mod.funcs)
     wasm = joinpath(mktempdir(), "tasks.wasm")
     write(wasm, c.bytes)
     calls = [Dict("fn" => "main_safe"),
