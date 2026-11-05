@@ -7,6 +7,11 @@ implib_add(x::Int32, y::Int64) = ccall((:add, "implib_test"), Int64, (Int32, Int
 implib_note(x::UInt32) = (ccall((:note, "implib_test"), Cvoid, (UInt32,), x); x + UInt32(1))
 implib_both(x::Int32) = implib_add(x, Int64(1)) + ccall((:twice, "implib_other"), UInt64, (UInt64,), UInt64(x))
 implib_float(x::Float64) = ccall((:half, "implib_test"), Float64, (Float64,), x)
+# an import reached only through a case of the runtime: the `showerror` of an exception of the
+# program's, which the host's error text calls by the exception's type
+struct ImplibError <: Exception end
+Base.showerror(io::IO, ::ImplibError) = (ccall((:note, "implib_test"), Cvoid, (UInt32,), UInt32(9)); print(io, "noted"))
+implib_error_text(x::UInt32) = UInt32(length(WasmCodegen.Runtime.Host.error_text(ImplibError()))) + x
 
 import_list(c) = sort!([(f.imported[1], f.imported[2], f.params, f.results)
                         for f in c.cgm.mod.funcs if f.imported !== nothing &&
@@ -53,6 +58,12 @@ end
                                 ("implib_test", "add", ValType[I32, I64], ValType[I64])]
     lib = "{ implib_test: { add: (x, y) => BigInt(x) + y }, implib_other: { twice: (x) => 2n * x } }"
     @test run_import_libraries(both, "implib_both", lib, Int32(5)) == ("16", String[])
+
+    # through a case of the runtime (compiled with the program's options)
+    err = WasmCodegen.compile(implib_error_text, (UInt32,); config = wasi(import_libraries = ["implib_test"]))
+    @test import_list(err) == [("implib_test", "note", ValType[I32], ValType[])]
+    lib = "{ implib_test: { note: (x) => { log.push(`note \${x >>> 0}`); } } }"
+    @test run_import_libraries(err, "implib_error_text", lib, UInt32(1)) == ("6", ["note 9"])
 
     # a library not declared is a C library, as before: unsupported
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(implib_add, (Int32, Int64); config = wasi())
