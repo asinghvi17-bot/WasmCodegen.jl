@@ -3,13 +3,40 @@
 
 ## declarations
 
-"The Julia argument types of the function of `mi`: its signature, varargs packed in a tuple."
+"""
+The Julia argument types of the function of `mi`: its signature, varargs packed in a tuple of
+the type native codegen gives them (`va_tuple_type`).
+"""
 function function_argtypes(mi::Core.MethodInstance)
     sig = Any[Base.unwrap_unionall(mi.specTypes).parameters...]
     m = mi.def
     (m isa Method && m.isva) || return sig
     n = Int(m.nargs)
-    return Any[sig[1:n-1]..., Tuple{sig[n:end]...}]
+    return Any[sig[1:n-1]..., va_tuple_type(sig[n:end])]
+end
+
+"""
+    va_tuple_type(ts) -> Type
+
+The type of the tuple of varargs of the types `ts`, as native codegen has it
+(`compute_va_type`) and inference types the argument: an element `Type{X}` of which `X` is
+the only value is of the type of `X` (`Tuple{Type{UInt64}, Float64}`, which no value has, is
+`Tuple{DataType, Float64}`), another that a type may be of is joined with `Type`.
+"""
+va_tuple_type(ts) = Tuple{Any[is_uniquerep_Type(T) ? typeof(T.parameters[1]) :
+                              ccall(:jl_has_intersect_type_not_kind, Cint, (Any,), T) != 0 ? Union{T,Type} : T
+                              for T in ts]...}
+
+# whether `T` is `Type{X}` with `X` its only value (`is_uniquerep_Type` of codegen.cpp)
+is_uniquerep_Type(@nospecialize T) = T isa DataType && T.name === Type.body.name && type_has_unique_rep(T.parameters[1])
+
+function type_has_unique_rep(@nospecialize t)
+    t === Core.TypeofBottom && return false
+    t === Union{} && return true
+    t isa TypeVar && return false
+    t isa Union{DataType,UnionAll,Union,Core.TypeofBottom} || return true
+    isconcretetype(t) && return true
+    return t isa DataType && t.name !== Tuple.name && all(type_has_unique_rep, t.parameters)
 end
 
 function function_name(cgm::CGModule, mi::Core.MethodInstance)

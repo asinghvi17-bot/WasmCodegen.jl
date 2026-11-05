@@ -60,8 +60,8 @@ function make_tuple(fc::FnCtx, @nospecialize(T), vals::Vector{CGVal})
     l = layout(fc, T)
     l.kind === Boxed && l.elements !== nothing && return new_tuple_array!(fc, T, vals)
     if !isconcretetype(T) && !is_inline_tuple(T)
-        # the concrete tuple type of the values
-        T = Tuple{(v.typ for v in vals)...}
+        # the concrete tuple type of the values (of a constant, its type: a type object's kind)
+        T = Tuple{(isconstant(v) && !isconcretetype(v.typ) ? typeof(constant_value(v)) : v.typ for v in vals)...}
         isconcretetype(T) || unsupported("a tuple of abstract type ", T)
     end
     return emit_new!(fc, T, vals)
