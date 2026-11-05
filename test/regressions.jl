@@ -1,5 +1,5 @@
 # Programs that were compiled wrong: identity, layouts, pointers, undefined values, tuples of
-# unknown length, and LAPACK's extreme magnitudes
+# unknown length, varargs with type objects, and LAPACK's extreme magnitudes
 
 using LinearAlgebra
 
@@ -112,6 +112,37 @@ rg_vt_field(n::Int) = (a = rg_id(Any[RGVt((n, "a"))])[1]; b = rg_id(Any[RG_VT])[
 rg_svd(x::Float64) = (s = svdvals([x 2x; 3x 4x]); (s[1] / x, s[2] / x, svdvals(fill(x, 1, 1))[1] / x))
 rg_eig(x::Float64) = (e = eigvals(Symmetric([2x x 0; x 3x x; 0 x 4x])); (e[1] / x, e[2] / x, e[3] / x))
 
+# varargs with a `Type{X}` element, packed in a tuple of the type native codegen gives them
+# (`Tuple{DataType, Float64}`; `Tuple{Type{UInt64}, Float64}`, the signature's, is no value's
+# type), then boxed (an `InexactError`'s arguments, with a union element too)
+@noinline rg_pick(c::Bool) = c ? 1.5 : 1
+rg_bits(a) = (a isa Tuple{DataType,Float64}, a isa Tuple{DataType,Int}, a isa Tuple{Any,Float64},
+              typeof(a) === Tuple{DataType,Float64})
+rg_type_tuple(c::Bool) = rg_bits(InexactError(:ceil, UInt64, rg_pick(c)).args)
+# varargs with a type object, packed as native codegen packs them: of 65 elements (no longer
+# inline, as a tuple of the signature's types would be)
+struct RgHold
+    a
+end
+@noinline rg_hold(args...) = RgHold(args)
+@eval rg_type_many(x::Float64) = (h = rg_hold(UInt64, $(fill(:x, 64)...)); (h.a[2]::Float64) + (h.a[65]::Float64) + (h.a[1] === UInt64))
+# an entry point with varargs and a type object: its export takes the arguments as a function
+# without varargs would (no parameter for the type object)
+rg_ventry(xs...) = xs[2]::Float64 + (xs[1] === Int)
+# and one whose method's signature is wider than the entry's (`@nospecialize`): the entry's
+Base.@nospecializeinfer rg_nsentry(@nospecialize(x), ys::Int...) = (x::Int) + 10 * length(ys) + 100 * ys[1]
+Base.@nospecializeinfer rg_nsentry1(@nospecialize(x)) = (x::Int) + 1
+const RG_XS = (Inf, 1)
+function rg_type_tuple_loop(i::Int)
+    r = (false, false, false, false)
+    k = 0
+    for x in RG_XS
+        (k += 1) == i || continue
+        r = try ceil(UInt64, x * 1000); r catch e; rg_bits((e::InexactError).args) end
+    end
+    return r
+end
+
 @testset "regressions" begin
     for i in 1:5
         @wtest rg_typekeys(i)
@@ -149,6 +180,12 @@ rg_eig(x::Float64) = (e = eigvals(Symmetric([2x x 0; x 3x x; 0 x 4x])); (e[1] / 
     @wtest rg_vt_absent_egal(17)
     @wtest rg_vt_storage(70)
     @wtest rg_vt_field(3); @wtest rg_vt_field(4)
+    @wtest rg_type_tuple(true); @wtest rg_type_tuple(false)
+    @wtest rg_type_tuple_loop(1); @wtest rg_type_tuple_loop(2)
+    @wtest rg_type_many(1.5)
+    @test wasm_run(wcompile(rg_ventry, (Type{Int}, Float64)), "rg_ventry", 1.5; rettype = Float64) === rg_ventry(Int, 1.5)
+    @test wasm_run(wcompile(rg_nsentry, (Int, Int)), "rg_nsentry", 3, 4; rettype = Int) === rg_nsentry(3, 4)
+    @test wasm_run(wcompile(rg_nsentry1, (Int,)), "rg_nsentry1", 3; rettype = Int) === rg_nsentry1(3)
     for x in (1.0, 1e100, 1e-100, 1e200, 1e-200, 1e300, 1e-300)
         @wtest_approx rg_svd(x)
         @wtest_approx rg_eig(x)

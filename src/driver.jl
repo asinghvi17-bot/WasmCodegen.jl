@@ -110,6 +110,40 @@ function run_restores(restores::Vector{Any})
     return failure
 end
 
+"""
+    entry_function!(cgm, info, e) -> Func
+
+The function the entry point `e` exports: the function of `info` where it takes the entry's
+argument types as they are; else (varargs, packed in a tuple; arguments of the method's
+signature wider than the entry's, `@nospecialize`) one taking the entry's arguments (a type
+object, a ghost, takes none) that calls it as a call does.
+"""
+function entry_function!(cgm::CGModule, info::FuncInfo, e::Entry)
+    m = info.mi.def
+    spec = Any[Base.unwrap_unionall(info.mi.specTypes).parameters...]
+    sig = Any[spec[1], e.argtypes...]
+    (m isa Method && m.isva) || sig != spec || return info.func
+    params = ValType[]
+    foreach(T -> append!(params, valtypes(cgm, T)), sig)
+    f = add_func!(cgm.mod, helper_name(cgm, "entry"), params, info.func.results)
+    fc = FnCtx(cgm, info, nothing, Builder(cgm.mod, f))
+    args = CGVal[]
+    k = 0
+    for T in sig
+        l = layout(cgm, T)
+        if l.kind === Ghost
+            push!(args, ghost(T, something(ghost_value(T))))
+        else
+            push!(args, CGVal(T, l.kind, LeafVal[k + j for j in 0:length(l.leaves)-1]))
+            k += length(l.leaves)
+        end
+    end
+    r = emit_call_info!(fc, info, args)
+    is_unreachable(fc.b) || r.kind === Bottom || push_val!(fc, r)
+    finish!(fc.b)
+    return f
+end
+
 function emit_module(w::ClosedWorld, mis::Vector{Core.MethodInstance}, entries::Vector{Entry},
                      config::Config, validate::Bool)
     mode = exception_mode(w)
@@ -118,7 +152,7 @@ function emit_module(w::ClosedWorld, mis::Vector{Core.MethodInstance}, entries::
         cgm = CGModule(w, config, mode)
         for (e, mi) in zip(entries, mis)
             info = get_function!(cgm, mi)
-            add_export!(cgm.mod, e.name, info.func)
+            add_export!(cgm.mod, e.name, entry_function!(cgm, info, e))
         end
         process_worklist!(cgm)
         compile_runtime_cases!(cgm)
