@@ -1080,15 +1080,17 @@ end
 """
     type_param_class(types, p) -> Vector{Any}
 
-The module's type objects (of `types`) equal to the type `p` (`jl_types_equal`), `p` first:
+The module's type objects (of `types`; `abstract`, those not concrete) equal to the type `p`
+(`jl_types_equal`), `p` first:
 those the type cache may take for it as a parameter (`typekey_eq`, after `normalize_unionalls`
 and `extract_wrapper`: `Tuple{S,S} where S` for `Tuple{T,T} where T`, `Tuple{Vararg{Int,N}}
 where N` for `Tuple{Vararg{Int}}`, `Vector{T} where Int<:T<:Int` for `Vector{Int}`). Which of
 them a row takes is decided natively, by applying `W` to them (`same_application`).
 """
-function type_param_class(types::Vector{Any}, @nospecialize(p))
+function type_param_class(types::Vector{Any}, abstract::Vector{Any}, @nospecialize(p))
     class = Any[p]
-    for Q in types
+    # (two concrete types are equal only if they are one: of a concrete `p`, the others only)
+    for Q in (p isa DataType && isconcretetype(p) ? abstract : types)
         Q !== p && p == Q && push!(class, Q)
     end
     return class
@@ -1107,7 +1109,7 @@ end
 
 function finish_apply_type!(cgm::CGModule)
     img, ts = cgm.image, cgm.types
-    types = nothing
+    types = abstract = nothing
     classes = IdDict{Any,Vector{Any}}()
     for (k, h) in cgm.helpers
         (k isa Tuple && length(k) == 3 && k[1] === :apply_type) || continue
@@ -1123,8 +1125,11 @@ function finish_apply_type!(cgm::CGModule)
                     # objects that natively gives this type in place of `p`, as the type cache
                     # takes types equal to it, `typekey_eq`; the rows stay disjoint, as each
                     # object gives one type)
-                    types === nothing && (types = type_objects(cgm))
-                    class = get!(() -> type_param_class(types, p), classes, p)
+                    if types === nothing
+                        types = type_objects(cgm)
+                        abstract = Any[Q for Q in types if !(Q isa DataType && isconcretetype(Q))]
+                    end
+                    class = get!(() -> type_param_class(types, abstract, p), classes, p)
                     class = Any[Q for Q in class if same_application(W, P, i, Q, T)]
                     for (j, Q) in enumerate(class)
                         emit!(b, :local_get, i - 1)
