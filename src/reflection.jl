@@ -153,12 +153,23 @@ function finish_typeof!(cgm::CGModule)
 end
 
 """
+    map_value!(cgm, f, T)
+
+`f(T)` of a function of types (`Runtime.map_type`), once per compilation: the tables are built
+to a fixpoint of the image's objects, so a type's value is one object, though `f` may make a
+new one on each call (`Runtime.type_hash`: natively, in a session of patches, any task's
+`hash(::Type)` calls it, so it keeps no cache of its own).
+"""
+map_value!(cgm::CGModule, @nospecialize(f), @nospecialize(T)) =
+    get!(() -> f(T), get!(() -> IdDict{Any,Any}(), cgm.helpers, (:map_values, f))::IdDict{Any,Any}, T)
+
+"""
     emit_map_type!(fc, f, T) -> CGVal
 
 `Runtime.map_type(f, T)`: the type `f(T)`, from a table of `f` over the module's types.
 """
 function emit_map_type!(fc::FnCtx, @nospecialize(f), t::CGVal)
-    isconstant(t) && return const_value(fc, f(constant_value(t)))
+    isconstant(t) && return const_value(fc, map_value!(fc.cgm, f, constant_value(t)))
     h = get!(fc.cgm.helpers, (:map_type, f)) do
         jl = jlvalue_ref(fc.cgm.types)
         add_func!(fc.cgm.mod, string("jl_map_type_", nameof(f)), ValType[jl], ValType[jl])
@@ -185,7 +196,7 @@ function finish_type_maps!(cgm::CGModule)
     refs = array_type!(ts, jl)
     for (f, h) in maps
         gidx = index_global!(cgm, string("jl_map_type_index_", nameof(f)), type_index(cgm, types))
-        elems = Inst[Inst(:global_get, object_global!(img, f(T))) for T in types]
+        elems = Inst[Inst(:global_get, object_global!(img, map_value!(cgm, f, T))) for T in types]
         values = add_global!(cgm.mod, string("jl_map_type_", nameof(f)), RefType(refs, false), false,
                              Inst[elems..., Inst(:array_new_fixed, refs, length(types))])
         b = Builder(cgm.mod, h)
@@ -228,7 +239,7 @@ function add_type_map_types!(cgm::CGModule)
     n = length(types)
     while true
         for f in maps, T in types
-            object_global!(cgm.image, f(T))
+            object_global!(cgm.image, map_value!(cgm, f, T))
         end
         all = type_objects(cgm)
         length(all) == length(types) && break
