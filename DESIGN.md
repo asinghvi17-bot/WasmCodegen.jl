@@ -313,9 +313,12 @@ built it.
   (`MAP_FAILED`, `INVALID_HANDLE_VALUE`), the `Ptr` fields of mutable objects (not `const`,
   from Julia 1.13.3), the `Ptr`s boxed in their fields that are not `const` (and in the
   reference slots of values stored inline in them), and the `Ptr` elements of memories (and
-  the boxed ones, and those in the reference slots of inline elements): a `Regex`'s compiled
-  pattern is compiled again on first use. Natively, other pointers (of immutable objects) are
-  kept as they are; here a non-null one, but -1, is rejected unless its field is allowlisted by
+  the boxed ones, and those in the reference slots of inline elements), and the `Ptr` value of a
+  global variable: a `Regex`'s compiled pattern is compiled again on first use. The slots are
+  native ones: a value stored inline natively but an object here is reset as where it is stored,
+  and a large tuple's elements (an array here) are not a memory's. Natively, other pointers (of
+  immutable objects, or constants) are kept as they are; here a non-null one, but -1, is
+  rejected unless its field is allowlisted by
   `Config(image_pointer_fields)` (then it is kept as an address without owner).
 - A symbol carries its hash, as Julia's runtime computed it, so that dictionaries with
   symbol keys built at compile time are found at run time.

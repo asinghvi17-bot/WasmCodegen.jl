@@ -40,8 +40,9 @@ The configuration of the code generator:
 - `image_pointer_fields`: the `(type, field name)`s whose pointers of the build process
   (addresses without an owner) the image may hold as they are. Otherwise, as native images,
   the image holds as null (but for -1) the `Ptr` fields of mutable objects (not `const`, from
-  Julia 1.13.3), `Ptr`s boxed in their fields that are not `const`, and the `Ptr` elements of
-  memories; any other non-null one (of an immutable object), but -1, is an unsupported construct;
+  Julia 1.13.3), `Ptr`s boxed in their fields that are not `const`, the `Ptr` elements of
+  memories and the `Ptr` values of global variables; any other non-null one (of an immutable
+  object, or a constant), but -1, is an unsupported construct;
 - `extra_patches`: files of patches applied after the default ones (`trim_patches`), in
   the same session (see [`with_trim_patches`](@ref)): method definitions only;
 - `patch_bindings`: `name => value` bindings the patch files see (the modules they patch,

@@ -92,6 +92,29 @@ read_ptrs() = (u(PTRS[1]), u(PTRS[2]), u(PTRS[3]))
 read_anys() = u(ANYS[1]::Ptr{Cvoid})
 read_inlines() = (u(INLINES[1].p), u(INLINES[1].a::Ptr{Cvoid}))
 read_inline_ref() = (u(INLINE_REF[].p), u(INLINE_REF[].a::Ptr{Cvoid}))
+# stored inline natively, an object here (more leaves than `MAX_INLINE_LEAVES`): reset as
+# where it is stored
+struct Wide
+    a::Any
+    pad::NTuple{64,Int}
+end
+global WIDES::Vector{Wide} = [Wide(p(1), ntuple(_ -> 0, 64))]
+global WIDE_REF::Base.RefValue{Wide} = Ref(Wide(p(2), ntuple(_ -> 0, 64)))
+read_wides() = u(WIDES[1].a::Ptr{Cvoid})
+read_wide_ref() = u(WIDE_REF[].a::Ptr{Cvoid})
+# a large tuple's pointers (inline natively, an array here): kept
+global BIG_REF::Base.RefValue{NTuple{33,Ptr{Cvoid}}} = Ref(ntuple(_ -> p(3), 33))
+global BIG_ANY::Vector{Any} = Any[ntuple(_ -> p(4), 33)]
+read_big_ref(i::Int) = u(BIG_REF[][i])
+read_big_any(i::Int) = u((BIG_ANY[1]::NTuple{33,Ptr{Cvoid}})[i])
+# global variables (a binding's value): reset; a constant: kept
+global G_PTR = p(5)
+global G_TYPED::Ptr{Cvoid} = p(6)
+global G_ANY::Any = p(7)
+global G_MINUS1::Ptr{Cvoid} = p(-1)
+const C_PTR = p(8)
+read_globals() = (u(G_PTR::Ptr{Cvoid}), u(G_TYPED), u(G_ANY::Ptr{Cvoid}), u(G_MINUS1))
+read_const_global() = u(C_PTR)
 end
 
 @testset "image pointers" begin
@@ -157,6 +180,16 @@ end
     @test run(P.read_anys, UInt) == 0
     @test run(P.read_inlines, T2) == (0, 0)
     @test run(P.read_inline_ref, T2) == (0, 0)
+    # stored inline natively, an object here: reset as where it is stored
+    @test run(P.read_wides, UInt) == 0
+    @test run(P.read_wide_ref, UInt) == 0
+    # a large tuple's pointers: kept natively, so addresses here
+    for f in (P.read_big_ref, P.read_big_any)
+        @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(f, (Int,); config)
+    end
+    # global variables: null, but for -1; a constant's pointer is kept (folded into the code)
+    @test run(P.read_globals, Tuple{UInt,UInt,UInt,UInt}) == (0, 0, 0, typemax(UInt))
+    @test run(P.read_const_global, UInt) == 8 == P.read_const_global()
 end
 
 # the runtime's Unicode tables have no unused capacity (the image serializes all of a Memory)

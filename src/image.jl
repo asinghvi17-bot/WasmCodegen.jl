@@ -144,11 +144,15 @@ end
 # mutable object that is not `const` (or in a reference slot of a value stored inline in such
 # a field), and the elements of a memory of `Ptr`s, or boxed in a memory (or in the reference
 # slots of its inline elements), are C_NULL, but for the value -1 (`MAP_FAILED`,
-# `INVALID_HANDLE_VALUE`). E.g. a `Regex`'s compiled pattern is null, and Base compiles it
-# again when the `Regex` is first used. Other pointers (of immutable objects, such as a tuple
-# a field of abstract type holds) are written as they are natively, which here is unsupported
-# but for null and -1 (`check_build_pointer`); `Config(image_pointer_fields)` keeps a field's
-# as it is.
+# `INVALID_HANDLE_VALUE`), and so is the value of a global variable (a `Core.Binding`'s value).
+# E.g. a `Regex`'s compiled pattern is null, and Base compiles it again when the `Regex` is
+# first used. The slots are native ones: a value stored inline natively but an object here
+# (more than `MAX_INLINE_LEAVES` leaves) is reset as where it is stored (`reset_object_global!`),
+# and a tuple's elements, inline natively, are not memory elements here either
+# (`tuple_array_global!`). Other pointers (of immutable objects, such as a tuple a field of
+# abstract type holds, or of a constant) are written as they are natively, which here is
+# unsupported but for null and -1 (`check_build_pointer`); `Config(image_pointer_fields)`
+# keeps a field's as it is.
 
 is_cpointer_type(@nospecialize(T)) = T isa DataType && T.name === Ptr.body.name
 
@@ -167,6 +171,14 @@ end
 
 "Whether the image resets the pointers boxed in the `i`th field of objects of type `T` (see above)."
 resets_boxed_pointers(@nospecialize(T), i::Int) = ismutabletype(T) && !isconst(T, i)
+
+"""
+The key of the box or object of the inline value `x` whose reference slots the image resets
+(see above), apart from the one of `x` where they are not.
+"""
+struct ResetPointers
+    x::Any
+end
 
 "The element `v` of a memory of element type `E` as the image has it: a pointer reset (see above)."
 image_element(@nospecialize(E), @nospecialize(v)) =
@@ -230,6 +242,9 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT); raw_point
         g = get!(() -> tuple_array_global!(img, x, lf; register=false), img.boxes, key)
         return Inst[Inst(:global_get, g)]
     end
+    # (stored inline natively, where the image resets the pointers boxed in it)
+    reset_pointers && Base.allocatedinline(FT) && !isbits(x) && !ismutable(x) &&
+        return Inst[Inst(:global_get, reset_object_global!(img, x))]
     return Inst[Inst(:global_get, object_global!(img, x))]
 end
 
@@ -261,7 +276,7 @@ function boxed_object_global!(img::Image, @nospecialize(x); raw_pointer::Bool=fa
     T = typeof(x)
     l = layout(ts, T)
     if l.kind === Boxed
-        return object_global!(img, x)
+        return reset_pointers && !isbits(x) && !ismutable(x) ? reset_object_global!(img, x) : object_global!(img, x)
     elseif l.kind === Ghost
         return singleton_global!(img, T)
     end
@@ -269,7 +284,7 @@ function boxed_object_global!(img::Image, @nospecialize(x); raw_pointer::Bool=fa
     is_ptr_type(T) && check_build_pointer(x, raw_pointer)
     # isbits values are boxed once per value; others (Memory, String) per object (and per
     # whether the pointers in their reference slots are reset)
-    key = reset_pointers && !isbits(x) ? (x, :reset_pointers) : x
+    key = reset_pointers && !isbits(x) ? ResetPointers(x) : x
     haskey(img.boxes, key) && (note_reach!(img, key); return img.boxes[key])
     note_created!(img, key)
     get!(img.boxes, key) do
@@ -321,6 +336,25 @@ function object_global!(img::Image, @nospecialize(x))
     end
     note_created!(img, x)
     return new_object_global!(img, x)
+end
+
+"""
+    reset_object_global!(img, x) -> Global
+
+The global of the immutable `x`, an object here, where natively it is stored inline in a slot
+whose boxed pointers the image resets (a field of a mutable object, a memory's element: see
+`image_field`): with the pointers boxed in its reference slots reset.
+"""
+function reset_object_global!(img::Image, @nospecialize(x))
+    key = ResetPointers(x)
+    g = get(img.globals, key, nothing)
+    g === nothing || (note_reach!(img, key); return g)
+    note_created!(img, key)
+    l = layout(types(img), typeof(x))
+    g = l.elements !== nothing ? tuple_array_global!(img, x, l; register=false, reset_pointers=true) :
+                                 struct_global!(img, x, l; register=false, reset_pointers=true)
+    img.globals[key] = g
+    return g
 end
 
 # `x` (an object, a box's value or a global variable's key) serialized first by an optional function
@@ -381,8 +415,11 @@ end
 
 # a large tuple: its elements in an array (as a Memory's), in an object
 # the tuple `x` as an array object of the layout `l` (of its own type, or of the declared
-# type of where it is stored)
-function tuple_array_global!(img::Image, @nospecialize(x), l::Layout; register::Bool=true)
+# type of where it is stored); its elements are the tuple's, inline natively (not a memory's:
+# a pointer is kept), with the pointers boxed in their reference slots reset with
+# `reset_pointers` (see `image_field`)
+function tuple_array_global!(img::Image, @nospecialize(x), l::Layout; register::Bool=true,
+                             reset_pointers::Bool=false)
     ts = types(img)
     T = typeof(x)
     n = x isa Core.SimpleVector ? length(x) : fieldcount(T)
@@ -390,7 +427,7 @@ function tuple_array_global!(img::Image, @nospecialize(x), l::Layout; register::
     for i in 1:n
         mem[i] = x[i]
     end
-    memory_global!(img, mem)
+    memory_global!(img, mem; tuple_reset=reset_pointers)
     arr = img.arrays[mem]
     init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0), Inst(:global_get, arr),
                 Inst(:struct_new, l.wtype)]
@@ -458,7 +495,10 @@ function field_init!(img::Image, @nospecialize(v), @nospecialize(FT), back::Vect
     return const_leaves(img, v, FT; raw_pointer, reset_pointers)
 end
 
-function struct_global!(img::Image, @nospecialize(x), l::Layout)
+# (`reset_pointers`: an immutable stored inline natively where the image resets the pointers
+# boxed in it: see `reset_object_global!`)
+function struct_global!(img::Image, @nospecialize(x), l::Layout; register::Bool=true,
+                        reset_pointers::Bool=false)
     ts = types(img)
     T = typeof(x)
     img.cgm.config.shell_first_mutables && ismutabletype(T) && return mutable_global!(img, x, l)
@@ -472,7 +512,7 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout)
                 raw = (T, fieldname(T, i)) in img.cgm.config.image_pointer_fields
                 append!(init, field_init!(img, raw ? getfield(x, i) : image_field(x, i), FT, back,
                                           first(l.fields[i]) - 1; raw_pointer=raw,
-                                          reset_pointers=!raw && resets_boxed_pointers(T, i)))
+                                          reset_pointers=!raw && (reset_pointers || resets_boxed_pointers(T, i))))
             else
                 append!(init, Inst[default_inst(leaf.type) for leaf in field_leaves(ts, FT)])
             end
@@ -482,7 +522,7 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout)
     end
     push!(init, Inst(:struct_new, l.wtype))
     g = add_global!(img.cgm.mod, global_name(img, x), RefType(l.wtype, false), false, init)
-    img.globals[x] = g
+    register && (img.globals[x] = g)
     if !isempty(back)
         ismutabletype(T) || unsupported("a cycle of objects through the immutable ", T)
         for (wfield, v, FT) in back
@@ -492,7 +532,8 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout)
     return g
 end
 
-function memory_global!(img::Image, mem)
+# (`tuple_reset`: the array of a tuple, see `tuple_array_global!`)
+function memory_global!(img::Image, mem; tuple_reset::Union{Nothing,Bool}=nothing)
     T = typeof(mem)
     E = memory_eltype(T)
     ml = memory_layout(types(img), E)
@@ -516,11 +557,13 @@ function memory_global!(img::Image, mem)
                 append!(elems, Inst[Inst(:ref_null, (ml.storage::RefType).heap) for _ in 1:ml.stride])
                 continue
             end
-            v = image_element(E, mem[i])
+            v = mem[i]
+            # (a tuple's pointer elements are inline natively: kept)
+            reset = tuple_reset === nothing ? (v = image_element(E, v); true) : tuple_reset && !(v isa Ptr)
             if ml.boxed
-                push!(elems, Inst(:global_get, boxed_object_global!(img, v; reset_pointers=Base.allocatedinline(E))))
+                push!(elems, Inst(:global_get, boxed_object_global!(img, v; reset_pointers=reset && Base.allocatedinline(E))))
             else
-                append!(elems, field_init!(img, v, E, back, i - 1; reset_pointers=true))
+                append!(elems, field_init!(img, v, E, back, i - 1; reset_pointers=reset))
             end
         end
     finally
@@ -711,7 +754,8 @@ function global_var!(img::Image, ref::GlobalRef)
     defined = Base.invoke_in_world(img.cgm.world.world, isdefinedglobal, ref.mod, ref.name)
     inits = if defined
         v = Base.invoke_in_world(img.cgm.world.world, getglobal, ref.mod, ref.name)
-        const_leaves(img, v, T)
+        # (a pointer reset, as natively in the binding's value: see `image_field`)
+        const_leaves(img, v isa Ptr ? reset_pointer(v) : v, T)
     else
         Inst[default_inst(leaf.type) for leaf in l.leaves]
     end
