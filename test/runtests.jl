@@ -1,7 +1,7 @@
-# The tests, in parallel (ParallelTestRunner): each file in a worker process, in a session of
-# juliac's trim patches of its own (as juliac builds in one process). The files that open
-# sessions with other patches open them themselves. `julia test/runtests.jl --help` lists the
-# options (`--jobs=N`, test names to run only those).
+# The tests, in parallel (ParallelTestRunner): each file in a worker process. A worker opens a
+# session of juliac's trim patches once (as juliac builds in one process) and runs its files in
+# it; the files that open sessions with other patches run in workers without one.
+# `julia test/runtests.jl --help` lists the options (`--jobs=N`, test names to run only those).
 
 using ParallelTestRunner
 using WasmCodegen
@@ -28,7 +28,7 @@ const OWN_SESSION_TESTS = ["patch_sessions", "tasks"]
 # in each worker, once: the harness, the programs and the references of printing.jl (with
 # Base's printing: before the patches), in `Main`; the names they define, which each test's
 # module imports
-const init_worker_code = quote
+const harness_code = quote
     const _BEFORE_HARNESS = Set(names(Main; all=true, imported=true))
     include($(joinpath(@__DIR__, "harness.jl")))
     include($(joinpath(@__DIR__, "juliac", "programs.jl")))
@@ -39,6 +39,25 @@ const init_worker_code = quote
     const HARNESS_NAMES = Symbol[n for n in names(Main; all=true, imported=true)
                                  if !(n in _BEFORE_HARNESS) && !startswith(string(n), '#')]
 end
+# and then the session of juliac's trim patches, open for the worker's life: a task waits in
+# it, and the files' sessions (and `compile`'s) are that one (same patches: no new session)
+const init_worker_code = quote
+    $harness_code
+    const _SESSION_OPEN = Base.Event()
+    const _SESSION = @async try
+        WasmCodegen.with_trim_patches() do _, _
+            notify(_SESSION_OPEN)
+            wait(Base.Event())
+        end
+    finally
+        notify(_SESSION_OPEN)   # (also if the session failed to open: its error, below)
+    end
+    wait(_SESSION_OPEN)
+    istaskfailed(_SESSION) && fetch(_SESSION)
+end
+# the files that open sessions with other patches: in a worker of their own, without the session
+test_worker(test, _) =
+    test in OWN_SESSION_TESTS ? ParallelTestRunner.addworker(; init_worker_code=harness_code) : nothing
 const init_code = quote
     # (the harness's `using`s: their exported names are not bindings of `Main`)
     using WasmCodegen, WasmBuilder, Base64, SHA
@@ -61,4 +80,4 @@ end
 
 args = parse_args(ARGS)
 filter_tests!(testsuite, args)
-runtests(WasmCodegen, args; testsuite, init_worker_code, init_code)
+runtests(WasmCodegen, args; testsuite, init_worker_code, init_code, test_worker)
