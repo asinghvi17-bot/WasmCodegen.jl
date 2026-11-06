@@ -1,6 +1,8 @@
 # Pointers of the build process in the image: addresses without an owner, which mean nothing
-# in the module. Null pointers are serialized; another is an unsupported construct, unless
-# its field is allowlisted (`Config(image_pointer_fields)`).
+# in the module. Null pointers (and -1) are serialized; where native images reset pointers
+# (mutable objects' `Ptr` fields, `Ptr`s boxed in their fields, memories' elements:
+# src/image.jl `image_field`), null; another is an unsupported construct, unless its field is
+# allowlisted (`Config(image_pointer_fields)`).
 
 module ImagePointers
 struct PtrHolder
@@ -48,6 +50,48 @@ const MIXED = MixedRoot(UPH, let m = Memory{Ptr{UInt8}}(undef, 1); m[1] = Ptr{UI
 read_mixed() = (p = MIXED.h.p; (p === nothing ? UInt(0) : UInt(p)) + UInt(MIXED.m[1]))
 global NULL_CSH::CstrHolder = CstrHolder(reinterpret(Cstring, C_NULL), reinterpret(Cwstring, C_NULL))
 read_null_csh() = (reinterpret(UInt, NULL_CSH.s), reinterpret(UInt, NULL_CSH.w))
+
+# where native image serialization resets pointers (src/staticdata.c `jl_write_values`): the
+# values a package image holds natively (checked on Julia 1.12.7, 1.13.0-rc4, 1.13.3), not the
+# build process's (globals, not constants: inference would fold reads of `const` fields)
+p(n) = Ptr{Cvoid}(n % UInt)
+u(x) = UInt(x)
+mutable struct Reset
+    p::Ptr{Cvoid}
+    a::Any
+    u::Union{Nothing,Ptr{Cvoid}}
+end
+mutable struct ConstPtr
+    const q::Ptr{Cvoid}
+end
+mutable struct ConstAny
+    const b::Any
+end
+mutable struct TupleAny
+    t::Tuple{Any,Int}
+end
+struct InlineAny
+    p::Ptr{Cvoid}
+    a::Any
+end
+global RESET::Reset = Reset(p(1), p(3), nothing)
+global MINUS1::Reset = Reset(p(-1), p(-1), p(-1))
+global CONST_PTR::ConstPtr = ConstPtr(p(2))
+global CONST_ANY::ConstAny = ConstAny(p(4))
+global TUPLE_ANY::TupleAny = TupleAny((p(5), 1))
+global PTRS::Vector{Ptr{Cvoid}} = Ptr{Cvoid}[p(7), p(-1), p(0)]
+global ANYS::Vector{Any} = Any[p(8)]
+global INLINES::Vector{InlineAny} = InlineAny[InlineAny(p(0), p(11))]
+global INLINE_REF::Base.RefValue{InlineAny} = Ref(InlineAny(p(0), p(13)))
+read_reset() = (u(RESET.p), u(RESET.a::Ptr{Cvoid}))
+read_minus1() = (u(MINUS1.p), u(MINUS1.a::Ptr{Cvoid}), u(MINUS1.u::Ptr{Cvoid}))
+read_const_ptr() = u(CONST_PTR.q)
+read_const_any() = u(CONST_ANY.b::Ptr{Cvoid})
+read_tuple_any() = u(TUPLE_ANY.t[1]::Ptr{Cvoid})
+read_ptrs() = (u(PTRS[1]), u(PTRS[2]), u(PTRS[3]))
+read_anys() = u(ANYS[1]::Ptr{Cvoid})
+read_inlines() = (u(INLINES[1].p), u(INLINES[1].a::Ptr{Cvoid}))
+read_inline_ref() = (u(INLINE_REF[].p), u(INLINE_REF[].a::Ptr{Cvoid}))
 end
 
 @testset "image pointers" begin
@@ -70,8 +114,8 @@ end
     # unless its field is allowlisted: its address as it is
     c = WasmCodegen.compile(P.read_holder, (); config=WasmCodegen.Config(image_pointer_fields=[(P.PtrHolder, :p)]))
     @test wasm_run(c, "read_holder"; rettype=UInt) == UInt(0x1003)
-    # a field of a mutable object too
-    @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(P.read_mph, ())
+    # a field of a mutable object: null, as native images hold it (but allowlisted)
+    @test wasm_run(WasmCodegen.compile(P.read_mph, ()), "read_mph"; rettype=UInt) == 0
     c = WasmCodegen.compile(P.read_mph, (); config=WasmCodegen.Config(image_pointer_fields=[(P.MutablePtrHolder, :p)]))
     @test wasm_run(c, "read_mph"; rettype=UInt) == UInt(0x2000)
     # boxed in a union or `Any` field: rejected, or as it is when allowlisted
@@ -80,13 +124,39 @@ end
         c = WasmCodegen.compile(f, (); config=WasmCodegen.Config(image_pointer_fields=[(H, :p)]))
         @test wasm_run(c, string(nameof(f)); rettype=UInt) == UInt(addr) == f()
     end
-    @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(P.read_mixed, ();
-        config=WasmCodegen.Config(image_pointer_fields=[(P.UnionPtrHolder, :p)]))
+    # (a memory's `Ptr` elements: null, as native images hold them)
+    c = WasmCodegen.compile(P.read_mixed, (); config=WasmCodegen.Config(image_pointer_fields=[(P.UnionPtrHolder, :p)]))
+    @test wasm_run(c, "read_mixed"; rettype=UInt) == UInt(0x3000)
     # C strings in fields: null ones serialized, another as it is when allowlisted
     @wtest P.read_null_csh()
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(P.read_csh, ())
     c = WasmCodegen.compile(P.read_csh, (); config=WasmCodegen.Config(image_pointer_fields=[(P.CstrHolder, :s)]))
     @test wasm_run(c, "read_csh"; rettype=Tuple{UInt,UInt}) == (UInt(0x5000), UInt(0)) == P.read_csh()
+end
+
+@testset "image pointers reset as natively (shell-first $shell)" for shell in (false, true)
+    P = ImagePointers
+    config = WasmCodegen.Config(shell_first_mutables = shell)
+    run(f, RT) = wasm_run(WasmCodegen.compile(f, (); config), string(nameof(f)); rettype=RT)
+    T2, T3 = Tuple{UInt,UInt}, Tuple{UInt,UInt,UInt}
+    # a mutable object's `Ptr` field and a `Ptr` in its field of type `Any`: null; -1 kept
+    @test run(P.read_reset, T2) == (0, 0)
+    @test run(P.read_minus1, T3) == (typemax(UInt), typemax(UInt), typemax(UInt))
+    # a `const` `Ptr` field: null before Julia 1.13.3, whose images keep it (an address here)
+    if VERSION < v"1.13.3"
+        @test run(P.read_const_ptr, UInt) == 0
+    else
+        @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(P.read_const_ptr, (); config)
+    end
+    # kept natively, so an address here: a `const` field's boxed `Ptr`, a tuple object's
+    @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(P.read_const_any, (); config)
+    @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(P.read_tuple_any, (); config)
+    # a memory's `Ptr` elements, boxed ones, and those in the reference slots of its inline
+    # elements, or of an inline value in a mutable object's field
+    @test run(P.read_ptrs, T3) == (0, typemax(UInt), 0)
+    @test run(P.read_anys, UInt) == 0
+    @test run(P.read_inlines, T2) == (0, 0)
+    @test run(P.read_inline_ref, T2) == (0, 0)
 end
 
 # the runtime's Unicode tables have no unused capacity (the image serializes all of a Memory)

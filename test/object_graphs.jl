@@ -315,12 +315,12 @@ end
     for shell in (false, true)
         cfg = WasmCodegen.Config(shell_first_mutables = shell, image_pointer_fields = [(S.PtrHolder, :p)])
         @test wasm_run(WasmCodegen.compile(S.read_ptr, (); config = cfg), "read_ptr"; rettype = UInt) == UInt(0x2000)
-        # not allowlisted: a pointer of the build process is an unsupported construct
-        @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(S.read_ptr, ();
-            config = WasmCodegen.Config(shell_first_mutables = shell))
+        # not allowlisted: null, as native images hold a mutable object's pointers
+        @test wasm_run(WasmCodegen.compile(S.read_ptr, (); config = WasmCodegen.Config(shell_first_mutables = shell)),
+                       "read_ptr"; rettype = UInt) == 0
     end
     cfg = WasmCodegen.Config(shell_first_mutables = true, image_pointer_fields = [(S.Holder, :p)])
     @test wasm_run(WasmCodegen.compile(S.read_holder, (); config = cfg), "read_holder"; rettype = UInt) == UInt(0x3000)
-    @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(S.read_holder, ();
-        config = WasmCodegen.Config(shell_first_mutables = true))
+    @test wasm_run(WasmCodegen.compile(S.read_holder, (); config = WasmCodegen.Config(shell_first_mutables = true)),
+                   "read_holder"; rettype = UInt) == 0
 end

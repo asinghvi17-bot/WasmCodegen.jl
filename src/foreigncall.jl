@@ -117,24 +117,34 @@ function foreign_function(config::Config, name, lib)
 end
 
 """
-    emit_foreign_function!(fc, f, name, lib, args, typ) -> CGVal
+    emit_foreign_function!(fc, f, name, lib, ex, args, typ) -> CGVal
 
 `ccall((name, lib), ...)` of a C function the program implements (`Config(foreign_functions)`):
-a call of `f` with the arguments as they are, which must return the call's type `typ`.
+a call of `f` (the value of the configuration, in the image) with the arguments as they are,
+which must return a value of the call's type `typ`. A mutable struct by value is unsupported:
+natively C receives a copy, which `f` would not (as for `cfunction`s: `check_c_type`).
 """
-function emit_foreign_function!(fc::FnCtx, @nospecialize(f), name::Symbol, lib::String, args::Vector{Any},
-                                @nospecialize(typ))
-    res = emit_runtime_ccall!(fc, RuntimeCcall(f, fill(:val, length(args))), args, typ)
-    res.typ === typ || (typ === Nothing && res.kind === Ghost) ||
-        unsupported("the foreign function ", f, " for ", lib, ".", name, " returns ", res.typ,
-                    ", not the call's ", typ)
-    return res
+function emit_foreign_function!(fc::FnCtx, @nospecialize(f), name::Symbol, lib::String, ex::Expr,
+                                args::Vector{Any}, @nospecialize(typ))
+    what() = string("the foreign function ", f, " for ", lib, ".", name)
+    for T in Any[ex.args[2], (ex.args[3]::Core.SimpleVector)...]
+        T isa Type && !c_pointer_slot(T) && ismutabletype(T) &&
+            unsupported(what(), " with the mutable type ", T, " by value (natively a copy)")
+    end
+    vals = CGVal[a::CGVal for a in args]
+    info = runtime_function!(fc.cgm, f, Tuple(v.typ for v in vals))
+    res = emit_call_info!(fc, info, CGVal[const_value(fc, f), vals...])
+    res.kind === Bottom && return res
+    res.typ <: typ || unsupported(what(), " returns ", res.typ, ", not the call's ", typ)
+    return convert_repr(fc, res, typ)
 end
 
-"Check `Config(foreign_functions)`: each names a library."
+"Check `Config(foreign_functions)`: each names a library, not one of WasmCodegen's own imports."
 function check_foreign_functions(config::Config)
     for ((name, lib), _) in config.foreign_functions
         isempty(lib) && throw(ArgumentError("Config(foreign_functions): $name has an empty library name"))
+        reserved_import_library(lib) &&
+            throw(ArgumentError("Config(foreign_functions): \"$lib\" is a name of WasmCodegen's own imports"))
     end
 end
 
@@ -143,11 +153,12 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     nargs = length(ex.args[3]::Core.SimpleVector)
     args = Any[operand(fc, a) for a in ex.args[6:5+nargs]]
     lib = foreigncall_library(ex.args[1])
+    # (a function the program implements, before the host's of a library it declares)
+    f = foreign_function(fc.cgm.config, name, lib)
+    f === nothing || return emit_foreign_function!(fc, f, name::Symbol, lib::String, ex, args, typ)
     if lib !== nothing && name !== nothing && (lib in IMPORT_LIBRARIES || lib in fc.cgm.config.import_libraries)
         return emit_import_ccall!(fc, lib, name, ex, args)
     end
-    f = foreign_function(fc.cgm.config, name, lib)
-    f === nothing || return emit_foreign_function!(fc, f, name::Symbol, lib::String, args, typ)
     if name === nothing && is_llvmcall(ex.args[5])
         iname = llvm_intrinsic_name(ex.args[1])
         iname === nothing || return emit_llvm_intrinsic!(fc, iname, args, typ)

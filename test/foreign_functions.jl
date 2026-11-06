@@ -1,7 +1,8 @@
 # C functions a program implements in Julia (`Config(foreign_functions)`, src/foreigncall.jl):
 # here Base's PCRE2 calls, and so Base's `Regex`, on a toy engine of literal patterns. What
 # the configuration routes and what it does not, a `Regex` constant of the image compiled again
-# on first use (`IMAGE_RESET_FIELDS`), and no match contexts (`trim/wasm-regex.jl`).
+# on first use (its pattern null, as native images hold a mutable object's pointers: src/image.jl
+# `image_field`), and no match contexts (`Runtime.MATCH_CONTEXT`).
 
 module ToyPCRE
 
@@ -169,6 +170,24 @@ ff_other(x::Int32) = ccall((:pcre2_match_data_free_8, "libother"), Int32, (Int32
 ff_wrong_count(md::Ptr{Cvoid}) = 1
 ff_count(md::Ptr{Cvoid}) = ccall((:pcre2_get_ovector_count_8, "libpcre2-8"), UInt32, (Ptr{Cvoid},), md)
 
+ffs(ps...) = Pair{Tuple{Symbol,String},Any}[ps...]
+# a mutable struct by value: natively C receives a copy, which the function would not
+mutable struct FFMutable
+    x::Int32
+end
+ff_change(s::FFMutable) = (s.x = Int32(2); Int32(0))
+ff_mutable(x::Int32) = (s = FFMutable(x); ccall((:change, "libff"), Int32, (FFMutable,), s); s.x)
+# a closure: its captured value
+ff_adder(n::Int32) = x::Int32 -> x + n
+ff_add(x::Int32) = ccall((:add, "libff"), Int32, (Int32,), x)
+# a result of a type of the call's (boxed where it is `Any`), and a function that throws
+ff_answer() = Int32(7)
+ff_any() = ccall((:answer, "libff"), Any, ())::Int32
+ff_fail()::Int32 = error("no answer")
+ff_throws(x::Int32) = try ccall((:fail, "libff"), Int32, ()) + x catch; Int32(-1) end
+# a library the program declares as the host's too
+ff_declared(x::Int32) = ccall((:answer, "ff_declared"), Int32, ()) + x
+
 @testset "foreign functions" begin
     toy(; kw...) = test_config(; foreign_functions = ToyPCRE.FUNCTIONS, kw...)
     c = WasmCodegen.compile(ff_print_regexes, (); config = toy())
@@ -206,4 +225,31 @@ ff_count(md::Ptr{Cvoid}) = ccall((:pcre2_get_ovector_count_8, "libpcre2-8"), UIn
     @test occursin("returns Int64, not the call's UInt32", sprint(showerror, err))
     @test_throws ArgumentError WasmCodegen.compile(ff_count, (Ptr{Cvoid},);
         config = test_config(foreign_functions = Pair{Tuple{Symbol,String},Any}[(:f, "") => ff_wrong_count]))
+    # or one of WasmCodegen's own imports
+    @test_throws ArgumentError WasmCodegen.compile(ff_count, (Ptr{Cvoid},);
+        config = test_config(foreign_functions = ffs((:fd_write, "wasi_snapshot_preview1") => ff_wrong_count)))
+
+    # a mutable struct by value is unsupported (natively C receives a copy)
+    err = try
+        WasmCodegen.compile(ff_mutable, (Int32,); config = test_config(foreign_functions = ffs((:change, "libff") => ff_change)))
+        nothing
+    catch e
+        e
+    end
+    @test err isa WasmCodegen.UnsupportedConstructs && occursin("FFMutable by value", sprint(showerror, err))
+    # a closure, with its captured value
+    c = WasmCodegen.compile(ff_add, (Int32,); config = test_config(foreign_functions = ffs((:add, "libff") => ff_adder(Int32(7)))))
+    @test wasm_run(c, "ff_add", Int32(35); rettype = Int32) == 42
+    # a result of a subtype of the call's type; a function that throws
+    c = WasmCodegen.compile(ff_any, (); config = test_config(foreign_functions = ffs((:answer, "libff") => ff_answer)))
+    @test wasm_run(c, "ff_any"; rettype = Int32) == 7
+    c = WasmCodegen.compile(ff_throws, (Int32,); config = test_config(foreign_functions = ffs((:fail, "libff") => ff_fail)))
+    @test wasm_run(c, "ff_throws", Int32(1); rettype = Int32) == -1
+    # the program's function, not the host's import, of a library it declares too
+    c = WasmCodegen.compile(ff_declared, (Int32,); config = WasmCodegen.Config(host = :wasi,
+        import_libraries = ["ff_declared"], foreign_functions = ffs((:answer, "ff_declared") => ff_answer)))
+    @test !any(f -> f.imported !== nothing && f.imported[1] == "ff_declared", c.cgm.mod.funcs)
+    # a `Regex` constant compiled on first use with shell-first serialization too
+    c = WasmCodegen.compile(ff_compiles, (); config = toy(shell_first_mutables = true))
+    @test wasm_run(c, "ff_compiles"; rettype = Bool) === true
 end

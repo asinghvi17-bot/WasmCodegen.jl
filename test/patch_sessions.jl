@@ -35,11 +35,13 @@ end
     @test length(methods(P.greeting)) == nmethods
     # (the default patches are removed too: Base works natively as before)
     @test sprint(show, Int) == "Int64"
-    # (Base's per-thread PCRE2 match contexts, which the regex patch removes)
+    # (Base's per-thread PCRE2 match contexts, which only the module does without)
     @test Base.invokelatest(Base.PCRE.get_local_match_context) != C_NULL && occursin(r"a+b", "caab")
 
     # a session within a session with other patches or bindings: an error
     WasmCodegen.with_trim_patches() do _, _
+        # (natively, in a session, too)
+        @test Base.invokelatest(Base.PCRE.get_local_match_context) != C_NULL
         @test_throws ErrorException WasmCodegen.compile(P.greeting_length, (); config=config([ok]))
         @test_throws ErrorException WasmCodegen.with_trim_patches(() -> nothing; bindings=[:PatchTarget => P])
         # the same patches: shared

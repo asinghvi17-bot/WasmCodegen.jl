@@ -308,8 +308,14 @@ built it.
   built at compile time find them.
 - Global variables are mutable globals (one per leaf of the declared type), initialized
   with their value at compile time.
-- A `Ptr` constant must be null (`C_NULL`): a non-null one is an address of the build process,
-  which means nothing in the module, and is rejected unless its field is allowlisted by
+- A `Ptr` of the build process is an address that means nothing in the module. As native
+  image serialization (`jl_write_values`) does, the image holds as null, but for -1
+  (`MAP_FAILED`, `INVALID_HANDLE_VALUE`), the `Ptr` fields of mutable objects (not `const`,
+  from Julia 1.13.3), the `Ptr`s boxed in their fields that are not `const` (and in the
+  reference slots of values stored inline in them), and the `Ptr` elements of memories (and
+  the boxed ones, and those in the reference slots of inline elements): a `Regex`'s compiled
+  pattern is compiled again on first use. Natively, other pointers (of immutable objects) are
+  kept as they are; here a non-null one, but -1, is rejected unless its field is allowlisted by
   `Config(image_pointer_fields)` (then it is kept as an address without owner).
 - A symbol carries its hash, as Julia's runtime computed it, so that dictionaries with
   symbol keys built at compile time are found at run time.
@@ -376,8 +382,8 @@ reported when the module is compiled. A call through a null pointer throws as na
 a pointer that is not a `cfunction` of its call's signature, an error of the program. Each
 compiled `cfunction` has a slot of its own, as natively a function of its own. The pointers
 are the module's own (no interoperation with a host's or another module's functions), and the
-image holds none: a `cfunction`'s pointer in a value built at compile time is reported, as other
-pointers of the build process are.
+image holds none: a `cfunction`'s pointer in a value built at compile time is null or reported,
+as other pointers of the build process are.
 
 ## 8. The runtime
 

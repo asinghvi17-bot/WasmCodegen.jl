@@ -45,6 +45,7 @@ include("runtime/exprs.jl")
 include("runtime/types.jl")
 include("runtime/eqtable.jl")
 include("runtime/jlapi.jl")
+include("runtime/regex.jl")
 include("runtime/blas.jl")
 include("runtime/lapack.jl")
 end
