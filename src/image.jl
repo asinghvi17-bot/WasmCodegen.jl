@@ -164,6 +164,7 @@ function image_field(@nospecialize(x), i::Int)
     v = getfield(x, i)
     T = typeof(x)
     # (a `const` one too before Julia 1.13.3)
+    # (1.14 development builds before JuliaLang/julia#63886 still reset `const` fields)
     ismutabletype(T) && is_cpointer_type(fieldtype(T, i)) && (VERSION < v"1.13.3" || !isconst(T, i)) &&
         return reset_pointer(v)
     return v
@@ -480,7 +481,8 @@ function memory_object_global!(img::Image, mem, arr::Global)
 end
 
 # the leaves of the field value `v` (declared type FT) of an object being serialized, with
-# null for references to objects being serialized (cycles), recorded in `back`
+# null for references to objects being serialized (cycles), recorded in `back` (with whether
+# the image resets the pointers boxed in them)
 function field_init!(img::Image, @nospecialize(v), @nospecialize(FT), back::Vector{Any}, slot;
                      raw_pointer::Bool=false, reset_pointers::Bool=false)
     ts = types(img)
@@ -488,7 +490,7 @@ function field_init!(img::Image, @nospecialize(v), @nospecialize(FT), back::Vect
     if lf.kind === Boxed
         target = lf.wtype == ts.jlvalue && layout(ts, typeof(v)).kind !== Boxed ? nothing : v
         if target !== nothing && target in img.inprogress
-            push!(back, (slot, v, FT))
+            push!(back, (slot, v, FT, reset_pointers))
             return Inst[Inst(:ref_null, lf.leaves[1].type.heap)]
         end
     end
@@ -525,8 +527,8 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout; register::Bool=
     register && (img.globals[x] = g)
     if !isempty(back)
         ismutabletype(T) || unsupported("a cycle of objects through the immutable ", T)
-        for (wfield, v, FT) in back
-            push!(img.patches, (g, :struct, l.wtype, wfield, v, FT, img.owner))
+        for (wfield, v, FT, reset) in back
+            push!(img.patches, (g, :struct, l.wtype, wfield, v, FT, img.owner, reset))
         end
     end
     return g
@@ -579,8 +581,8 @@ function memory_global!(img::Image, mem; tuple_reset::Union{Nothing,Bool}=nothin
                   Inst(:array_set, ml.array))
         end
     end
-    for (i, v, FT) in back
-        push!(img.patches, (g, :array, ml.array, i * ml.stride, v, FT, img.owner))
+    for (i, v, FT, reset) in back
+        push!(img.patches, (g, :array, ml.array, i * ml.stride, v, FT, img.owner, reset))
     end
     return obj
 end
@@ -840,7 +842,9 @@ function finish_image!(cgm::CGModule)
         else
             emit!(b, :global_get, g)
             emit!(b, :i32_const, idx)
-            for inst in (kind === :array_insts ? v : const_leaves(img, v, FT)); emit!(b, inst.op, inst.imm...); end
+            for inst in (kind === :array_insts ? v : const_leaves(img, v, FT; reset_pointers=length(p) >= 8 && p[8]::Bool))
+                emit!(b, inst.op, inst.imm...)
+            end
             emit!(b, :array_set, wtype)
         end
     end

@@ -102,6 +102,28 @@ global WIDES::Vector{Wide} = [Wide(p(1), ntuple(_ -> 0, 64))]
 global WIDE_REF::Base.RefValue{Wide} = Ref(Wide(p(2), ntuple(_ -> 0, 64)))
 read_wides() = u(WIDES[1].a::Ptr{Cvoid})
 read_wide_ref() = u(WIDE_REF[].a::Ptr{Cvoid})
+# ... also where it is reached again while it is serialized (a cycle: a memory element, or a
+# mutable object's field, set once every global exists)
+struct WideCycle
+    a::Any
+    pad::NTuple{64,Int}
+    back::Any
+end
+global WIDE_CYCLE::Base.RefValue{WideCycle} = let m = Memory{WideCycle}(undef, 1)
+    w = WideCycle(p(1), ntuple(_ -> 0, 64), m)
+    m[1] = w
+    Ref(w)
+end
+read_wide_cycle() = (u(WIDE_CYCLE[].a::Ptr{Cvoid}), u((WIDE_CYCLE[].back::Memory{WideCycle})[1].a::Ptr{Cvoid}))
+mutable struct WideHolder
+    w::WideCycle
+    WideHolder() = new()
+end
+global WIDE_BACKS::Vector{WideCycle} = let h = WideHolder()
+    h.w = WideCycle(p(3), ntuple(_ -> 0, 64), h)
+    [h.w]
+end
+read_wide_backs() = (u(WIDE_BACKS[1].a::Ptr{Cvoid}), u((WIDE_BACKS[1].back::WideHolder).w.a::Ptr{Cvoid}))
 # a large tuple's pointers (inline natively, an array here): kept
 global BIG_REF::Base.RefValue{NTuple{33,Ptr{Cvoid}}} = Ref(ntuple(_ -> p(3), 33))
 global BIG_ANY::Vector{Any} = Any[ntuple(_ -> p(4), 33)]
@@ -183,6 +205,8 @@ end
     # stored inline natively, an object here: reset as where it is stored
     @test run(P.read_wides, UInt) == 0
     @test run(P.read_wide_ref, UInt) == 0
+    @test run(P.read_wide_cycle, T2) == (0, 0)
+    @test run(P.read_wide_backs, T2) == (0, 0)
     # a large tuple's pointers: kept natively, so addresses here
     for f in (P.read_big_ref, P.read_big_any)
         @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(f, (Int,); config)
