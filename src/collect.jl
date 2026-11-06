@@ -98,9 +98,16 @@ not compile its target. Each such target is inferred as an entry of its own, and
 made of its code instance; the verifier checks that code as any other. (For a few rounds: the
 targets of a program whose specializations do not end, as recursive invokes of ever deeper
 types, stay unresolved invokes.)
+
+The check runs in the world of the code generator's own code (`COMPILER_WORLD`), as `compile`
+does: a session of patches makes a newer world, in which that code (the inference of the
+module's interpreter, the verifier) would be compiled again.
 """
-function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_world_counter(),
-                    onlywarn::Bool=false, extensions=())
+trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_world_counter(),
+           onlywarn::Bool=false, extensions=()) =
+    Base.invoke_in_world(COMPILER_WORLD[], trim_check_in_world, entries, world, onlywarn, extensions)
+
+function trim_check_in_world(entries::Vector{Core.MethodInstance}, world::UInt, onlywarn::Bool, extensions)
     replacement = Replacements(world, extensions)
     roots = Any[entries...]
     codeinfos = verify_inference(roots, world, extensions)
