@@ -496,7 +496,7 @@ end
 `new(C, x1, …, xn)` of fields of any type, as `jl_new_structv` does natively: each field is
 checked (`TypeError(:new, "", fieldtype, value)`, the first that does not fit), then the
 object is built (as an `Any`). A case of `new` of a type known only at run time, compiled for
-each concrete type of the module it may be (`new_func!`).
+each concrete type of the module it may be (`add_new_cases!`, `emit_new_rt!`).
 """
 function new_as end
 
