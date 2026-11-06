@@ -416,6 +416,7 @@ function compile_runtime_cases!(cgm::CGModule)
         end
     end
     promote_getfield_any_cases!(cgm)
+    promote_new_cases!(cgm)
 end
 
 """
@@ -545,10 +546,7 @@ program's code, with their unsupported constructs, once a program function needs
 function getfield_any_func!(cgm::CGModule, @nospecialize(T), f::Union{Symbol,Int})
     ks = get!(() -> Any[], cgm.helpers, :getfield_any)::Vector{Any}
     any(k -> k[1] === T && k[2] === f, ks) || push!(ks, (T, f))
-    img = cgm.image
-    owners = get!(() -> Any[], cgm.helpers, (:getfield_any_owners, T, f))::Vector{Any}
-    owner = img.optional_mode || img.owner in img.optional ? img.owner : :program
-    any(o -> o === owner, owners) || push!(owners, owner)
+    note_case_owner!(cgm, (:getfield_any_owners, T, f))
     return get!(cgm.helpers, (:getfield_any, T, f)) do
         jl = jlvalue_ref(cgm.types)
         add_func!(cgm.mod, string("jl_getfield_any_", replace(string(T, "_", f), r"[^A-Za-z0-9_]" => "_")),
@@ -576,26 +574,41 @@ function add_getfield_any_cases!(cgm::CGModule)
     return n
 end
 
-# the cases of a helper a program function needs: the program's (their unsupported constructs
-# are its errors); of one optional functions need: promoted with each (`promote_optional!`).
-# After the cases are emitted (all functions emitted in optional mode are optional). Of a
-# value of type `Any`, those of the runtime's own objects (types, modules, methods: no field
-# of theirs is read in a module) stay optional: one reaching them traps, as `objectid` of a
-# type it cannot be compiled for.
-function promote_getfield_any_cases!(cgm::CGModule)
+# Runtime cases a program function needs are the program's code: their unsupported constructs
+# are its errors. The functions needing a helper of cases, by `key` (`:program` for a program
+# function, else the optional function, the one being emitted).
+function note_case_owner!(cgm::CGModule, key)
     img = cgm.image
+    owners = get!(() -> Any[], cgm.helpers, key)::Vector{Any}
+    owner = img.optional_mode || img.owner in img.optional ? img.owner : :program
+    any(o -> o === owner, owners) || push!(owners, owner)
+    return owners
+end
+
+# the cases `cases` of a helper the functions `owners` need: the program's code if a program
+# function needs it; else promoted with each optional function needing it (`promote_optional!`).
+# After the cases are emitted (all functions emitted in optional mode are optional).
+function promote_cases!(cgm::CGModule, owners::Vector{Any}, cases)
+    img = cgm.image
+    for owner in owners, c in cases
+        if owner === :program || !(owner in img.optional)
+            promote_optional!(cgm, c)
+        else
+            cs = get!(() -> Any[], img.optional_children, owner)
+            any(x -> x === c, cs) || push!(cs, c)
+        end
+    end
+end
+
+# the cases of the `getfield` helpers (`promote_cases!`); but of a value of type `Any`, those of
+# the runtime's own objects (types, modules, methods: no field of theirs is read in a module)
+# stay optional: one reaching them traps, as `objectid` of a type it cannot be compiled for
+function promote_getfield_any_cases!(cgm::CGModule)
     for (T, f) in get(cgm.helpers, :getfield_any, Any[])::Vector{Any}
         cases = get(cgm.helpers, (:getfield_any_cases, T, f), Dict{Int,FuncInfo}())::Dict{Int,FuncInfo}
-        owners = cgm.helpers[(:getfield_any_owners, T, f)]::Vector{Any}
-        for owner in owners, (id, c) in cases
-            T === Any && any(R -> cgm.types.typelist[id] === R, RUNTIME_TYPES) && continue
-            if owner === :program || !(owner in img.optional)
-                promote_optional!(cgm, c)
-            else
-                cs = get!(() -> Any[], img.optional_children, owner)
-                any(x -> x === c, cs) || push!(cs, c)
-            end
-        end
+        promote_cases!(cgm, cgm.helpers[(:getfield_any_owners, T, f)]::Vector{Any},
+                       FuncInfo[c for (id, c) in cases
+                                if !(T === Any && any(R -> cgm.types.typelist[id] === R, RUNTIME_TYPES))])
     end
 end
 
@@ -1030,7 +1043,8 @@ end
 `jl_new_<n>`, one per number of fields for the module, which goes by the type id of `T` to the
 case of `new` for that type (`Runtime.new_as`). Its cases are the module's concrete types that
 some site's `T` may be by inference (`add_new_cases!`); the members inference names are the
-module's, and their cases are compiled as the program's code. Of a `T` that inference bounds
+module's, and the cases of a site a program function has are the program's code
+(`promote_new_cases!`). Of a `T` that inference bounds
 only by `DataType` (or wider), not supported: that would be every concrete type of the module.
 """
 function emit_new_rt!(fc::FnCtx, T::CGVal, args::Vector{CGVal}, @nospecialize(typ))
@@ -1046,6 +1060,7 @@ function emit_new_rt!(fc::FnCtx, T::CGVal, args::Vector{CGVal}, @nospecialize(ty
     ts = cgm.types
     bounds = get!(() -> Any[], cgm.helpers, (:new_rt_bounds, n))::Vector{Any}
     any(B -> B === Tinf, bounds) || push!(bounds, Tinf)
+    note_case_owner!(cgm, (:new_rt_owners, Tinf, n))
     cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, (:new_rt_cases, n))::Dict{Int,FuncInfo}
     # (the types inference says it may be: the module's, their cases the program's code)
     for S in members
@@ -1107,6 +1122,20 @@ function add_new_cases!(cgm::CGModule)
         end
     end
     return added
+end
+
+# the cases of the `new` helpers, of the types each site's `T` may be (`promote_cases!`)
+function promote_new_cases!(cgm::CGModule)
+    ts = cgm.types
+    for k in collect(keys(cgm.helpers))
+        (k isa Tuple && length(k) == 2 && k[1] === :new_rt) || continue
+        n = k[2]
+        cases = cgm.helpers[(:new_rt_cases, n)]::Dict{Int,FuncInfo}
+        for Tinf in cgm.helpers[(:new_rt_bounds, n)]::Vector{Any}
+            promote_cases!(cgm, cgm.helpers[(:new_rt_owners, Tinf, n)]::Vector{Any},
+                           FuncInfo[c for (id, c) in cases if ts.typelist[id] isa Tinf])
+        end
+    end
 end
 
 function finish_new!(cgm::CGModule)

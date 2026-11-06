@@ -270,7 +270,7 @@ function new_as_body(@nospecialize(C), n::Int)
         FT = fieldtype(C, i)
         push!(body.args, :($(xs[i]) isa $FT || throw(TypeError(:new, "", $FT, $(xs[i])))))
     end
-    push!(body.args, :(return Ref{Any}($(Expr(:new, C, (:($(xs[i])::$(fieldtype(C, i))) for i in 1:n)...)))[]))
+    push!(body.args, :(return Base.inferencebarrier($(Expr(:new, C, (:($(xs[i])::$(fieldtype(C, i))) for i in 1:n)...)))))
     return body
 end
 

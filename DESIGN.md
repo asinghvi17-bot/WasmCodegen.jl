@@ -469,7 +469,8 @@ as other pointers of the build process are.
   error (written to `Core.stderr` too: `apply_type` does not throw for inference).
   `new(T, xs...)` calls `jl_new_<n>`, which goes by the type id of `T` to `Runtime.new_as`
   compiled for each concrete type of the module some `new` site's `T` may be by inference
-  (`T` of type `DataType`, which would be every type, is not supported): it checks the
+  (`T` of type `DataType`, which would be every type, is not supported; the cases of a
+  program function's site are the program's code, with its errors): it checks the
   fields (`TypeError(:new, ...)`) and builds the object, as `jl_new_structv`. Printing a type (juliac's `show`,
   which reflects on it) is a foldable function returning its name as a Symbol, so that
   inference computes it for a type known at compile time (a `Union` or `UnionAll` is not
