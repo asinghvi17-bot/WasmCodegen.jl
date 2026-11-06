@@ -278,15 +278,17 @@ function only_if_reached(mi::Core.MethodInstance)
 end
 
 """
-    compiled_instances(codeinfos, entries, replacement) -> (compiled, native_only)
+    compiled_instances(codeinfos, entries, replacement, interp) -> (compiled, native_only)
 
-The method instances of `codeinfos` (native inference's) that the module compiles: those the
-entries reach through `:invoke`s, where a call of a native method that a method of an overlay
-method table replaces (`replacement`) reaches the replacement instead; and those reached only
+The method instances of `codeinfos` that the module compiles: those the entries reach through
+`:invoke`s and the callees the verifier looks up by a call's types (`deferred_callee`: a
+finalizer, a `@cfunction`'s function, a `Threads.@threads` loop's body, by the module's
+interpreter `interp`), where a call of a native method that a method of an overlay method
+table replaces (`replacement`) reaches the replacement instead; and those reached only
 through such native methods (`native_only`).
 """
 function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance},
-                            replacement::Replacements)
+                            replacement::Replacements, interp::WasmInterpreter)
     src = IdDict{Core.MethodInstance,Core.CodeInfo}()
     for i in 1:length(codeinfos)
         item = codeinfos[i]
@@ -311,6 +313,13 @@ function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodI
                 r = native ? nothing : replacement(callee)
                 r === nothing ? push!(work, callee) : (push!(replaced, callee); push!(work, r))
             end
+            native && continue
+            # (the module's callbacks, finalizers and loop bodies, as the verifier finds them)
+            sptypes = CC.sptypes_from_meth_instance(mi)
+            for st in ci.code
+                callee = deferred_callee(st, ci, sptypes, mi, interp)
+                callee === nothing || push!(work, callee)
+            end
         end
         return reached
     end
@@ -321,36 +330,44 @@ function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodI
     return compiled, IdSet{Core.MethodInstance}(mi for mi in native if !(mi in compiled))
 end
 
-# whether the error is an unresolved callee the verifier looks up by the call's types (a
-# finalizer, a `@cfunction`'s function, a `Threads.@threads` loop's body) that the module's
-# inference did compile: the verifier looks these up among native code instances only
-# (`get_verify_typeinf_trim`'s `caches`), and `verify_inference`'s are the module's own. The
-# callee is found as the verifier finds it, by the module's interpreter `interp` (its world
-# and overlay method tables, as the collection's).
-function callee_compiled(d, code::IdDict{Core.MethodInstance,Core.CodeInstance}, interp::WasmInterpreter)
-    stmt = d.codeinfo.code[d.stmtidx]
+# the callee of a statement of `src` (of `mi`) that the verifier looks up by the call's types
+# (`get_verify_typeinf_trim`'s `caches`): the finalizer a `Core.finalizer` call registers, a
+# `@cfunction`'s function, a `Threads.@threads` loop's body (Julia 1.13); found as the verifier
+# finds it, by the module's interpreter `interp` (its world and overlay method tables, as the
+# collection's). Else nothing.
+function deferred_callee(@nospecialize(stmt), src::Core.CodeInfo, sptypes, mi::Core.MethodInstance,
+                         interp::WasmInterpreter)
     Meta.isexpr(stmt, :(=)) && (stmt = stmt.args[2])
-    if d.desc == "unresolved finalizer registered"
-        (Meta.isexpr(stmt, :call) && 3 <= length(stmt.args) <= 5) || return false
-        atype = CC.argtypes_to_type(Any[CC.argextype(stmt.args[2], d.codeinfo, d.sptypes),
-                                        CC.argextype(stmt.args[3], d.codeinfo, d.sptypes)])
-    elseif d.desc == "unresolved cfunction"
-        (Meta.isexpr(stmt, :cfunction) && length(stmt.args) == 5 && stmt.args[4] isa Core.SimpleVector) ||
-            return false
-        mi = CC.get_ci_mi(d.codeinst)
-        atype = CC.argtypes_to_type(Any[CC.argextype(stmt.args[2], d.codeinfo, d.sptypes);
+    cfunction = Meta.isexpr(stmt, :cfunction)
+    if cfunction
+        (length(stmt.args) == 5 && stmt.args[4] isa Core.SimpleVector) || return nothing
+        atype = CC.argtypes_to_type(Any[CC.argextype(stmt.args[2], src, sptypes);
                                         Any[CC.sp_type_rewrap(T, mi, false) for T in stmt.args[4]]])
-    elseif d.desc == "unresolved `Threads.@threads` loop body"   # (Julia 1.13)
-        atype = CC.TrimVerifier.threads_deferred_call_type(stmt, d.codeinfo, d.sptypes)
-        atype === nothing && return false
+    elseif Meta.isexpr(stmt, :call) && 3 <= length(stmt.args) <= 5 &&
+           CC.widenconst(CC.argextype(stmt.args[1], src, sptypes)) === typeof(Core.finalizer)
+        atype = CC.argtypes_to_type(Any[CC.argextype(stmt.args[2], src, sptypes),
+                                        CC.argextype(stmt.args[3], src, sptypes)])
+    elseif VERSION >= v"1.13-" && Meta.isexpr(stmt, :invoke)
+        atype = CC.TrimVerifier.threads_deferred_call_type(stmt, src, sptypes)
+        atype === nothing && return nothing
     else
-        return false
+        return nothing
     end
-    mi = CC.compileable_specialization_for_call(interp, atype)
-    mi === nothing && return false
+    callee = CC.compileable_specialization_for_call(interp, atype)
+    callee === nothing && return nothing
     # (1.13's verifier: the instance covers the `@cfunction`'s types)
-    VERSION >= v"1.13-" && d.desc == "unresolved cfunction" && !(atype <: (mi.def::Method).sig) && return false
-    return haskey(code, mi)
+    VERSION >= v"1.13-" && cfunction && !(atype <: (callee.def::Method).sig) && return nothing
+    return callee
+end
+
+# whether the error is an unresolved callee the verifier looks up by the call's types (see
+# `deferred_callee`) that the module's inference did compile: the verifier looks these up
+# among native code instances only, and `verify_inference`'s are the module's own
+function callee_compiled(d, code::IdDict{Core.MethodInstance,Core.CodeInstance}, interp::WasmInterpreter)
+    d.desc in ("unresolved finalizer registered", "unresolved cfunction",
+               "unresolved `Threads.@threads` loop body") || return false
+    callee = deferred_callee(d.codeinfo.code[d.stmtidx], d.codeinfo, d.sptypes, CC.get_ci_mi(d.codeinst), interp)
+    return callee !== nothing && haskey(code, callee)
 end
 
 """
@@ -375,9 +392,9 @@ function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.Method
                      replacement::Replacements, onlywarn::Bool; world::UInt, extensions=())
     TV = CC.TrimVerifier
     errors, parents = TV.get_verify_typeinf_trim(codeinfos)
-    compiled, native_only = compiled_instances(codeinfos, entries, replacement)
-    code = linkable_code(codeinfos)
     interp = WasmInterpreter(; world, extensions)
+    compiled, native_only = compiled_instances(codeinfos, entries, replacement, interp)
+    code = linkable_code(codeinfos)
     filter!(errors) do e
         d = e.second
         d isa TV.CallMissing || return true
