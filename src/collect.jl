@@ -117,7 +117,7 @@ function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_w
     io = IOBuffer()
     try
         redirect_stdout(devnull) do
-            verify_trim(io, codeinfos, entries, replacement, onlywarn)
+            verify_trim(io, codeinfos, entries, replacement, onlywarn; world, extensions)
         end
     catch err
         err isa Core.TrimFailure || rethrow()
@@ -321,22 +321,40 @@ function compiled_instances(codeinfos::Vector{Any}, entries::Vector{Core.MethodI
     return compiled, IdSet{Core.MethodInstance}(mi for mi in native if !(mi in compiled))
 end
 
-# whether the error is an "unresolved finalizer registered" whose finalizer the module's
-# inference did compile: the verifier looks finalizers up among native code instances only
-# (`get_verify_typeinf_trim`'s `caches`), and `verify_inference`'s are the module's own
-function finalizer_compiled(d, code::IdDict{Core.MethodInstance,Core.CodeInstance})
-    d.desc == "unresolved finalizer registered" || return false
+# whether the error is an unresolved callee the verifier looks up by the call's types (a
+# finalizer, a `@cfunction`'s function, a `Threads.@threads` loop's body) that the module's
+# inference did compile: the verifier looks these up among native code instances only
+# (`get_verify_typeinf_trim`'s `caches`), and `verify_inference`'s are the module's own. The
+# callee is found as the verifier finds it, by the module's interpreter `interp` (its world
+# and overlay method tables, as the collection's).
+function callee_compiled(d, code::IdDict{Core.MethodInstance,Core.CodeInstance}, interp::WasmInterpreter)
     stmt = d.codeinfo.code[d.stmtidx]
     Meta.isexpr(stmt, :(=)) && (stmt = stmt.args[2])
-    (Meta.isexpr(stmt, :call) && 3 <= length(stmt.args) <= 5) || return false
-    atype = CC.argtypes_to_type(Any[CC.argextype(stmt.args[2], d.codeinfo, d.sptypes),
-                                    CC.argextype(stmt.args[3], d.codeinfo, d.sptypes)])
-    mi = CC.compileable_specialization_for_call(WasmInterpreter(; world=Base.get_world_counter()), atype)
-    return mi !== nothing && haskey(code, mi)
+    if d.desc == "unresolved finalizer registered"
+        (Meta.isexpr(stmt, :call) && 3 <= length(stmt.args) <= 5) || return false
+        atype = CC.argtypes_to_type(Any[CC.argextype(stmt.args[2], d.codeinfo, d.sptypes),
+                                        CC.argextype(stmt.args[3], d.codeinfo, d.sptypes)])
+    elseif d.desc == "unresolved cfunction"
+        (Meta.isexpr(stmt, :cfunction) && length(stmt.args) == 5 && stmt.args[4] isa Core.SimpleVector) ||
+            return false
+        mi = CC.get_ci_mi(d.codeinst)
+        atype = CC.argtypes_to_type(Any[CC.argextype(stmt.args[2], d.codeinfo, d.sptypes);
+                                        Any[CC.sp_type_rewrap(T, mi, false) for T in stmt.args[4]]])
+    elseif d.desc == "unresolved `Threads.@threads` loop body"   # (Julia 1.13)
+        atype = CC.TrimVerifier.threads_deferred_call_type(stmt, d.codeinfo, d.sptypes)
+        atype === nothing && return false
+    else
+        return false
+    end
+    mi = CC.compileable_specialization_for_call(interp, atype)
+    mi === nothing && return false
+    # (1.13's verifier: the instance covers the `@cfunction`'s types)
+    VERSION >= v"1.13-" && d.desc == "unresolved cfunction" && !(atype <: (mi.def::Method).sig) && return false
+    return haskey(code, mi)
 end
 
 """
-    verify_trim(io, codeinfos, entries, replacement, onlywarn)
+    verify_trim(io, codeinfos, entries, replacement, onlywarn; world, extensions=())
 
 juliac's verifier (`Compiler.verify_typeinf_trim`) of what the module compiles: the methods
 of the overlay method tables in place of the native methods they replace (`trim_check` infers
@@ -348,18 +366,22 @@ reached otherwise (from an entry) is verified too.
 The calls are those of the module's inference (`verify_inference`), which already infers a
 call of a replaced method as its replacement, and inlines the replacement where it inlines:
 what is left of the bookkeeping below is for code that still reaches a native method a
-replacement replaces (as `Runtime.original` does).
+replacement replaces (as `Runtime.original` does). The callees the verifier looks up by a
+call's types among native code instances (finalizers, `@cfunction`s, `Threads.@threads` loop
+bodies) are looked up among the module's, by its interpreter in `world` with the overlay
+tables of `extensions` (`callee_compiled`).
 """
 function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.MethodInstance},
-                     replacement::Replacements, onlywarn::Bool)
+                     replacement::Replacements, onlywarn::Bool; world::UInt, extensions=())
     TV = CC.TrimVerifier
     errors, parents = TV.get_verify_typeinf_trim(codeinfos)
     compiled, native_only = compiled_instances(codeinfos, entries, replacement)
     code = linkable_code(codeinfos)
+    interp = WasmInterpreter(; world, extensions)
     filter!(errors) do e
         d = e.second
         d isa TV.CallMissing || return true
-        finalizer_compiled(d, code) && return false
+        callee_compiled(d, code, interp) && return false
         mi = CC.get_ci_mi(d.codeinst)
         return !(mi in native_only ||
                  ((only_if_reached(mi) || compile_time_instance(mi) || replacement(mi) !== nothing) &&
@@ -374,7 +396,7 @@ function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.Method
         printstyled(io, "Error #", no, ": "; color=Base.error_color(), bold=true)
         # (Julia 1.12's has no `warn`)
         VERSION >= v"1.13-" ? TV.verify_print_error(io, desc, parents, warn) :
-                              TV.verify_print_error(io, desc, parents)
+                              verify_print_error_1_12(io, desc, parents)
     end
     if counts[1] > 0 || counts[2] > 0
         print(io, "Trim verify finished with ")
@@ -392,6 +414,39 @@ function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.Method
         print(io, ".\n")
         counts[1] > 0 && !onlywarn && throw(Core.TrimFailure())
     end
+    return nothing
+end
+
+# Julia 1.12's verifier prints the stack of an error's statement by following the parents of
+# its code instance without end where they make a cycle (a recursion through an entry, as
+# `f(n) = n <= 0 ? g(n) : f(n - 1)`): it never returns, and its frames take all the memory.
+# The frames as Julia 1.13's (`verify_create_stackframes`), which stops at a parent it visited.
+function verify_print_error_1_12(io::IOContext{IO}, desc, parents)
+    TV = CC.TrimVerifier
+    desc isa TV.CallMissing || return TV.verify_print_error(io, desc, parents)
+    scopes = TV.LineInfoNode[]
+    frames = Base.StackTraces.StackFrame[]
+    visited = Base.IdSet{Tuple{Core.CodeInstance,Int}}()
+    parent = (desc.codeinst, desc.stmtidx)
+    while true
+        ci, idx = parent
+        TV.append_scopes!(scopes, idx, ci.debuginfo, :var"unknown scope")
+        for i in reverse(1:length(scopes))
+            lno = scopes[i]
+            def = lno.method
+            def isa Union{Method,Core.CodeInstance,Core.MethodInstance} || (def = nothing)
+            push!(frames, Base.StackTraces.StackFrame(TV.normalize_method_name(lno.method), lno.file,
+                                                      lno.line, def, false, i != 1, 0))
+        end
+        empty!(scopes)
+        parent = get(parents, ci, nothing)
+        (parent === nothing || parent in visited) && break
+        push!(visited, parent)
+    end
+    print(io, desc.desc, " from statement ")
+    TV.verify_print_stmt(io, desc.codeinfo, desc.sptypes, desc.stmtidx)
+    Base.show_backtrace(io, frames)
+    print(io, "\n\n")
     return nothing
 end
 
