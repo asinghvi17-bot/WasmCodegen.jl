@@ -33,6 +33,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("ptrbytes.jl")
     include("ptrhash.jl")
     include("typeof_any.jl")
+    include("getfield_any.jl")
     include("invoke_cycle.jl")
     include("reflection_rt.jl")
     include("printing.jl")

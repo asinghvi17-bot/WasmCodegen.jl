@@ -125,13 +125,40 @@ function emit_atomic_field!(fc::FnCtx, @nospecialize(f), args::Vector{Any}, @nos
     end
 end
 
-"Whether `f` names no field of the concrete type `T` (in code inference has not proven dead)."
+"""Whether `f` names no field of the concrete type `T` (in code inference has not proven dead).
+(Of a module, `getfield` with a Symbol is natively a global of the module.)"""
 is_no_field(@nospecialize(T), @nospecialize(f)) =
-    f isa Symbol && T isa DataType && isconcretetype(T) && Base.fieldindex(T, f, false) == 0
+    f isa Symbol && T isa DataType && isconcretetype(T) && T !== Module && Base.fieldindex(T, f, false) == 0
 
 "A `FieldError`: the type `T` has no field `name`."
 no_field!(fc::FnCtx, @nospecialize(T), name::Symbol) =
     throw_error!(fc, Runtime.throw_field_error, () -> convert_repr(fc, const_value(fc, T), Any), const_value(fc, name))
+
+"""
+Whether a field of a value of type `T` is found by the value's type at run time: `T` is not
+concrete and has no layout of fields of its own (abstract, a `Union`, a `UnionAll`; tuples and
+memories have theirs), where natively the `getfield` builtin finds it (see `get_field_any!`).
+"""
+getfield_by_type(@nospecialize(T)) =
+    !isconcretetype(T) && T !== Union{} && !(T <: Tuple) && !is_memory_type(T) && !is_memoryref_type(T)
+
+"""
+    get_field_any!(fc, x, f, typ) -> CGVal
+
+The field `f` (a constant name or index) of the value `x`, whose type is not concrete
+(`getfield_by_type`), of the inferred type `typ`: the module's case for the type of `x` at run
+time (`getfield_any_func!`), as natively the `getfield` builtin, with its errors.
+"""
+function get_field_any!(fc::FnCtx, x::CGVal, @nospecialize(f), @nospecialize(typ))
+    # (natively another index is a TypeError: `getfield` takes an `Int` or a `Symbol`)
+    (f isa Symbol || f isa Int) || unsupported("a field index of type ", typeof(f))
+    h = getfield_any_func!(fc.cgm, x.typ, f)
+    push_val!(fc, convert_repr(fc, x, Any))
+    call!(fc.b, h)
+    v = pop_val!(fc, Any)
+    typ === Union{} && (unreachable!(fc.b); return bottom())
+    return convert_repr(fc, v, typ)
+end
 
 """
     get_field(fc, x, i) -> CGVal
@@ -141,8 +168,9 @@ The field `i` (constant) of the value `x`.
 function get_field(fc::FnCtx, x::CGVal, i::Int)
     T = x.typ
     l = layout(fc, T)
-    if isconstant(x) && (!ismutable(constant_value(x)) || constant_value(x) isa Type)
-        # (a type's fields are fixed once it is made)
+    if isconstant(x) && (!ismutable(constant_value(x)) || constant_value(x) isa Type) &&
+       1 <= i <= Core.nfields(constant_value(x))
+        # (a type's fields are fixed once it is made; an index out of them is the BoundsError below)
         return const_value(fc, getfield(constant_value(x), i))
     end
     # an index out of a type's fields (known at compile time): a BoundsError, as natively
@@ -151,7 +179,8 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
     catch
         nothing
     end
-    if nfields !== nothing && !(1 <= i <= nfields)
+    # (and below 1, of a type of fields not known at compile time: a tuple of unknown length)
+    if (nfields !== nothing && !(1 <= i <= nfields)) || i < 1
         return throw_error!(fc, Runtime.throw_bounds_error, () -> convert_repr(fc, x, Any),
                             const_value(fc, i))
     end
@@ -248,10 +277,31 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         end
         x = x::CGVal
         if isconstant(x) && isconstant(idx) && constant_value(x) isa Type
-            # a field of a type (fixed once the type is made; a value of type Type{X})
-            return const_value(fc, getfield(constant_value(x), constant_value(idx)))
+            # a field of a type (fixed once the type is made; a value of type Type{X}); one it
+            # has not is the error below, at run time
+            v = try
+                Some(getfield(constant_value(x), constant_value(idx)))
+            catch
+                nothing
+            end
+            v === nothing || return const_value(fc, something(v))
+        end
+        if isconstant(x) && isconstant(idx) && constant_value(x) isa Module && constant_value(idx) isa Symbol
+            # (of a module: its global, as natively)
+            return operand(fc, GlobalRef(constant_value(x), constant_value(idx)))
         end
         if isconstant(idx)
+            if getfield_by_type(x.typ)
+                # (an ordering argument: natively checked against the field's atomicity)
+                (length(args) == 2 || (length(args) == 3 && args[3] isa CGVal && args[3].typ === Bool)) ||
+                    unsupported("getfield with an ordering of a value of type ", x.typ)
+                return get_field_any!(fc, x, constant_value(idx), typ)
+            end
+            if constant_value(idx) isa Symbol && x.typ <: Tuple && x.typ !== Union{} && !isconcretetype(x.typ)
+                # (no field of a tuple has a name: natively a FieldError of the value's type,
+                # here by its type, as for a value whose type is not concrete)
+                return get_field_any!(fc, x, constant_value(idx), typ)
+            end
             is_no_field(x.typ, constant_value(idx)) && return no_field!(fc, x.typ, constant_value(idx))
             return get_field(fc, x, field_index(x.typ, constant_value(idx)))
         end

@@ -409,11 +409,12 @@ function compile_runtime_cases!(cgm::CGModule)
     with_optional_config(cgm) do
         while true
             n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm) +
-                add_by_type_cases!(cgm)
+                add_by_type_cases!(cgm) + add_getfield_any_cases!(cgm)
             n == 0 && break
             process_worklist!(cgm)
         end
     end
+    promote_getfield_any_cases!(cgm)
 end
 
 """
@@ -521,6 +522,100 @@ function finish_by_type!(cgm::CGModule)
             end!(b)
         end
         emit!(b, :i32_const, 0)
+        finish!(b)
+    end
+    return nothing
+end
+
+## `getfield` of a value whose type is not concrete
+
+"""
+    getfield_any_func!(cgm, T, f) -> Func
+
+`(x::\$JlValue) -> \$JlValue`: `getfield(x, f)` (a constant name or index `f`) of a value `x`
+of the type `T` that is not concrete, as `Any`: natively the `getfield` builtin, which finds
+the field by the value's type at run time. Here the module's case for the type of `x`
+(`Runtime.getfield_as`, compiled for each concrete type of the module whose objects may be
+`T`s, and of a tuple whose concrete type the module does not have), chosen by its type id.
+Generated when the module's types are known (`finish_getfield_any!`). The cases are the
+program's code, with their unsupported constructs, once a program function needs the helper
+(`promote_getfield_any_cases!`); before, those of the optional functions needing it.
+"""
+function getfield_any_func!(cgm::CGModule, @nospecialize(T), f::Union{Symbol,Int})
+    ks = get!(() -> Any[], cgm.helpers, :getfield_any)::Vector{Any}
+    any(k -> k[1] === T && k[2] === f, ks) || push!(ks, (T, f))
+    img = cgm.image
+    owners = get!(() -> Any[], cgm.helpers, (:getfield_any_owners, T, f))::Vector{Any}
+    owner = img.optional_mode || img.owner in img.optional ? img.owner : :program
+    any(o -> o === owner, owners) || push!(owners, owner)
+    return get!(cgm.helpers, (:getfield_any, T, f)) do
+        jl = jlvalue_ref(cgm.types)
+        add_func!(cgm.mod, string("jl_getfield_any_", replace(string(T, "_", f), r"[^A-Za-z0-9_]" => "_")),
+                  ValType[jl], ValType[jl])
+    end::Func
+end
+
+# the cases of the functions of `getfield_any_func!`: of each concrete type of the module
+# whose objects may be of its type (the number of cases added)
+function add_getfield_any_cases!(cgm::CGModule)
+    n = 0
+    for (T, f) in get(cgm.helpers, :getfield_any, Any[])::Vector{Any}
+        cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, (:getfield_any_cases, T, f))::Dict{Int,FuncInfo}
+        seen = get!(() -> Set{Int}(), cgm.helpers, (:getfield_any_seen, T, f))::Set{Int}
+        for (id, S) in enumerate(copy(cgm.types.typelist))
+            id in seen && continue
+            push!(seen, id)
+            # (an object of a kind, as `DataType`, may be a `Type{X}` without the kind being one;
+            # an object of `Tuple` is a tuple whose concrete type the module does not have)
+            ((S isa DataType && isconcretetype(S)) || S === Tuple) && typeintersect(S, T) !== Union{} || continue
+            cases[id] = runtime_function!(cgm, Runtime.getfield_as, (Any, Val{S}, Val{f}))
+            n += 1
+        end
+    end
+    return n
+end
+
+# the cases of a helper a program function needs: the program's (their unsupported constructs
+# are its errors); of one optional functions need: promoted with each (`promote_optional!`).
+# After the cases are emitted (all functions emitted in optional mode are optional). Of a
+# value of type `Any`, those of the runtime's own objects (types, modules, methods: no field
+# of theirs is read in a module) stay optional: one reaching them traps, as `objectid` of a
+# type it cannot be compiled for.
+function promote_getfield_any_cases!(cgm::CGModule)
+    img = cgm.image
+    for (T, f) in get(cgm.helpers, :getfield_any, Any[])::Vector{Any}
+        cases = get(cgm.helpers, (:getfield_any_cases, T, f), Dict{Int,FuncInfo}())::Dict{Int,FuncInfo}
+        owners = cgm.helpers[(:getfield_any_owners, T, f)]::Vector{Any}
+        for owner in owners, (id, c) in cases
+            T === Any && any(R -> cgm.types.typelist[id] === R, RUNTIME_TYPES) && continue
+            if owner === :program || !(owner in img.optional)
+                promote_optional!(cgm, c)
+            else
+                cs = get!(() -> Any[], img.optional_children, owner)
+                any(x -> x === c, cs) || push!(cs, c)
+            end
+        end
+    end
+end
+
+function finish_getfield_any!(cgm::CGModule)
+    ts = cgm.types
+    for (T, f) in get(cgm.helpers, :getfield_any, Any[])::Vector{Any}
+        func = cgm.helpers[(:getfield_any, T, f)]::Func
+        cases = get(cgm.helpers, (:getfield_any_cases, T, f), Dict{Int,FuncInfo}())::Dict{Int,FuncInfo}
+        b = Builder(cgm.mod, func)
+        tid = add_local!(func, I32)
+        emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+        for id in sort!(collect(keys(cases)))
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            if!(b)
+            emit!(b, :local_get, 0); call!(b, cases[id].func)
+            # (a case that always throws returns nothing)
+            isempty(cases[id].func.results) ? unreachable!(b) : return!(b)
+            end!(b)
+        end
+        # (no other object is a `T`)
+        unreachable!(b)
         finish!(b)
     end
     return nothing

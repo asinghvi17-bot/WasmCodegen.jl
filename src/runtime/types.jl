@@ -148,6 +148,22 @@ const NO_BY_TYPE = Ref{Any}(nothing)
 # (read through a global, so that inference does not fold the result into the callers)
 const NO_CASE = Ref(false)
 
+"""
+    getfield_as(x, Val(S), Val(f))
+
+`getfield(x, f)` of `x`, an `S`, as `Any`: the case of `S` of `getfield` of a value whose type
+is not concrete (abstract, a `Union`, a `UnionAll`), which natively the `getfield` builtin
+finds by the value's type at run time (see `getfield_any_func!`). Its errors are the native
+ones: a `FieldError` for a name `S` has no field of, a `BoundsError` for an index out of its
+fields, an `UndefRefError` for a field not defined. (`S` in a `Val`, so that the case's only
+parameter is `x`: `Type{S}` is not a ghost for every `S`.)
+"""
+getfield_as(@nospecialize(x), ::Val{S}, ::Val{f}) where {S,f} = Base.inferencebarrier(getfield(x::S, f))
+# a tuple whose concrete type the module does not have (an object of `Tuple`): no field has a
+# name (natively a FieldError of its concrete type, which the module does not have: of `Tuple`)
+getfield_as(@nospecialize(x), ::Val{Tuple}, ::Val{f}) where {f} =
+    f isa Symbol ? throw(FieldError(Tuple, f)) : Base.inferencebarrier(getfield(x::Tuple, f))
+
 "The type a value shown in a context of `typeinfo` `T` is printed as (`nonnothing_nonmissing_typeinfo`)."
 nonnothing_nonmissing(@nospecialize(T)) = T isa Type ? Base.nonmissingtype(Base.nonnothingtype(T)) : Any
 
