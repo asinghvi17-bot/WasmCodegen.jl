@@ -237,6 +237,47 @@ function rg_valtype_caught(n::Int)
     end
 end
 rg_nttype(flag::Bool) = (x = flag ? 1 : 2.5; T = NamedTuple{(:a,), Tuple{typeof(x)}}; T === NamedTuple{(:a,), Tuple{Int}} ? 1 : 2)
+# `apply_type` of parameters that may not be ones, or outside their variable's bounds: the
+# native TypeError (`jl_f_apply_type`, `jl_apply_type`, `check_datatype_parameters`), before the
+# closed world's error (`Runtime.apply_type_check`)
+struct RGBounded{T<:Integer} end
+const RG_ALIAS{T} = RGBounded{T}
+const RG_VTUPLE = Tuple{Vararg{T,N}} where T<:Integer where N
+const RG_PARAMS = Any[Int, Float64, 3, "s", Int8]
+function rg_bad_param(i::Int, which::Int)
+    p = RG_PARAMS[i]
+    try
+        T = which == 1 ? RGBounded{p} : which == 2 ? RG_ALIAS{p} : which == 3 ? Val{p} : Tuple{p, Int}
+        return (0, T === RGBounded{Int}, T === Val{3}, T === Tuple{Int8,Int}, false, false)
+    catch e
+        # (`expected` is the bound's `TypeVar`, in a field of type `Type`: read where `e` is not
+        # known to be a TypeError, else natively `===` is folded by the field's type)
+        x = getfield(Base.inferencebarrier(e), :expected)
+        e isa TypeError || return (-1, false, false, false, false, false)
+        return (1, e.func === :RGBounded, e.func === :Type || e.func === :Tuple, (c = e.context; c isa String && c == "T"),
+                x === RGBounded.var || x === Type, e.got === p)
+    end
+end
+# a parameter substitution drops (natively `RG_VTUPLE{0,T}` is `Tuple{}`, whose bound of `T` is
+# not checked): here an error, never that type (DESIGN.md)
+function rg_erased_bound(n::Int)
+    p = RG_PARAMS[2]
+    try
+        return RG_VTUPLE{n,p} === Tuple{} ? 1 : 2
+    catch e
+        return e isa TypeError ? -1 : e isa ErrorException ? -2 : -3
+    end
+end
+# a case of `new` that always throws (of a field of type `Union{}`): not the others
+struct RGNever{T}; x::T; end
+@generated rg_never(flag::Bool, x::Int) = Expr(:new, :(flag ? RGNever{Int} : RGNever{Union{}}), :x)
+function rg_never_caught(flag::Bool)
+    try
+        rg_never(flag, 5) isa RGNever{Int} ? 1 : 2
+    catch e
+        e isa TypeError && e.func === :new && e.expected === Union{} && e.got === 5 ? -1 : -2
+    end
+end
 function rg_user(flag::Bool)
     v = flag ? [1] : ["a"]
     return rg_callit(() -> length(v))
@@ -274,6 +315,18 @@ end
     let r = wasm_run(wcompile(rg_valtype_caught, (Int,)), "rg_valtype_caught", 3; rettype=Int)
         @test r == -1 || (r isa Tuple && r[1] === :trap)
         @test occursin("not one of this module's", LAST_OUTPUT[])
+    end
+    # (of valid parameters, applications whose types code names: others are the closed world's
+    # error, as `Val{3}` above)
+    for (i, which) in ((1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3), (4, 1), (4, 2), (4, 3), (4, 4), (5, 4))
+        @wtest rg_bad_param(i, which)
+    end
+    @test rg_erased_bound(0) == 1
+    let r = wasm_run(wcompile(rg_erased_bound, (Int,)), "rg_erased_bound", 0; rettype=Int)
+        @test r in (-1, -2) || (r isa Tuple && r[1] === :trap)
+    end
+    for flag in (true, false)
+        @wtest rg_never_caught(flag)
     end
     for i in 1:5
         @wtest rg_typekeys(i)

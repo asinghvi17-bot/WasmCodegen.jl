@@ -922,13 +922,17 @@ type_var_count(@nospecialize(W)) = W isa UnionAll ? 1 + type_var_count(W.body) :
     apply_type_params(W, T, n) -> Union{Vector{Any},Nothing}
 
 The `n` parameters `P` with `Core.apply_type(W, P...) === T`, or `nothing` if `T` is not
-such a type (computed natively, for the module's types).
+such a type (computed natively, for the module's types). `T` of parameters it leaves unbound
+(a parameter the substitution of the earlier ones drops, as `NTuple{0,T}` is `Tuple{}` for
+any `T`) is not an instantiation found by its parameters: such an application is the closed
+world's error, never another type.
 """
 function apply_type_params(@nospecialize(W), @nospecialize(T), n::Int)
     (T isa DataType && !Base.has_free_typevars(T)) || return nothing
     if W === Tuple
         (T <: Tuple && !Base.isvatuple(T) && length(T.parameters) == n) || return nothing
         P = collect(Any, T.parameters)
+        any(p -> p isa TypeVar, P) && return nothing
     else
         U = Base.unwrap_unionall(W)
         (U isa DataType && U.name === T.name && T <: W) || return nothing
@@ -958,6 +962,8 @@ function emit_apply_type!(fc::FnCtx, args::Vector{Any}, @nospecialize(typ))
         unsupported("apply_type of types not known at compile time")
     W = constant_value(args[1])
     n = length(args) - 1
+    n <= Runtime.MAX_APPLY_PARAMS ||
+        unsupported("apply_type of types not known at compile time, of ", n, " parameters")
     (W === Tuple || (W isa UnionAll && Base.unwrap_unionall(W) isa DataType && type_var_count(W) == n)) ||
         unsupported("apply_type of types not known at compile time (", W, " of ", n, " parameters)")
     cgm = fc.cgm
@@ -966,8 +972,11 @@ function emit_apply_type!(fc::FnCtx, args::Vector{Any}, @nospecialize(typ))
         f = add_func!(cgm.mod, "jl_apply_type_" * replace(typename_str(W), r"[^A-Za-z0-9_]" => "_"),
                       ValType[jl for _ in 1:n], ValType[jl])
         msg = string("Core.apply_type(", W, ", …): the type is not one of this module's (types are not made at run time)")
+        # (the native errors of parameters that may not be ones, or outside the bounds)
+        argtypes = (Val{W}, ntuple(_ -> Any, n)...)
         (; func=f, msg=object_global!(cgm.image, msg),
            throw=runtime_function!(cgm, Runtime.throw_apply_type_unknown, (String,)),
+           check=runtime_function!(cgm, Runtime.apply_type_check, argtypes),
            cands=IdDict{Any,Vector{Any}}())
     end
     # (the types inference says it gives are the module's, as types code names are)
@@ -1017,6 +1026,8 @@ function finish_apply_type!(cgm::CGModule)
         (k isa Tuple && length(k) == 3 && k[1] === :apply_type) || continue
         n = k[3]
         b = Builder(cgm.mod, h.func)
+        call_check(c::FuncInfo) = (for i in 1:n; emit!(b, :local_get, i - 1); end;
+                                   call!(b, c.func); foreach(_ -> emit!(b, :drop), c.func.results))
         for T in sort!(collect(keys(h.cands)); by=T -> typeid!(ts, T))
             P = h.cands[T]
             for (i, p) in enumerate(P)
@@ -1029,6 +1040,8 @@ function finish_apply_type!(cgm::CGModule)
             n == 0 && emit!(b, :i32_const, 1)
             if!(b); emit!(b, :global_get, object_global!(img, T)); return!(b); end!(b)
         end
+        # (not one of the module's: natively a TypeError if not a valid application)
+        call_check(h.check)
         emit!(b, :global_get, h.msg)
         call!(b, h.throw.func)
         unreachable!(b)
@@ -1155,7 +1168,7 @@ function finish_new!(cgm::CGModule)
         end!(b)
         for id in sort!(collect(keys(cases)))
             info = cases[id]
-            length(info.func.params) == n && length(info.func.results) == 1 ||
+            length(info.func.params) == n && length(info.func.results) <= 1 ||
                 error("WasmCodegen: the case of `new` of ", ts.typelist[id], " has an unexpected signature")
             emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
             if!(b)
@@ -1163,7 +1176,8 @@ function finish_new!(cgm::CGModule)
                 emit!(b, :local_get, i)
             end
             call!(b, info.func)
-            return!(b)
+            # (a case that always throws, as of a field of type `Union{}`, returns nothing)
+            isempty(info.func.results) ? unreachable!(b) : return!(b)
             end!(b)
         end
         # (a concrete type of the wrong number of fields)

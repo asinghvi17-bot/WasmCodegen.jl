@@ -209,8 +209,9 @@ is_memoryref_type(@nospecialize T) =
     T isa DataType && T.name === GenericMemoryRef.body.body.body.name
 memory_eltype(@nospecialize T) = T.parameters[2]
 
-# the runtime's own objects, which have no Julia-level layout to follow
-const RUNTIME_TYPES = Any[DataType, UnionAll, Union, Core.TypeofBottom, TypeVar,
+# the runtime's own objects, which have no Julia-level layout to follow (a `TypeVar`, a
+# mutable struct of its name and bounds, has one: type objects do not hold them here)
+const RUNTIME_TYPES = Any[DataType, UnionAll, Union, Core.TypeofBottom,
                           Core.SimpleVector, Module, Method, Core.MethodInstance,
                           Core.CodeInstance, Core.TypeName, Core.Binding]
 

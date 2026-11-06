@@ -292,8 +292,8 @@ module with that many fields: natively the `TypeError` of a type that is not a c
 
 """
 The error of `Core.apply_type(W, …)` whose result is not one of the module's types (`msg`
-names `W`): types are not made at run time. (Natively also the error of an application that
-is not valid, `Vector{3}`, which cannot be told apart here.)
+names `W`): types are not made at run time. (An application that is not valid is natively's
+`TypeError` before it: `apply_type_check`.)
 """
 # (`apply_type` does not throw for inference, which may have removed the handlers around it:
 # the message is also written to `Core.stderr`, as `throw_typeof_unknown`'s)
@@ -304,3 +304,142 @@ end
 
 "The error of `new(T, …)` of a concrete type `T` with a number of fields it cannot have."
 @noinline throw_invalid_struct_allocation() = error("invalid struct allocation")
+
+## the errors of `Core.apply_type` of parameters known only at run time (`jl_f_apply_type`,
+## `jl_apply_type`, `check_datatype_parameters`): checked where the parameters are not those of
+## one of the module's instantiations, before the closed world's error (see `reflection.jl`)
+
+"""
+    valid_param_kind(T) -> Symbol
+
+`:valid` if the values of the type `T` may be parameters of types, else `:invalid`
+(`jl_valid_type_param`, which depends only on the value's type): a function of types, for a
+table over the module's types (`map_type_symbol`).
+"""
+function valid_param_kind(@nospecialize(T))
+    T isa DataType || return :invalid
+    (T.name === Tuple.name || T.name === NamedTuple.body.body.name) &&
+        return nestable_type_param(T) ? :valid : :invalid
+    T === Core.TypeofVararg && return :invalid
+    return T <: Type || T === TypeVar || T === Symbol || T === Module || isbitstype(T) ? :valid : :invalid
+end
+
+# `is_nestable_type_param`: a tuple or named tuple type whose values may be type parameters
+function nestable_type_param(@nospecialize(t))
+    t isa DataType && t.name === NamedTuple.body.body.name && (t = t.parameters[2])
+    (t isa DataType && t.name === Tuple.name) || return false
+    for p in t.parameters
+        (p === Symbol || (p isa DataType && isbitstype(p)) || nestable_type_param(p)) || return false
+    end
+    return true
+end
+
+"`jl_valid_type_param`: whether `p` may be a parameter of a type."
+valid_type_param(@nospecialize(p)) = map_type_symbol(valid_param_kind, typeof(p)) === :valid
+
+"`within_typevar`: whether `p` is within the bounds `lb`, `ub` of a type variable."
+within_typevar(@nospecialize(p), @nospecialize(lb), @nospecialize(ub)) =
+    p isa TypeVar || (p isa Type ? (lb <: p && p <: ub) : (lb === Union{} && ub === Any))
+
+# `jl_type_error_rt`: the `TypeError` of `func` (in `context`), whose `expected` may be a
+# `TypeVar`, as the C runtime builds it, without `new`'s check of the field's type `Type` (run
+# in the module only; `expected` hidden from inference, which would find that `new` throws)
+@eval type_error_rt(func::Symbol, context::String, @nospecialize(expected), @nospecialize(got)) =
+    $(Expr(:new, TypeError, :func, :context, :(Base.inferencebarrier(expected)), :got))
+
+# the checks of `jl_f_apply_type(W, ps...)`: that each parameter may be one, in order
+function apply_type_valid_body(@nospecialize(W), ps)
+    body = Expr(:block)
+    n = length(ps)
+    for (i, p) in enumerate(ps)
+        if W === Tuple
+            push!(body.args, :(if $p isa Core.TypeofVararg
+                                   $(i == n ? nothing : :(throw(TypeError(:Tuple, "non-final parameter", Type, $p))))
+                               elseif !valid_type_param($p)
+                                   throw(TypeError(:Tuple, "parameter", Type, $p))
+                               end))
+        else
+            push!(body.args, :(valid_type_param($p) ||
+                               throw(TypeError(:Type, "parameter", $p isa Number ? Int : Type, $p))))
+        end
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+"""
+    apply_type_bounds(W, n) -> Vector{Tuple{Int,Symbol,TypeVar}}
+
+The bounds `jl_apply_type(W, ps...)` checks, in order, as (the parameter's index, the
+function the `TypeError` names, the variable): of `W`'s variables, then (of an alias of a
+type, not its wrapper) of the parameters of the type it makes (`check_datatype_parameters`).
+A bound that depends on an earlier variable is not checked (that needs the type made of the
+earlier parameters): an application outside it is the closed world's error.
+"""
+function apply_type_bounds(@nospecialize(W), n::Int)
+    checks = Tuple{Int,Symbol,TypeVar}[]
+    W === Tuple && return checks
+    vars = TypeVar[]
+    w = W
+    while w isa UnionAll
+        push!(vars, w.var)
+        w = w.body
+    end
+    D = w
+    fixed(v::TypeVar) = !Base.has_free_typevars(v.lb) && !Base.has_free_typevars(v.ub)
+    if D isa DataType && W === D.name.wrapper
+        for (i, v) in enumerate(vars)
+            i <= n && fixed(v) && push!(checks, (i, D.name.name, v))
+        end
+        return checks
+    end
+    for (i, v) in enumerate(vars)
+        i <= n && fixed(v) && push!(checks, (i, D isa DataType ? D.name.name : :Type, v))
+    end
+    if D isa DataType && D.name !== Tuple.name
+        wvars = TypeVar[]
+        w = D.name.wrapper
+        while w isa UnionAll
+            push!(wvars, w.var)
+            w = w.body
+        end
+        for (j, e) in enumerate(D.parameters)
+            i = findfirst(v -> v === e, vars)
+            (i === nothing || i > n || j > length(wvars)) && continue
+            fixed(wvars[j]) && push!(checks, (i, D.name.name, wvars[j]))
+        end
+    end
+    return checks
+end
+
+# the checks of `jl_f_apply_type`, then the bounds of `jl_apply_type` (`apply_type_bounds`)
+function apply_type_check_body(@nospecialize(W), ps)
+    body = apply_type_valid_body(W, ps)
+    pop!(body.args)
+    for (i, f, v) in apply_type_bounds(W, length(ps))
+        p = ps[i]
+        push!(body.args, :(within_typevar($p, $(QuoteNode(v.lb)), $(QuoteNode(v.ub))) ||
+                           throw(type_error_rt($(QuoteNode(f)), $(String(v.name)), $(QuoteNode(v)), $p))))
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+"The most parameters `Core.apply_type` of parameters known only at run time is compiled for."
+const MAX_APPLY_PARAMS = 16
+
+"""
+    apply_type_check(Val(W), ps...)
+
+The errors of `Core.apply_type(W, ps...)` natively: of parameters that may not be ones, and
+outside the bounds of `W`'s variables (`apply_type_bounds`); else `nothing`. Compiled for each
+`W` the module applies at run time (`emit_apply_type!`), and called where the parameters are
+not those of one of the module's instantiations, before the closed world's error.
+"""
+function apply_type_check end
+for n in 0:MAX_APPLY_PARAMS
+    ps = Tuple(Symbol(:p, i) for i in 1:n)
+    @eval @generated function apply_type_check(::Val{W}, $(ps...)) where {W}
+        return apply_type_check_body(W, $ps)
+    end
+end

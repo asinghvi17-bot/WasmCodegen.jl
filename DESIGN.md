@@ -466,7 +466,16 @@ as other pointers of the build process are.
   module's types: `apply_type(W, ps...)` calls `jl_apply_type_<W>`, the instantiations of
   `W` the module has (the closed world's cache of them), found by their parameters (type
   objects by reference, other values with `jl_egal`); one the module does not have is an
-  error (written to `Core.stderr` too: `apply_type` does not throw for inference).
+  error (written to `Core.stderr` too: `apply_type` does not throw for inference). Before
+  it, parameters that may not be ones, or outside their variable's bounds, are native's
+  `TypeError` (`Runtime.apply_type_check`). Some native errors and results are the closed
+  world's error instead: a bound that depends on an earlier parameter (`S<:T`) and the
+  checks made while making the type (a `NamedTuple`'s names, a `Vararg`'s count). So are
+  erased parameters: an instantiation whose parameters do not all appear in it (`Tuple{}` of
+  `NTuple{0,T}`) is never found by them, and an erased parameter outside its bound is a
+  `TypeError` natively skipped once it is erased. And of an alias, whose bounds and its
+  type's are checked each list in turn, where natively they interleave, the `TypeError` may
+  name another parameter than native's first.
   `new(T, xs...)` calls `jl_new_<n>`, which goes by the type id of `T` to `Runtime.new_as`
   compiled for each concrete type of the module some `new` site's `T` may be by inference
   (`T` of type `DataType`, which would be every type, is not supported; the cases of a

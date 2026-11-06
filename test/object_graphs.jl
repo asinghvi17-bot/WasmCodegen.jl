@@ -109,22 +109,26 @@ module DeferredHash
     same(x::Float64) = objectid((B.self::Box).k1) === objectid(B.k2) ? x : -x
 end
 
-# a deferred field value that cannot be serialized (a `TypeVar`), directly and in a nested object
-# reached through a deferred field, from a constant and from a global variable
+# a deferred field value that cannot be serialized (an immutable object holding a pointer of the
+# build process, which a native image keeps as it is), directly and in a nested object reached
+# through a deferred field, from a constant and from a global variable
 module DeferredFailure
+    struct PtrBox
+        p::Ptr{Cvoid}
+    end
     mutable struct Rec
         p::Any
         k::Float64
         self::Any
     end
-    const REC = let r = Rec(TypeVar(:T), 2.0, nothing); r.self = r; r end
+    const REC = let r = Rec(PtrBox(Ptr{Cvoid}(1)), 2.0, nothing); r.self = r; r end
     read(x::Float64) = x * (REC.self::Rec).k
     read2(x::Float64) = x + (REC.self::Rec).k
     plain1(x::Float64) = x + 1.0
     plain2(x::Float64) = x - 1.0
-    const OUTER = let r = Rec(nothing, 3.0, nothing); r.self = Rec(TypeVar(:S), 0.5, r); r end
+    const OUTER = let r = Rec(nothing, 3.0, nothing); r.self = Rec(PtrBox(Ptr{Cvoid}(2)), 0.5, r); r end
     nested(x::Float64) = x * OUTER.k
-    VAR::Rec = Rec(TypeVar(:U), 4.0, nothing)
+    VAR::Rec = Rec(PtrBox(Ptr{Cvoid}(3)), 4.0, nothing)
     fromvar(x::Float64) = x * VAR.k
     # such an object reached through the box of a tuple held in an `Any` field, through a tuple stored
     # as an array (a field of a tuple type of unknown length), and through a global variable, from two
@@ -133,7 +137,7 @@ module DeferredFailure
         v::Any
         id::Int
     end
-    const TUP = (Rec(TypeVar(:V), 5.0, nothing), 1.0)
+    const TUP = (Rec(PtrBox(Ptr{Cvoid}(4)), 5.0, nothing), 1.0)
     const SINK3 = Any[nothing]
     const SINK4 = Any[nothing]
     const HOLD3 = Holder(TUP, 3)
@@ -144,14 +148,14 @@ module DeferredFailure
         t::Tuple{Vararg{Rec}}
         id::Int
     end
-    const VTUP = (Rec(TypeVar(:X), 7.0, nothing),)
+    const VTUP = (Rec(PtrBox(Ptr{Cvoid}(5)), 7.0, nothing),)
     const SINK5 = Any[nothing]
     const SINK6 = Any[nothing]
     const VH5 = VHold(VTUP, 5)
     const VH6 = VHold(VTUP, 6)
     varr5(x::Float64) = (SINK5[1] = VH5; x)
     varr6(x::Float64) = (SINK6[1] = VH6; x)
-    VAR2::Rec = Rec(TypeVar(:W), 6.0, nothing)
+    VAR2::Rec = Rec(PtrBox(Ptr{Cvoid}(6)), 6.0, nothing)
     var3(x::Float64) = x * VAR2.k
     var4(x::Float64) = x + VAR2.k
 end
