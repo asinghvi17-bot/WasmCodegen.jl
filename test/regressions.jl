@@ -143,7 +143,191 @@ function rg_type_tuple_loop(i::Int)
     return r
 end
 
+# closures capturing a variable inferred as a small Union: `apply_type` and `new` of a type
+# known only at run time (as Pkg's registry and download functions have), the builtins at run
+# time over the module's types
+@noinline rg_callit(g) = g()
+@noinline rg_pick(flag::Bool) = flag ? [1, 2, 3] : ["a", "b"]
+@noinline rg_maybe_str(n::Int) = n > 0 ? string("s", n) : nothing
+@noinline rg_maybe_tup(n::Int) = n > 0 ? (SubString("abcd", 1, n), Dict(1 => n)) : nothing
+function rg_closure_vec(flag::Bool)
+    v = rg_pick(flag)
+    return rg_callit(() -> length(v) * 10 + (v isa Vector{Int} ? 1 : 2))
+end
+function rg_closure_nothing(n::Int)
+    s = string("ab", "c"^max(n, 0))
+    m = rg_maybe_str(n)
+    k = n + 1
+    return rg_callit(() -> (m === nothing ? 0 : length(m)) + length(s) * k)
+end
+function rg_closure_tuple(n::Int)
+    t = rg_maybe_tup(n)
+    return rg_callit(() -> t === nothing ? -1 : length(t[1]) + t[2][1])
+end
+# a `new` of one of a few types whose field is not correlated with the choice: a TypeError
+# where the field does not fit, as natively
+struct RGUnionBox{T}; x::T; end
+mutable struct RGMutableBox{T}; x::T; end
+@noinline rg_unionpick(flag::Bool) = flag ? 42 : 2.5
+@generated function rg_unionfield(flag::Bool, pick::Bool)
+    newex = Expr(:new, :(flag ? RGUnionBox{Int} : RGUnionBox{Float64}), :x)
+    quote
+        x = rg_unionpick(pick)
+        b = $newex
+        b isa RGUnionBox{Int} ? (1, Float64(b.x)) : (2, b.x)
+    end
+end
+@generated rg_mutable(flag::Bool, x::Float64) =
+    Expr(:new, :(flag ? RGMutableBox{Int} : RGMutableBox{Float64}), :x)
+function rg_mutablefield(flag::Bool, x::Float64)
+    b = rg_mutable(flag, x)
+    return b isa RGMutableBox{Int} ? Float64(b.x) : b.x
+end
+# (caught, with a `finally`)
+function rg_catch_new(flag::Bool, pick::Bool)
+    cleaned = Ref(0)
+    r = try
+        try
+            rg_unionfield(flag, pick)[1]
+        finally
+            cleaned[] += 1
+        end
+    catch e
+        e isa TypeError ? (e.func === :new ? 10 : 20) + (e.expected === Int ? 1 : e.expected === Float64 ? 2 : 3) : 30
+    end
+    return (r, cleaned[])
+end
+function rg_catch_mutable(flag::Bool, x::Float64)
+    try
+        rg_mutablefield(flag, x)
+    catch e
+        e isa TypeError && e.func === :new && e.got === x ? -1.0 : -2.0
+    end
+end
+# `new` of a type of a bound other than a union (`Type{<:RGUnionBox}`), and of an abstract type
+@noinline rg_boxtype(i::Int) = i == 1 ? RGUnionBox{Int} : i == 2 ? RGUnionBox{Float64} : RGUnionBox{Integer}
+@generated rg_newbound(i::Int, x::Int) = Expr(:new, :(rg_boxtype(i)), :x)
+rg_newbound_val(i::Int, x::Int) = (b = rg_newbound(i, x); b isa RGUnionBox{Int} ? 1 : b isa RGUnionBox{Float64} ? 2 : 3)
+function rg_newbound_caught(i::Int, x::Int)
+    try
+        rg_newbound_val(i, x)
+    catch e
+        e isa TypeError && e.func === :new ? (e.expected === Float64 ? -1 : -2) : -3
+    end
+end
+@noinline rg_numtype(i::Int) = i == 1 ? RGUnionBox{Int} : Integer
+@generated rg_newabstract(i::Int) = Expr(:new, :(rg_numtype(i)), 1)
+function rg_newabstract_caught(i::Int)
+    try
+        rg_newabstract(i) isa RGUnionBox{Int} ? 1 : 2
+    catch e
+        e isa TypeError && e.func === :new && e.expected === DataType && e.got === Integer ? -1 : -2
+    end
+end
+# `apply_type` of other wrappers: `Tuple`, a parameter that is not a type (`Val{n}`: compared
+# with `jl_egal`), a `NamedTuple`; and of a type the module does not have (an error: types are
+# not made at run time; natively `Val{3}`)
+rg_tupletype(flag::Bool) = (x = flag ? 1 : "a"; T = Tuple{typeof(x), Int}; T === Tuple{Int,Int} ? 1 : T === Tuple{String,Int} ? 2 : 3)
+rg_valtype(n::Int) = (T = Val{n}; T === Val{1} ? 1 : T === Val{2} ? 2 : 0)
+function rg_valtype_caught(n::Int)
+    try
+        rg_valtype(n)
+    catch e
+        e isa ErrorException ? -1 : -2
+    end
+end
+rg_nttype(flag::Bool) = (x = flag ? 1 : 2.5; T = NamedTuple{(:a,), Tuple{typeof(x)}}; T === NamedTuple{(:a,), Tuple{Int}} ? 1 : 2)
+# `apply_type` of parameters that may not be ones, or outside their variable's bounds: the
+# native TypeError (`jl_f_apply_type`, `jl_apply_type`, `check_datatype_parameters`), before the
+# closed world's error (`Runtime.apply_type_check`)
+struct RGBounded{T<:Integer} end
+const RG_ALIAS{T} = RGBounded{T}
+const RG_VTUPLE = Tuple{Vararg{T,N}} where T<:Integer where N
+const RG_PARAMS = Any[Int, Float64, 3, "s", Int8]
+function rg_bad_param(i::Int, which::Int)
+    p = RG_PARAMS[i]
+    try
+        T = which == 1 ? RGBounded{p} : which == 2 ? RG_ALIAS{p} : which == 3 ? Val{p} : Tuple{p, Int}
+        return (0, T === RGBounded{Int}, T === Val{3}, T === Tuple{Int8,Int}, false, false)
+    catch e
+        # (`expected` is the bound's `TypeVar`, in a field of type `Type`: read where `e` is not
+        # known to be a TypeError, else natively `===` is folded by the field's type)
+        x = getfield(Base.inferencebarrier(e), :expected)
+        e isa TypeError || return (-1, false, false, false, false, false)
+        return (1, e.func === :RGBounded, e.func === :Type || e.func === :Tuple, (c = e.context; c isa String && c == "T"),
+                x === RGBounded.var || x === Type, e.got === p)
+    end
+end
+# a parameter substitution drops (natively `RG_VTUPLE{0,T}` is `Tuple{}`, whose bound of `T` is
+# not checked): here an error, never that type (DESIGN.md)
+function rg_erased_bound(n::Int)
+    p = RG_PARAMS[2]
+    try
+        return RG_VTUPLE{n,p} === Tuple{} ? 1 : 2
+    catch e
+        return e isa TypeError ? -1 : e isa ErrorException ? -2 : -3
+    end
+end
+# a case of `new` that always throws (of a field of type `Union{}`): not the others
+struct RGNever{T}; x::T; end
+@generated rg_never(flag::Bool, x::Int) = Expr(:new, :(flag ? RGNever{Int} : RGNever{Union{}}), :x)
+function rg_never_caught(flag::Bool)
+    try
+        rg_never(flag, 5) isa RGNever{Int} ? 1 : 2
+    catch e
+        e isa TypeError && e.func === :new && e.expected === Union{} && e.got === 5 ? -1 : -2
+    end
+end
+function rg_user(flag::Bool)
+    v = flag ? [1] : ["a"]
+    return rg_callit(() -> length(v))
+end
 @testset "regressions" begin
+    @wtest rg_unionfield(true, true)
+    @wtest rg_unionfield(false, false)
+    @wtest rg_mutablefield(false, 2.5)
+    for flag in (true, false), pick in (true, false)
+        @wtest rg_catch_new(flag, pick)
+    end
+    @wtest rg_catch_mutable(true, 2.5)
+    @wtest rg_catch_mutable(false, 2.5)
+    for flag in (true, false)
+        @wtest rg_closure_vec(flag)
+        @wtest rg_user(flag)
+        @wtest rg_tupletype(flag)
+        @wtest rg_nttype(flag)
+    end
+    for n in (-1, 0, 3)
+        @wtest rg_closure_nothing(n)
+        @wtest rg_closure_tuple(n)
+    end
+    for i in 1:3
+        @wtest rg_newbound_caught(i, 7)
+    end
+    for i in 1:2
+        @wtest rg_newabstract_caught(i)
+    end
+    for n in 1:2
+        @wtest rg_valtype_caught(n)
+    end
+    # (natively 0: `Val{3}` is a type no code of the module names, an error here, written to
+    # stderr too, as inference may have removed the handler: `apply_type` does not throw for it)
+    let r = wasm_run(wcompile(rg_valtype_caught, (Int,)), "rg_valtype_caught", 3; rettype=Int)
+        @test r == -1 || (r isa Tuple && r[1] === :trap)
+        @test occursin("not one of this module's", LAST_OUTPUT[])
+    end
+    # (of valid parameters, applications whose types code names: others are the closed world's
+    # error, as `Val{3}` above)
+    for (i, which) in ((1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3), (4, 1), (4, 2), (4, 3), (4, 4), (5, 4))
+        @wtest rg_bad_param(i, which)
+    end
+    @test rg_erased_bound(0) == 1
+    let r = wasm_run(wcompile(rg_erased_bound, (Int,)), "rg_erased_bound", 0; rettype=Int)
+        @test r in (-1, -2) || (r isa Tuple && r[1] === :trap)
+    end
+    for flag in (true, false)
+        @wtest rg_never_caught(flag)
+    end
     for i in 1:5
         @wtest rg_typekeys(i)
     end
