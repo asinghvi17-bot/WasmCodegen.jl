@@ -64,13 +64,14 @@ end
 mutable struct TypeHash   # (mutable: an object of the image; never mutated)
     h::UInt
 end
-const TYPE_HASHES = IdDict{Any,TypeHash}()
 """
 `type_hash(T)`: the C runtime's hash of a type (`jl_type_hash`, Base's `_jl_type_hash`), for
 `map_type_value`: computed natively for the module's types, when the code generator builds the
-table, so `hash(::Type)` gives the native values in Wasm. (One object per type.)
+table, so `hash(::Type)` gives the native values in Wasm. (A new object each time, without a
+cache: natively, in a session of patches, any task's `hash(::Type)` calls it; the code
+generator keeps one per type, `map_value!`.)
 """
-type_hash(@nospecialize(T)) = get!(() -> TypeHash(ccall(:jl_type_hash, UInt, (Any,), T)), TYPE_HASHES, T)
+type_hash(@nospecialize(T)) = TypeHash(ccall(:jl_type_hash, UInt, (Any,), T))
 
 """
 `simple_type_name(T)`: the name a type is printed with in a module (`show(io, ::Type)`,
