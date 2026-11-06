@@ -1,61 +1,64 @@
-include("harness.jl")
-include("juliac/programs.jl")
-# programs inferred into a package image; precompiled before the patches, which change how
-# Base prints the code it sends to the precompiling process
+# The tests, in parallel (ParallelTestRunner): each file in a worker process, in a session of
+# juliac's trim patches of its own (as juliac builds in one process). The files that open
+# sessions with other patches open them themselves. `julia test/runtests.jl --help` lists the
+# options (`--jobs=N`, test names to run only those).
+
+using ParallelTestRunner
+using WasmCodegen
+
+# programs inferred into a package image; precompiled here, once, before the workers load
+# them, and before the patches, which change how Base prints the code it sends to the
+# precompiling process
 push!(LOAD_PATH, joinpath(@__DIR__, "PrecompiledPrograms"))
 using PrecompiledPrograms
 pop!(LOAD_PATH)
 
-# (the references of printing.jl, with Base's printing: before the patches)
-include("printing_fixtures.jl")
+# the files run in a session of juliac's trim patches
+const SESSION_TESTS = [
+    "basics", "cfunctions", "data", "random", "dicts", "object_graphs", "globals", "exceptions",
+    "coverage", "linalg", "eachindex_trim", "task_fields", "ptrcarry", "regressions", "exprs",
+    "ir_cache", "progress", "hosts", "import_libraries", "ptrbytes", "ptrhash", "typeof_any",
+    "getfield_any", "invoke_cycle", "reflection_rt", "printing", "runtime", "idset", "unset",
+    "image_pointers", "vararg_tuples", "split_unions", "versions", "specialize", "invokelatest",
+    "staging", "env", "fs", "event", "diagnostics", "type_hash", "foreign_functions",
+    "verifier", "juliac/runtests"]
+# the files that open sessions with other patches themselves
+const OWN_SESSION_TESTS = ["patch_sessions", "tasks"]
 
-# one session of juliac's trim patches for all the tests (as juliac builds in one process)
-WasmCodegen.with_trim_patches() do _, _
-    include("basics.jl")
-    include("cfunctions.jl")
-    include("data.jl")
-    include("random.jl")
-    include("dicts.jl")
-    include("object_graphs.jl")
-    include("globals.jl")
-    include("exceptions.jl")
-    include("coverage.jl")
-    include("linalg.jl")
-    include("eachindex_trim.jl")
-    include("task_fields.jl")
-    include("ptrcarry.jl")
-    include("regressions.jl")
-    include("exprs.jl")
-    include("ir_cache.jl")
-    include("progress.jl")
-    include("hosts.jl")
-    include("import_libraries.jl")
-    include("ptrbytes.jl")
-    include("ptrhash.jl")
-    include("typeof_any.jl")
-    include("getfield_any.jl")
-    include("invoke_cycle.jl")
-    include("reflection_rt.jl")
-    include("printing.jl")
-    include("runtime.jl")
-    include("idset.jl")
-    include("unset.jl")
-    include("image_pointers.jl")
-    include("vararg_tuples.jl")
-    include("split_unions.jl")
-    include("versions.jl")
-    include("specialize.jl")
-    include("invokelatest.jl")
-    include("staging.jl")
-    include("env.jl")
-    include("fs.jl")
-    include("event.jl")
-    include("diagnostics.jl")
-    include("type_hash.jl")
-    include("foreign_functions.jl")
-    include("juliac/runtests.jl")
+# in each worker, once: the harness, the programs and the references of printing.jl (with
+# Base's printing: before the patches), in `Main`; the names they define, which each test's
+# module imports
+const init_worker_code = quote
+    const _BEFORE_HARNESS = Set(names(Main; all=true, imported=true))
+    include($(joinpath(@__DIR__, "harness.jl")))
+    include($(joinpath(@__DIR__, "juliac", "programs.jl")))
+    push!(LOAD_PATH, $(joinpath(@__DIR__, "PrecompiledPrograms")))
+    using PrecompiledPrograms
+    pop!(LOAD_PATH)
+    include($(joinpath(@__DIR__, "printing_fixtures.jl")))
+    const HARNESS_NAMES = Symbol[n for n in names(Main; all=true, imported=true)
+                                 if !(n in _BEFORE_HARNESS) && !startswith(string(n), '#')]
+end
+const init_code = quote
+    # (the harness's `using`s: their exported names are not bindings of `Main`)
+    using WasmCodegen, WasmBuilder, Base64, SHA
+    for n in Main.HARNESS_NAMES
+        isdefined(@__MODULE__, n) && continue
+        Core.eval(@__MODULE__, Expr(:using, Expr(:(:), Expr(:., :Main), Expr(:., n))))
+    end
 end
 
-# sessions with project patches, outside the session above
-include("patch_sessions.jl")
-include("tasks.jl")         # (the task patches make a session of their own)
+testsuite = Dict{String,Expr}()
+for t in SESSION_TESTS
+    file = joinpath(@__DIR__, t * ".jl")
+    testsuite[t] = :(WasmCodegen.with_trim_patches() do _, _
+                         include($file)
+                     end)
+end
+for t in OWN_SESSION_TESTS
+    testsuite[t] = :(include($(joinpath(@__DIR__, t * ".jl"))))
+end
+
+args = parse_args(ARGS)
+filter_tests!(testsuite, args)
+runtests(WasmCodegen, args; testsuite, init_worker_code, init_code)
