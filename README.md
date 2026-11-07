@@ -104,8 +104,11 @@ the raw module, for debugging the code generator only.
 
 Each example builds a page: `examples/lorenz` solves the Lorenz system with adjustable
 parameters, `examples/mtk` simulates a ModelingToolkit model with sliders,
-`examples/juliasyntax` parses Julia source in the browser, and `examples/images` filters
-images with ImageFiltering's `imfilter` and a kernel of your choosing.
+`examples/brusselator` solves a stiff reaction-diffusion system with a choice of LinearSolve's
+solvers, `examples/juliasyntax` parses Julia source in the browser, and `examples/images`
+filters images with ImageFiltering's `imfilter` and a kernel of your choosing. The pages, built
+from `main` by the Pages workflow (`examples/site`), are at
+https://gbaraldi.github.io/WasmCodegen.jl/.
 
 ## Host runtimes
 

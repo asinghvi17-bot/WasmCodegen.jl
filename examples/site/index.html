@@ -1,0 +1,138 @@
+<title>WasmCodegen.jl examples</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600&display=swap">
+<style>
+  /* The examples' index: one entry per page, with the package call at its heart. Same family
+     as the pages. */
+  :root {
+    --bg: #eef0f3;
+    --surface: #ffffff;
+    --ink: #18202b;
+    --muted: #5a6473;
+    --line: #d5dae1;
+    --accent: #1f5ca6;
+    --code-bg: #f7f8fa;
+    --t-keyword: #8a3ab9;
+    --t-literal: #0f7a5c;
+    --font-display: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-code: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+      --accent: #74a9f5; --code-bg: #11161e; --t-keyword: #d19bf0; --t-literal: #5fd0a8;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+    --accent: #74a9f5; --code-bg: #11161e; --t-keyword: #d19bf0; --t-literal: #5fd0a8;
+    color-scheme: dark;
+  }
+
+  body { background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 15px; line-height: 1.5; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+  .page {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding-block: 36px 48px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: grid;
+    gap: 28px;
+  }
+  header { display: grid; gap: 8px; }
+  .eyebrow { font-family: var(--font-code); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-family: var(--font-display); font-weight: 600; font-size: clamp(28px, 4vw, 40px); line-height: 1.1; margin: 0; text-wrap: balance; }
+  .lede { margin: 0; max-width: 68ch; color: var(--muted); }
+  .lede code, .note code { font-family: var(--font-code); font-size: 13.5px; color: var(--ink); }
+
+  .examples { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 16px; }
+  .example { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 16px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+  .example .eyebrow { font-size: 11px; }
+  .example h2 { font-family: var(--font-display); font-weight: 600; font-size: 21px; line-height: 1.2; margin: 0; text-wrap: balance; }
+  .example h2 a { color: var(--ink); text-decoration: none; }
+  .example h2 a:hover { color: var(--accent); }
+  .example p { margin: 0; color: var(--muted); }
+  .call {
+    margin: 0; font: 12.5px/1.6 var(--font-code); background: var(--code-bg);
+    border: 1px solid var(--line); border-radius: 5px; padding: 8px 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .call .k { color: var(--t-keyword); }
+  .call .l { color: var(--t-literal); }
+  .links { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 14px; font-weight: 500; }
+
+  .note { border-top: 1px solid var(--line); padding-top: 20px; display: grid; gap: 6px; }
+  .note p { margin: 0; max-width: 76ch; color: var(--muted); font-size: 14px; }
+</style>
+
+<div class="page">
+  <header>
+    <div class="eyebrow">Julia → WebAssembly GC · no Julia runtime</div>
+    <h1>Julia packages, running in your browser</h1>
+    <p class="lede">Each page is a Julia program compiled ahead of time by
+      <a href="https://github.com/gbaraldi/WasmCodegen.jl">WasmCodegen.jl</a> to WebAssembly GC:
+      the packages' own code, unchanged, in a module embedded in the page. Nothing runs on a
+      server.</p>
+  </header>
+
+  <main class="examples">
+    <article class="example">
+      <div class="eyebrow">ImageFiltering · ImageCore</div>
+      <h2><a href="images.html">JuliaImages filtering</a></h2>
+      <p>Type the weights of a convolution kernel, or pick one, and filter a picture of your
+        own with the package's padding, separability test and color arithmetic.</p>
+      <pre class="call">imfilter(img, kernel, <span class="l">"reflect"</span>)</pre>
+      <div class="links"><a href="images.html">Open the page</a><a href="https://github.com/gbaraldi/WasmCodegen.jl/tree/main/examples/images">Source</a></div>
+    </article>
+
+    <article class="example">
+      <div class="eyebrow">Base.JuliaSyntax</div>
+      <h2><a href="juliasyntax.html">Julia's parser</a></h2>
+      <p>Edit Julia source and see it lexed and parsed into JuliaSyntax's green tree as you
+        type, syntax errors and their recovery included.</p>
+      <pre class="call">JuliaSyntax.parse!(stream)</pre>
+      <div class="links"><a href="juliasyntax.html">Open the page</a><a href="https://github.com/gbaraldi/WasmCodegen.jl/tree/main/examples/juliasyntax">Source</a></div>
+    </article>
+
+    <article class="example">
+      <div class="eyebrow">OrdinaryDiffEq · StaticArrays</div>
+      <h2><a href="lorenz.html">The Lorenz attractor</a></h2>
+      <p>Move σ, ρ, β and x₀ and the system is solved again over <em>t</em> ∈ [0, 40], by an
+        integrator built in Julia ahead of time and serialized into the module.</p>
+      <pre class="call">init(prob, Tsit5(); saveat = <span class="l">0.01</span>)</pre>
+      <div class="links"><a href="lorenz.html">Open the page</a><a href="https://github.com/gbaraldi/WasmCodegen.jl/tree/main/examples/lorenz">Source</a></div>
+    </article>
+
+    <article class="example">
+      <div class="eyebrow">ModelingToolkit · OrdinaryDiffEq</div>
+      <h2><a href="mtk.html">A ModelingToolkit model</a></h2>
+      <p>A driven, damped oscillator, simplified by ModelingToolkit when the module was built;
+        its energy is read back through the model's own observed function.</p>
+      <pre class="call">mtkcompile(oscillator)</pre>
+      <div class="links"><a href="mtk.html">Open the page</a><a href="https://github.com/gbaraldi/WasmCodegen.jl/tree/main/examples/mtk">Source</a></div>
+    </article>
+
+    <article class="example">
+      <div class="eyebrow">OrdinaryDiffEq · LinearSolve</div>
+      <h2><a href="brusselator.html">The Brusselator</a></h2>
+      <p>A stiff reaction–diffusion system on 32 points. Pick which of LinearSolve's pure-Julia
+        solvers factorizes W = I/(γ·dt) − J at each step.</p>
+      <pre class="call">Rodas5P(linsolve = KrylovJL_GMRES())</pre>
+      <div class="links"><a href="brusselator.html">Open the page</a><a href="https://github.com/gbaraldi/WasmCodegen.jl/tree/main/examples/brusselator">Source</a></div>
+    </article>
+  </main>
+
+  <footer class="note">
+    <p>Built by GitHub Actions from
+      <a href="https://github.com/gbaraldi/WasmCodegen.jl/commit/__COMMIT__"><code>__SHORT__</code></a>:
+      each example is compiled as its README says and run in Node.js, and the pages are
+      published only when every example passes.</p>
+    <p>The pages need WebAssembly GC and exception handling with <code>exnref</code>. They have
+      been tried only in Chromium.</p>
+  </footer>
+</div>
