@@ -6,8 +6,7 @@
 @noinline throw_undefref_error() = throw(UndefRefError())
 @noinline throw_undefvar_error(s::Symbol) = throw(UndefVarError(s))
 @noinline throw_undefvar_error(s::Symbol, m::Module) = throw(UndefVarError(s, m))
-@noinline throw_type_error(@nospecialize(expected), @nospecialize(got)) =
-    throw(TypeError(:typeassert, "", expected::Type, got))
+@noinline throw_type_error(@nospecialize(expected), @nospecialize(got)) = throw_type_error(:typeassert, expected, got)
 @noinline throw_type_error(f::Symbol, @nospecialize(expected), @nospecialize(got)) =
     throw(TypeError(f, "", expected::Type, got))
 @noinline throw_method_error(@nospecialize(f), @nospecialize(args)) = throw(MethodError(f, args))

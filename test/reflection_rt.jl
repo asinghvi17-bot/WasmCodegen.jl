@@ -75,6 +75,9 @@ setkey_any(i::Int, k::Int) = (p = Point3(1.0, 2.0, 3, 4); v = Any[5.0, 6, "s"][k
     try setfield!(p, KEYS[i], v); (fields(p), 0) catch e; (fields(p), code(e)) end)
 setindex_field(i::Int, v::Int) = (p = Point3(1.0, 2.0, 3, 4);
     try setfield!(p, i, v); (fields(p), 0) catch e; (fields(p), code(e)) end)
+# (with an ordering: not atomic, as the fields)
+setkey_order(i::Int, v::Float64) = (p = Point3(1.0, 2.0, 3, 4);
+    try setfield!(p, KEYS[i], v, :not_atomic); (fields(p), 0) catch e; (fields(p), code(e)) end)
 # (of a Ref, as Makie's ComputePipeline: `setproperty!(::RefValue, name, v)`)
 setref(k::Int, v::Float64) = (r = Ref(0.0);
     try setproperty!(r, NAMES[k], v); (r[], 0) catch e; (r[], code(e)) end)
@@ -102,6 +105,7 @@ setref(k::Int, v::Float64) = (r = Ref(0.0);
         for i in 1:length(KEYS)
             @wtest setkey(i, 7.5)
             @wtest setkey(i, 7.0)
+            @wtest setkey_order(i, 7.5)
             for k in 1:3
                 @wtest setkey_any(i, k)
             end

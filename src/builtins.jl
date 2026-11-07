@@ -593,20 +593,20 @@ function set_field_dynamic!(fc::FnCtx, x::CGVal, i::CGVal, v::CGVal)
     idx = checked_field_index!(fc, x, i)
     for_field_at!(fc, idx, fieldcount(T)) do k
         if isconst(T, k)
-            throw_error!(fc, Runtime.throw_const_field_error, const_value(fc, nameof(T)),
-                         const_value(fc, fieldname(T, k)))
+            throw_error!(fc, Runtime.throw_const_field_error, () -> const_value(fc, nameof(T)),
+                         () -> const_value(fc, fieldname(T, k)))
             return
         end
         FT = fieldtype(T, k)
+        type_error() = throw_error!(fc, Runtime.throw_type_error, () -> const_value(fc, :setfield!),
+                                    () -> convert_repr(fc, const_value(fc, FT), Any), () -> convert_repr(fc, v, Any))
         t = emit_isa!(fc, v, FT)
-        if !(isconstant(t) && constant_value(t))
+        if isconstant(t)
+            constant_value(t) || (type_error(); return)
+        else
             push_val!(fc, t)
             emit!(fc.b, :i32_eqz)
-            if!(fc.b)
-            throw_error!(fc, Runtime.throw_type_error, const_value(fc, :setfield!),
-                         () -> convert_repr(fc, const_value(fc, FT), Any), () -> convert_repr(fc, v, Any))
-            end!(fc.b)
-            isconstant(t) && return
+            if!(fc.b); type_error(); end!(fc.b)
         end
         set_field!(fc, x, k, v.typ <: FT ? v : convert_repr(fc, v, typeintersect(v.typ, FT)))
     end
