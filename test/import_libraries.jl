@@ -40,6 +40,110 @@ function run_import_libraries(c, fn, libs, args...)
     return String(resp["r"]), String[x for x in resp["log"]]
 end
 
+# run calls `(fn, args)` of a module with js/julia.mjs, the declared libraries given as
+# JavaScript (`libs`: the source of a function of the host returning the import modules, or of
+# the modules): (the results as strings, the host's log)
+function run_js_bytes(c, libs, calls)
+    dir = mktempdir()
+    write(joinpath(dir, "m.wasm"), c.bytes)
+    js_arg(a) = a isa Union{Int64,UInt64} ? "$(a)n" : a isa String ? repr(a) : string(a)
+    write(joinpath(dir, "run.mjs"), """
+    import fs from 'node:fs';
+    import { instantiate } from $(repr(WasmCodegen.JS_HOST));
+    const log = [];
+    const b64 = (u8) => Buffer.from(u8).toString('base64');
+    const { instance } = await instantiate(fs.readFileSync($(repr(joinpath(dir, "m.wasm")))),
+                                           { imports: $libs });
+    const r = [];
+    $(join(("r.push(String(instance.exports.$fn($(join(map(js_arg, args), ", ")))));" for (fn, args) in calls), "\n"))
+    process.stdout.write(JSON.stringify({ r, log }));
+    """)
+    resp = JSON.parse(read(`$(node_cmd()) $(joinpath(dir, "run.mjs"))`, String))
+    return String[x for x in resp["r"]], String[x for x in resp["log"]]
+end
+
+# bytes for the host: `Vector{UInt8}`, `String` and `Memory{UInt8}` arguments of a declared
+# import, passed as the offset and length of a copy in the linear memory
+jsb_pattern(n::Int) = UInt8[(i * 7 + 3) % 256 for i in 1:n]
+jsb_vector(n::Int) = (ccall((:send, "jsb_test"), Cvoid, (Vector{UInt8},), jsb_pattern(n)); n)
+jsb_string(n::Int) = ccall((:text, "jsb_test"), Int32, (String,), repeat("αβc", n))
+# (a vector whose first byte is not its memory's: deleted at the front)
+jsb_offset(n::Int) = (v = jsb_pattern(n + 3); deleteat!(v, 1:3); ccall((:send, "jsb_test"), Cvoid, (Vector{UInt8},), v); n)
+function jsb_mixed(n::Int)
+    m = Memory{UInt8}(undef, 3)
+    m[1] = 0x01; m[2] = 0x02; m[3] = 0xff
+    return ccall((:mixed, "jsb_test"), Int64, (Int32, Vector{UInt8}, String, Int64, Memory{UInt8}),
+                 Int32(-7), jsb_pattern(n), "x", Int64(n), m)
+end
+jsb_ints(v::Vector{Int}) = ccall((:send, "jsb_test"), Cvoid, (Vector{Int},), v)
+jsb_ptr(v::Vector{UInt8}) = GC.@preserve v ccall((:send, "jsb_test"), Cvoid, (Ptr{UInt8},), pointer(v))
+
+const JSB_LIB = """(host) => ({ jsb_test: {
+  send: (p, n) => { log.push(`send \${p} \${n} ` + b64(host.bytes(p, n))); },
+  text: (p, n) => { const s = host.string(p, n); log.push(`text \${p} \${n} ` + s); return s.length; },
+  mixed: (a, p1, n1, p2, n2, k, p3, n3) => {
+    log.push(`mixed \${a} \${k} \${p1} \${n1} \${p2} \${n2} \${p3} \${n3} ` +
+             [host.bytes(p1, n1), host.bytes(p2, n2), host.bytes(p3, n3)].map(b64).join(' '));
+    return BigInt(n1 + n2 + n3) + k;
+  },
+} })"""
+
+# the calls logged by JSB_LIB: (name, the integers, the byte arguments)
+function jsb_log(line)
+    w = split(line, ' ')
+    name = w[1]
+    nbytes = name == "send" ? 1 : name == "mixed" ? 3 : 0
+    name == "text" && return (name, parse.(Int, w[2:3]), join(w[4:end], ' '))
+    nints = length(w) - 1 - nbytes
+    return (name, parse.(Int, w[2:1+nints]), [base64decode(x) for x in w[2+nints:end]])
+end
+
+@testset "bytes for the host" begin
+    entries = [(jsb_vector, (Int,)), (jsb_string, (Int,)), (jsb_offset, (Int,)), (jsb_mixed, (Int,))]
+    c = WasmCodegen.compile(entries; config = WasmCodegen.Config(import_libraries = ["jsb_test"]))
+    @test import_list(c) == [("jsb_test", "mixed", ValType[I32, I32, I32, I32, I32, I64, I32, I32], ValType[I64]),
+                             ("jsb_test", "send", ValType[I32, I32], ValType[]),
+                             ("jsb_test", "text", ValType[I32, I32], ValType[I32])]
+    @test c.cgm.mod.memory !== nothing
+    sizes = [0, 1, 7, 1024, 65536, 65537, 200_000]
+    calls = vcat([("jsb_vector", Any[n]) for n in sizes], [("jsb_string", Any[n]) for n in (0, 1, 3, 30_000)],
+                 [("jsb_offset", Any[n]) for n in (0, 5, 70_000)], [("jsb_mixed", Any[n]) for n in (0, 9)])
+    r, log = run_js_bytes(c, JSB_LIB, calls)
+    @test r == vcat(string.(sizes), [string(length(repeat("αβc", n))) for n in (0, 1, 3, 30_000)],
+                    ["0", "5", "70000"], ["4", "22"])
+    @test length(log) == length(calls)
+    for ((fn, (n,)), line) in zip(calls, log)
+        name, ints, b = jsb_log(line)
+        if fn == "jsb_vector" || fn == "jsb_offset"
+            # exactly the bytes, from the start of the memory
+            @test name == "send" && ints == [0, n] && b == [jsb_pattern(n + (fn == "jsb_offset" ? 3 : 0))[end-n+1:end]]
+        elseif fn == "jsb_string"
+            s = repeat("αβc", n)
+            @test name == "text" && ints == [0, sizeof(s)] && b == s
+        else
+            # each argument's bytes after the previous one's, from a multiple of 8
+            o2 = (n + 7) & ~7
+            @test name == "mixed" && ints == [-7, n, 0, n, o2, 1, o2 + 8, 3] &&
+                  b == [jsb_pattern(n), Vector{UInt8}("x"), UInt8[0x01, 0x02, 0xff]]
+        end
+    end
+
+    # for WASI: after the runtime's part of the memory
+    c = WasmCodegen.compile([(jsb_vector, (Int,)), (jsb_string, (Int,))];
+                            config = WasmCodegen.Config(host = :wasi, import_libraries = ["jsb_test"]))
+    r, log = run_js_bytes(c, JSB_LIB, [("jsb_vector", Any[300]), ("jsb_string", Any[2])])
+    base = Int(WasmCodegen.Runtime.Staging.SIZE)
+    @test r == ["300", "6"]
+    @test jsb_log(log[1]) == ("send", [base, 300], [jsb_pattern(300)])
+    @test jsb_log(log[2]) == ("text", [base, 10], "αβcαβc")
+
+    # other arrays, and pointers, are not bytes for the host
+    for (f, at) in ((jsb_ints, (Vector{Int},)), (jsb_ptr, (Vector{UInt8},)))
+        @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(f, at;
+                                                                           config = WasmCodegen.Config(import_libraries = ["jsb_test"]))
+    end
+end
+
 @testset "import libraries" begin
     wasi(; kw...) = WasmCodegen.Config(; host = :wasi, kw...)
     # a ccall of a declared library: the import lib.name, of the ccall's Wasm types
@@ -80,9 +184,12 @@ end
     for name in ("wasi_snapshot_preview1", "julia", "julia_io", "julia_anything", "")
         @test_throws ArgumentError WasmCodegen.compile(implib_add, (Int32, Int64); config = wasi(import_libraries = [name]))
     end
-    # nor libraries for another host than WASI
-    @test_throws ArgumentError WasmCodegen.compile(implib_add, (Int32, Int64);
-                                                   config = WasmCodegen.Config(host = :js, import_libraries = ["implib_test"]))
+    # (for JavaScript too: integers are numbers and BigInts, and the module has no memory)
+    js = WasmCodegen.compile(implib_add, (Int32, Int64); config = WasmCodegen.Config(import_libraries = ["implib_test"]))
+    @test import_list(js) == [("implib_test", "add", ValType[I32, I64], ValType[I64])]
+    @test js.cgm.mod.memory === nothing
+    lib = "{ implib_test: { add: (x, y) => { log.push(`add \${x} \${y}`); return BigInt(x) + y; } } }"
+    @test run_js_bytes(js, lib, [("implib_add", Any[Int32(40), Int64(2)])]) == (["42"], ["add 40 2"])
     # (an empty list changes nothing for either host)
     for host in (:js, :wasi)
         c = WasmCodegen.compile(implib_note, (UInt32,); config = WasmCodegen.Config(; host, trim = :unsafe, on_unsupported = :trap))

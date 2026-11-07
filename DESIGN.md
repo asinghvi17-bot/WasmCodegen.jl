@@ -565,6 +565,16 @@ as other pointers of the build process are.
     times before 1970, which cannot be set (EINVAL); and `cd(f, dir)`, which returns to the
     previous directory by its path, not an fd.
 
+  The program's own imports (`Config(import_libraries)`, either host) are calls of Wasm
+  imports of the libraries it declares, with integer arguments and results, and bytes
+  (`Vector{UInt8}`, `String`, `Memory{UInt8}`) as arguments. A Wasm GC array is opaque to
+  JavaScript, and Wasm has no bulk copy between arrays and the linear memory, so a call copies
+  the bytes to the linear memory (a loop, `jl_import_bytes`, growing the memory as needed) and
+  passes their offset and length: from the memory's start for `:js` (whose modules have a
+  memory only for this, exported as `memory`), after `Runtime.Staging` for `:wasi`. The bytes
+  are the import's until it returns: the next call with bytes, which may be one the import
+  makes back into the module, writes over them, and growing the memory replaces its buffer.
+
   The test runner (`test/runner.mjs`) runs `:js` modules with `js/julia.mjs` and `:wasi`
   ones with Node's `node:wasi`; `WASMCODEGEN_TEST_HOST=wasi` runs the suite for WASI.
 

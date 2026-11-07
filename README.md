@@ -71,6 +71,27 @@ wasi.initialize(instance);
 instance.exports.f(100n);
 ```
 
+A program can call functions of a host of its own: `Config(import_libraries = ["lib"])` makes a
+`ccall((:name, "lib"), ...)` a call of the Wasm import `lib.name`. The arguments and the result
+are 32- and 64-bit integers, and an argument may also be bytes (`Vector{UInt8}`, `String`,
+`Memory{UInt8}`), which the import gets as their offset and length in the module's `memory`:
+
+```julia
+send(msg::Vector{UInt8}) = ccall((:message, "page"), Cvoid, (Vector{UInt8},), msg)
+c = WasmCodegen.compile(f, (Int,); config = WasmCodegen.Config(import_libraries = ["page"]))
+```
+
+```js
+const { instance } = await instantiate(bytes, {
+  imports: (host) => ({ page: { message: (offset, length) => deliver(host.bytes(offset, length).slice()) } }),
+});
+```
+
+`host.bytes` is a `Uint8Array` view of the memory, and `host.string` decodes it from UTF-8. The
+bytes are a copy the module makes for the call, and they are the import's only until it returns:
+copy them to keep them. `examples/jsbytes` gives a message to a page this way, and compares
+it with reading it by calls of an export.
+
 WASI file paths use absolute preopen names and a virtual working directory (`PWD`, or the
 first preopen). Preopens must occupy contiguous descriptors starting at 3; the first EBADF
 ends discovery. Resolution uses the longest component-prefix match. `.` and `..` after a
