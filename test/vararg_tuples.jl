@@ -49,6 +49,21 @@ function vn_maxmethods1(i::Int)
     return (MaxMethods1.same(v, VS[i]), p === (), length(p), v.build === (), MaxMethods1.npre(v))
 end
 
+# converting a tuple of unknown length to a tuple type of a fixed length (as ComputePipeline's
+# flags of changes, of more than 10 fields): its length checked, without `typeintersect`; a
+# length not the type's a MethodError, as natively
+const BS = Bool[isodd(k) || k % 3 == 0 for k in 1:16]
+const IS = [1, 2, 3, 4]
+const V = Bool[true, false, true]
+bits(t::Tuple) = (s = 0; for b in t; s = 2s + b; end; s)
+cvt_mwe() = (t = convert(NTuple{3,Bool}, (V...,)); t[1] + 2 * t[2] + 4 * t[3])
+cvt_bool3(n::Int) = try bits(convert(NTuple{3,Bool}, (BS[1:n]...,))) catch e; e isa MethodError ? -1 : -2 end
+cvt_bool13(n::Int) = try bits(convert(NTuple{13,Bool}, (BS[1:n]...,))) catch e; e isa MethodError ? -1 : -2 end
+cvt_float(n::Int) = try (t = convert(NTuple{3,Float64}, (IS[1:n]...,)); t[1] + t[2] / 4 + t[3] / 16)
+                    catch e; e isa MethodError ? -1.0 : -2.0 end
+cvt_mixed(n::Int) = try (t = convert(Tuple{Float64,Int,Float64}, (IS[1:n]...,)); t[1] + t[2] / 4 + t[3] / 16)
+                    catch e; e isa MethodError ? -1.0 : -2.0 end
+
 @testset "tuples of unknown length" begin
     for f in (vn_parts, vn_iter, vn_maxmethods1)
         @testset "$(nameof(f))" begin
@@ -62,6 +77,21 @@ end
     # (natively the call is dynamic too, but works)
     @test MaxMethods1.own_limit(VS[3]) == 2
     @test_throws WasmCodegen.UnsupportedConstructs wcompile(MaxMethods1.own_limit, (VersionNumber,))
+    @testset "convert to a tuple type of a fixed length" begin
+        for (f, args) in ((cvt_mwe, ()), (cvt_bool3, (Int,)), (cvt_bool13, (Int,)), (cvt_float, (Int,)),
+                          (cvt_mixed, (Int,)))
+            @test (WasmCodegen.compile(f, args; config=WasmCodegen.Config(verify=:error)); true)
+        end
+        @wtest cvt_mwe()
+        for n in 2:4
+            @wtest cvt_bool3(n)
+            @wtest cvt_float(n)
+            @wtest cvt_mixed(n)
+        end
+        for n in 12:14
+            @wtest cvt_bool13(n)
+        end
+    end
     @testset "egal and comparison" begin
         for (i, j) in ((1, 1), (2, 3), (3, 3), (4, 1), (5, 5), (8, 7), (9, 10))
             @wtest vn_egal(i, j)

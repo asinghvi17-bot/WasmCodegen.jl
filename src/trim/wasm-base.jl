@@ -67,6 +67,28 @@ let Runtime = WasmCodegen.Runtime
             end
             print(io, sym)
         end
+        # converting a tuple to a tuple type of a fixed length (as from a tuple of a length not
+        # known at compile time, `Tuple{Vararg{E}}`): Base's, with the length checked against
+        # the type's and a static `Val` instead of `typeintersect` and `Val(N)`; another length
+        # the same MethodError, by `Core.throw_methoderror` (`_tuple_error` makes the tuple
+        # `(T, x)`, of an abstract type)
+        function convert(::Type{T}, x::NTuple{N,Any}) where {N, T<:Tuple}
+            function cvt1(n)
+                @inline
+                Tn = fieldtype(T, n)
+                xn = getfield(x, n, #=boundscheck=#false)
+                xn isa Tn && return xn
+                return convert(Tn, xn)
+            end
+            if T isa DataType && !isvatuple(T)
+                length(x) == fieldcount(T) || Core.throw_methoderror(convert, T, x)
+                return ntuple(cvt1, Val(fieldcount(T)))
+            end
+            if typeintersect(NTuple{N,Any}, T) === Union{}
+                _tuple_error(T, x)
+            end
+            return ntuple(cvt1, Val(N))::NTuple{N,Any}
+        end
         # (`typesplit` reflects on and makes types: a table of the module's types instead)
         nonnothing_nonmissing_typeinfo(io::IO) =
             $(Runtime.map_type)($(Runtime.nonnothing_nonmissing), get(io, :typeinfo, Any))
