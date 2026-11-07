@@ -53,6 +53,10 @@ cleanup_dynamic(r::Base.RefValue{Int}) = (r[] = 0; nothing)
 Base.Experimental.@overlay FinalizerTable cleanup_dynamic(r::Base.RefValue{Int}) =
     (r[] = (Base.inferencebarrier(1) + 1)::Int - 2; nothing)
 registered_dynamic(n::Int) = (r = Ref(n); Core.finalizer(cleanup_dynamic, r); r)
+# a call that stays an `:invoke` statement (Julia's verifier before 1.13.2 has no deferred calls
+# of `Threads.@threads` loops to look up for it)
+@noinline invoked_helper(x::Float64) = x + 1
+via_invoke(x::Float64) = 2 * invoked_helper(x)
 # an unresolved call in a recursion through the entry: its report ends (Julia 1.12's verifier
 # follows the recursion's parents without end)
 recursive_dynamic(n::Int)::Int = n <= 0 ? Base.inferencebarrier(n) + 1 : recursive_dynamic(n - 1)
@@ -85,6 +89,8 @@ end
     finally
         delete!(R.EXTENSION_METHODS, :test_finalizers)
     end
+    c = WasmCodegen.compile(T.via_invoke, (Float64,); config=WasmCodegen.Config(verify=:error))
+    @test wasm_run(c, "via_invoke", 1.5; rettype=Float64) === T.via_invoke(1.5) === 5.0
     report = WasmCodegen.trim_check([WasmCodegen.entry_instance(T.recursive_dynamic, (Int,))]; onlywarn=true)
     @test occursin("unresolved call", report) && occursin("recursive_dynamic", report)
 end

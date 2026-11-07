@@ -339,7 +339,7 @@ end
 
 # the callee of a statement of `src` (of `mi`) that the verifier looks up by the call's types
 # (`get_verify_typeinf_trim`'s `caches`): the finalizer a `Core.finalizer` call registers, a
-# `@cfunction`'s function, a `Threads.@threads` loop's body (Julia 1.13); found as the verifier
+# `@cfunction`'s function, a `Threads.@threads` loop's body (Julia 1.13.2); found as the verifier
 # finds it, by the module's interpreter `interp` (its world and overlay method tables, as the
 # collection's). Else nothing.
 function deferred_callee(@nospecialize(stmt), src::Core.CodeInfo, sptypes, mi::Core.MethodInstance,
@@ -354,7 +354,7 @@ function deferred_callee(@nospecialize(stmt), src::Core.CodeInfo, sptypes, mi::C
            CC.widenconst(CC.argextype(stmt.args[1], src, sptypes)) === typeof(Core.finalizer)
         atype = CC.argtypes_to_type(Any[CC.argextype(stmt.args[2], src, sptypes),
                                         CC.argextype(stmt.args[3], src, sptypes)])
-    elseif VERSION >= v"1.13-" && Meta.isexpr(stmt, :invoke)
+    elseif VERSION >= v"1.13.2" && Meta.isexpr(stmt, :invoke)
         atype = CC.TrimVerifier.threads_deferred_call_type(stmt, src, sptypes)
         atype === nothing && return nothing
     else
@@ -418,8 +418,8 @@ function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.Method
         severity = warn ? 2 : 1
         no = (counts[severity] += 1)
         printstyled(io, "Error #", no, ": "; color=Base.error_color(), bold=true)
-        # (Julia 1.12's has no `warn`)
-        VERSION >= v"1.13-" ? TV.verify_print_error(io, desc, parents, warn) :
+        # (Julia 1.12's and 1.13.0's and 1.13.1's have no `warn`)
+        VERSION >= v"1.13.2" ? TV.verify_print_error(io, desc, parents, warn) :
                               verify_print_error_1_12(io, desc, parents)
     end
     if counts[1] > 0 || counts[2] > 0
@@ -441,10 +441,11 @@ function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.Method
     return nothing
 end
 
-# Julia 1.12's verifier prints the stack of an error's statement by following the parents of
-# its code instance without end where they make a cycle (a recursion through an entry, as
-# `f(n) = n <= 0 ? g(n) : f(n - 1)`): it never returns, and its frames take all the memory.
-# The frames as Julia 1.13's (`verify_create_stackframes`), which stops at a parent it visited.
+# Julia 1.12's verifier (and 1.13.0's and 1.13.1's) prints the stack of an error's statement by
+# following the parents of its code instance without end where they make a cycle (a recursion
+# through an entry, as `f(n) = n <= 0 ? g(n) : f(n - 1)`): it never returns, and its frames
+# take all the memory.
+# The frames as Julia 1.13.2's (`verify_create_stackframes`), which stops at a parent it visited.
 function verify_print_error_1_12(io::IOContext{IO}, desc, parents)
     TV = CC.TrimVerifier
     desc isa TV.CallMissing || return TV.verify_print_error(io, desc, parents)
