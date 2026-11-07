@@ -160,6 +160,19 @@ module DeferredFailure
     var4(x::Float64) = x + VAR2.k
 end
 
+# the cycle back to a mutable object through an immutable one that is an object of its own (here
+# a Base.ImmutableDict), reached from the mutable object
+module ImmutableCycle
+    mutable struct Holder
+        dict::Any
+    end
+    const H = let h = Holder(nothing)
+        h.dict = Base.ImmutableDict{Symbol,Any}(:self, h)
+        h
+    end
+    read(x::Float64) = x + ((H.dict::Base.ImmutableDict{Symbol,Any}).value === H ? 1.0 : 2.0)
+end
+
 const SHELL_FIRST = WasmCodegen.Config(shell_first_mutables = true)
 
 @testset "cycles through closures and immutable objects" begin
@@ -172,6 +185,14 @@ const SHELL_FIRST = WasmCodegen.Config(shell_first_mutables = true)
     @test err isa WasmCodegen.UnsupportedConstructs
     @test occursin("serializing a cycle of objects through", sprint(showerror, err))
     @test occursin("Config(shell_first_mutables = true) serializes cycles through mutable objects", sprint(showerror, err))
+    # the cycle through an immutable object: its error names the option too, and the option works
+    err = try WasmCodegen.compile(ImmutableCycle.read, (Float64,); config = WasmCodegen.Config(verify = :off)); nothing catch e; e end
+    @test err isa WasmCodegen.UnsupportedConstructs
+    msg = sprint(showerror, err)
+    @test occursin("a cycle of objects through the immutable", msg)
+    @test occursin("shell_first_mutables", msg)
+    c = WasmCodegen.compile(ImmutableCycle.read, (Float64,); config = SHELL_FIRST)
+    @test wasm_run(c, "read", 1.5; rettype = Float64) === Base.invokelatest(ImmutableCycle.read, 1.5) === 2.5
     # compiled first: the serialized state is the initial one, so an alias is needed to see the new value
     cases = [(ClosureCycle.run, 1.5), (StructCycle.run, 2.5), (InlineCycle.read, 1.5), (InlineCycle.write, 7.0),
              (DeferredHash.same, 2.0)]
