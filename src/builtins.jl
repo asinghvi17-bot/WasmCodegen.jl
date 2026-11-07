@@ -136,11 +136,13 @@ no_field!(fc::FnCtx, @nospecialize(T), name::Symbol) =
 
 """
 Whether a field of a value of type `T` is found by the value's type at run time: `T` is not
-concrete and has no layout of fields of its own (abstract, a `Union`, a `UnionAll`; tuples and
-memories have theirs), where natively the `getfield` builtin finds it (see `get_field_any!`).
+concrete and has no layout of fields of its own (abstract, a `Union`, a `UnionAll`, a tuple of
+an element type not concrete, as `Tuple{Type, String}`; inline tuples, tuples of unknown length
+and memories have theirs), where natively the `getfield` builtin finds it (see `get_field_any!`).
 """
 getfield_by_type(@nospecialize(T)) =
-    !isconcretetype(T) && T !== Union{} && !(T <: Tuple) && !is_memory_type(T) && !is_memoryref_type(T)
+    !isconcretetype(T) && T !== Union{} && !(T <: Tuple && (is_inline_tuple(T) || is_vararg_tuple(T))) &&
+    !is_memory_type(T) && !is_memoryref_type(T)
 
 """
     get_field_any!(fc, x, f, typ) -> CGVal
@@ -290,18 +292,19 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
             # (of a module: its global, as natively)
             return operand(fc, GlobalRef(constant_value(x), constant_value(idx)))
         end
+        if isconstant(idx) && constant_value(idx) isa Symbol && x.typ <: Tuple && x.typ !== Union{} &&
+           !isconcretetype(x.typ)
+            # (no field of a tuple has a name: natively a FieldError of the value's type, here by
+            # its type, as for a value whose type is not concrete)
+            return get_field_any!(fc, x, constant_value(idx), typ)
+        end
+        if getfield_by_type(x.typ)
+            # (an ordering argument: natively checked against the field's atomicity)
+            (length(args) == 2 || (length(args) == 3 && args[3] isa CGVal && args[3].typ === Bool)) ||
+                unsupported("getfield with an ordering of a value of type ", x.typ)
+            isconstant(idx) && return get_field_any!(fc, x, constant_value(idx), typ)
+        end
         if isconstant(idx)
-            if getfield_by_type(x.typ)
-                # (an ordering argument: natively checked against the field's atomicity)
-                (length(args) == 2 || (length(args) == 3 && args[3] isa CGVal && args[3].typ === Bool)) ||
-                    unsupported("getfield with an ordering of a value of type ", x.typ)
-                return get_field_any!(fc, x, constant_value(idx), typ)
-            end
-            if constant_value(idx) isa Symbol && x.typ <: Tuple && x.typ !== Union{} && !isconcretetype(x.typ)
-                # (no field of a tuple has a name: natively a FieldError of the value's type,
-                # here by its type, as for a value whose type is not concrete)
-                return get_field_any!(fc, x, constant_value(idx), typ)
-            end
             is_no_field(x.typ, constant_value(idx)) && return no_field!(fc, x.typ, constant_value(idx))
             return get_field(fc, x, field_index(x.typ, constant_value(idx)))
         end
@@ -539,13 +542,22 @@ end
 The field of `x` at the run-time index or name `i` (1-based; out of bounds traps, as a
 BoundsError or FieldError would): an element of the array of a large tuple; for an inline
 tuple of one element type, an element of a temporary array of its elements; otherwise a
-chain of tests of the index.
+chain of tests of the index (of a tuple of a known number of fields, found by its type at
+run time, `getfield_by_type`: each that field so).
 """
 function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
     T = x.typ
     l = layout(fc, T)
     l.kind === Boxed && l.elements !== nothing && i.typ !== Symbol &&
         return tuple_array_get!(fc, x, i)
+    # (an index of another type, natively a TypeError or by the value's type, is not)
+    nby = getfield_by_type(T) && T <: Tuple && i.typ === Int ? definite_fieldcount(T) : nothing
+    if nby !== nothing
+        idx = checked_field_index!(fc, x, i)
+        res = new_val!(fc, typ)
+        for_field_at!(k -> assign!(fc, res, get_field_any!(fc, x, k, typ)), fc, idx, nby)
+        return res
+    end
     (T isa DataType && (isconcretetype(T) || (l.kind === Inline && is_inline_tuple(T))) && l.elements === nothing) ||
         unsupported("a field of ", T, " at an index not known at compile time")
     n = fieldcount(T)
@@ -564,6 +576,14 @@ function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
     res = new_val!(fc, typ)
     for_field_at!(k -> assign!(fc, res, get_field(fc, x, k)), fc, idx, n)
     return res
+end
+
+# the number of fields of every value of the tuple type `T` (of parameters or not), if it is
+# known at compile time: not of a tuple of unknown length, nor of a union (its members may
+# differ, and `fieldcount` has the first's)
+function definite_fieldcount(@nospecialize(T))
+    U = Base.unwrap_unionall(T)
+    return U isa DataType && !Base.isvatuple(U) ? length(U.parameters) : nothing
 end
 
 # the index (an Int) of the field of `x` at the run-time index or name `i`, checked: out of
