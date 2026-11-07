@@ -1,0 +1,561 @@
+<title>ImageFiltering in WasmGC</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600&display=swap">
+<style>
+  /* Layout: a filter bench. The kernel on the left (its grid, a heat map of the weights, and
+     how imfilter is called), the images on the right; stacks on phones. Same family as the
+     Lorenz, oscillator and parser pages. */
+  :root {
+    --bg: #eef0f3;
+    --surface: #ffffff;
+    --ink: #18202b;
+    --muted: #5a6473;
+    --line: #d5dae1;
+    --accent: #1f5ca6;
+    --code-bg: #f7f8fa;
+    --pos: #c2571a;
+    --neg: #1f5ca6;
+    --t-keyword: #8a3ab9;
+    --t-literal: #0f7a5c;
+    --t-error: #c42b1c;
+    --checker: #e3e6eb;
+    --font-display: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-code: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+      --accent: #74a9f5; --code-bg: #11161e; --pos: #f0915a; --neg: #74a9f5;
+      --t-keyword: #d19bf0; --t-literal: #5fd0a8; --t-error: #ff7a6b; --checker: #1c222c;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+    --accent: #74a9f5; --code-bg: #11161e; --pos: #f0915a; --neg: #74a9f5;
+    --t-keyword: #d19bf0; --t-literal: #5fd0a8; --t-error: #ff7a6b; --checker: #1c222c;
+    color-scheme: dark;
+  }
+
+  body { background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 15px; line-height: 1.5; }
+  .page {
+    max-width: 1320px;
+    margin: 0 auto;
+    padding-block: 28px 48px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: grid;
+    gap: 24px;
+  }
+  header { display: grid; gap: 6px; }
+  .eyebrow { font-family: var(--font-code); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-family: var(--font-display); font-weight: 600; font-size: clamp(28px, 4vw, 40px); line-height: 1.1; margin: 0; text-wrap: balance; }
+  .lede { margin: 0; max-width: 76ch; color: var(--muted); }
+  .lede code { font-family: var(--font-code); font-size: 13.5px; color: var(--ink); }
+
+  .bench { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 16px; align-items: start; }
+  @media (max-width: 920px) { .bench { grid-template-columns: minmax(0, 1fr); } }
+  .pane { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 14px; display: grid; gap: 12px; min-width: 0; }
+  .pane h2 { font: 600 13px var(--font-body); margin: 0; letter-spacing: 0.02em; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; align-items: baseline; }
+  .pane h2 span { font-weight: 400; color: var(--muted); }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+  select, .btn, input[type="file"]::file-selector-button {
+    font: 500 13px var(--font-body);
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 5px 8px;
+  }
+  .btn { cursor: pointer; }
+  .btn:hover { border-color: var(--accent); }
+  select:focus-visible, .btn:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  label.inline { font-size: 13px; color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
+  input[type="range"] { width: 120px; accent-color: var(--accent); }
+  .val { font: 500 13px var(--font-code); color: var(--ink); min-width: 3.5ch; font-variant-numeric: tabular-nums; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .seg button { font: 500 13px var(--font-body); color: var(--muted); background: var(--surface); border: 0; padding: 5px 10px; cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button[aria-pressed="true"] { color: var(--surface); background: var(--accent); }
+
+  /* the kernel: a grid of weights, each cell tinted by its sign and size */
+  .grid-wrap { overflow-x: auto; padding: 2px; }
+  .kgrid { display: grid; gap: 3px; width: max-content; margin: 0 auto; }
+  .kgrid input {
+    width: 58px; box-sizing: border-box;
+    font: 500 12.5px var(--font-code); font-variant-numeric: tabular-nums; text-align: center;
+    color: var(--ink); background: var(--code-bg);
+    border: 1px solid var(--line); border-radius: 4px; padding: 7px 2px;
+  }
+  .kgrid input.center { border-color: var(--ink); }
+  .kgrid input.bad { border-color: var(--t-error); }
+  @media (max-width: 480px) { .kgrid input { width: 50px; font-size: 12px; } }
+  .kinfo { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .kinfo div { background: var(--surface); padding: 6px 10px; display: grid; gap: 1px; min-width: 0; }
+  .kinfo span { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .kinfo b { font: 500 14px var(--font-code); font-variant-numeric: tabular-nums; }
+
+  .call {
+    margin: 0; font: 12.5px/1.6 var(--font-code); background: var(--code-bg);
+    border: 1px solid var(--line); border-radius: 5px; padding: 9px 12px; white-space: pre; overflow-x: auto;
+  }
+  .call .k { color: var(--t-keyword); }
+  .call .l { color: var(--t-literal); }
+
+  .images { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+  @media (max-width: 640px) { .images { grid-template-columns: minmax(0, 1fr); } }
+  figure { margin: 0; display: grid; gap: 6px; min-width: 0; }
+  figcaption { font-size: 12px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+  figcaption b { font: 500 12px var(--font-code); letter-spacing: 0; text-transform: none; color: var(--ink); }
+  canvas {
+    width: 100%; height: auto; display: block; border-radius: 4px; border: 1px solid var(--line);
+    background: repeating-conic-gradient(var(--checker) 0 25%, transparent 0 50%) 0 0 / 16px 16px;
+  }
+  .drop { outline: 2px dashed var(--accent); outline-offset: 4px; }
+  .readouts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .readout { background: var(--surface); padding: 6px 10px; display: grid; gap: 1px; min-width: 0; }
+  .readout span { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .readout b { font: 500 15px var(--font-code); font-variant-numeric: tabular-nums; }
+  @media (max-width: 480px) { .readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .status { font-size: 13px; color: var(--muted); }
+  .status.error { color: var(--t-error); }
+  .hint { font-size: 13px; color: var(--muted); margin: 0; }
+
+  .notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; border-top: 1px solid var(--line); padding-top: 22px; }
+  .notes h2 { font-family: var(--font-display); font-weight: 600; font-size: 18px; margin: 0 0 6px; }
+  .notes p { margin: 0; color: var(--muted); max-width: 60ch; }
+  .notes code { font-family: var(--font-code); font-size: 13px; color: var(--ink); }
+</style>
+
+<div class="page">
+  <header>
+    <div class="eyebrow">Julia → WebAssembly GC · no Julia runtime</div>
+    <h1>JuliaImages filtering, running in your browser</h1>
+    <p class="lede">ImageFiltering's <code>imfilter</code> on ImageCore's <code>RGB{N0f8}</code> pixels,
+      compiled from Julia to WasmGC with WasmCodegen. Pick a kernel or type your own weights; every
+      change re-filters the image in WebAssembly, with the package's own padding, separability test
+      and color arithmetic.</p>
+  </header>
+
+  <section class="bench" aria-label="Filter">
+    <div class="pane">
+      <h2>Kernel <span>weights of the correlation, centered</span></h2>
+      <div class="controls">
+        <label class="inline" for="preset">Preset <select id="preset"></select></label>
+        <label class="inline" for="size">Size <select id="size">
+          <option value="3">3 × 3</option><option value="5">5 × 5</option><option value="7">7 × 7</option>
+          <option value="9">9 × 9</option><option value="11">11 × 11</option></select></label>
+        <label class="inline" for="sigma">σ <input id="sigma" type="range" min="0.3" max="4" step="0.1" value="1.5">
+          <span class="val" id="sigma-v">1.5</span></label>
+      </div>
+      <div class="grid-wrap"><div id="kgrid" class="kgrid" role="grid" aria-label="Kernel weights"></div></div>
+      <div class="controls">
+        <button class="btn" id="normalize" type="button" title="Divide every weight by their sum">Normalize</button>
+        <button class="btn" id="negate" type="button" title="Multiply every weight by −1">Negate</button>
+        <button class="btn" id="transpose" type="button" title="Swap rows and columns (x ↔ y)">Transpose</button>
+        <button class="btn" id="zero" type="button" title="Every weight 0">Clear</button>
+      </div>
+      <div class="kinfo" aria-live="polite">
+        <div><span>Sum</span><b id="k-sum">–</b></div>
+        <div><span>Separable</span><b id="k-sep">–</b></div>
+        <div><span>Passes</span><b id="k-pass">–</b></div>
+      </div>
+      <h2>Output</h2>
+      <div class="controls">
+        <label class="inline" for="border">Border <select id="border">
+          <option value="1">"replicate"</option><option value="2">"reflect"</option>
+          <option value="3">"circular"</option><option value="4">Fill(0)</option></select></label>
+        <span class="seg" role="group" aria-label="Color">
+          <button type="button" id="mode-rgb" aria-pressed="true">RGB</button>
+          <button type="button" id="mode-gray" aria-pressed="false">Gray</button></span>
+      </div>
+      <div class="controls">
+        <label class="inline" for="post">Show <select id="post">
+          <option value="1">value, clamped</option><option value="2">|value|</option>
+          <option value="3">½ + value</option></select></label>
+        <label class="inline" for="gain">Gain <input id="gain" type="range" min="0" max="11" step="1" value="2">
+          <span class="val" id="gain-v">1×</span></label>
+      </div>
+      <h2>The call <span>as the module runs it</span></h2>
+      <pre id="call" class="call" aria-label="The Julia call"></pre>
+    </div>
+
+    <div class="pane" id="image-pane">
+      <h2>Images <span>drop an image here, or</span></h2>
+      <div class="controls">
+        <label class="inline" for="source">Image <select id="source">
+          <option value="card">test card</option><option value="rings">zone plate</option>
+          <option value="file" disabled>your image</option></select></label>
+        <input id="file" type="file" accept="image/*" aria-label="Load an image">
+      </div>
+      <div class="images">
+        <figure><figcaption>Input <b id="dims">–</b></figcaption><canvas id="in"></canvas></figure>
+        <figure><figcaption>imfilter <b id="kdesc">–</b></figcaption><canvas id="out"></canvas></figure>
+      </div>
+      <div class="readouts" aria-live="polite">
+        <div class="readout"><span>imfilter</span><b id="r-filter">–</b></div>
+        <div class="readout"><span>Pixels out</span><b id="r-copy">–</b></div>
+        <div class="readout"><span>Native</span><b id="r-native">–</b></div>
+        <div class="readout"><span>Module</span><b>__SIZE__ KB</b></div>
+      </div>
+      <p class="hint">Images are scaled to at most 512 pixels on a side. <span id="native-note"></span></p>
+      <div id="status" class="status">Loading the module…</div>
+    </div>
+  </section>
+
+  <section class="notes" aria-label="How it runs">
+    <div>
+      <h2>The packages, unchanged</h2>
+      <p>ImageFiltering, ImageCore, ColorTypes, FixedPointNumbers and OffsetArrays from the General
+        registry: __FUNCS__ Julia functions in __SIZE__ KB of WebAssembly, with __OBJECTS__ objects
+        (the presets' tables, the padding styles) serialized into the module.</p>
+    </div>
+    <div>
+      <h2>Separable or not</h2>
+      <p><code>imfilter</code> factors a 2-D kernel by its singular value decomposition: of rank one,
+        it filters with two 1-D passes. The SVD is LAPACK's <code>gesdd</code>, from the runtime
+        WasmCodegen compiles into the module, written in Julia.</p>
+    </div>
+    <div>
+      <h2>Checked against Julia</h2>
+      <p>On 29 cases (every preset, each border, color and gray), the module's pixels equal native
+        Julia's, or differ by one level where a sum lands on a rounding boundary: the SVD's last
+        bits differ from OpenBLAS's.</p>
+    </div>
+  </section>
+</div>
+
+<script>
+(async () => {
+  const WASM_BASE64 = "__WASM_BASE64__";
+  const NATIVE = [__NATIVE__];   // native ms: Gaussian 7 × 7, sharpen 5 × 5, on 512 × 512
+  const PRESETS = ["identity", "box blur", "Gaussian blur", "sharpen", "Laplacian",
+                   "difference of Gaussians", "Sobel x", "Sobel y", "Prewitt x", "Scharr x",
+                   "emboss", "outline", "motion blur"];
+  // (the presets of a width σ, and how each is best shown: [post, gain])
+  const SIGMA = new Set([3, 4, 6]);
+  const SHOW = { 5: [2, 3], 6: [3, 6], 7: [3, 2], 8: [3, 2], 9: [3, 2], 10: [3, 2] };
+  // (the presets ImageFiltering defines 3 × 3: chosen, the grid becomes 3 × 3)
+  const THREE = new Set([5, 7, 8, 9, 10, 11, 12]);
+  const MAXSIDE = 512;
+
+  const $ = (id) => document.getElementById(id);
+  const status = $("status");
+  const fail = (msg) => { status.textContent = msg; status.classList.add("error"); };
+
+  let ex;
+  try {
+    const wasm = Uint8Array.from(atob(WASM_BASE64), (c) => c.charCodeAt(0));
+    ({ instance: { exports: ex } } = await WebAssembly.instantiate(wasm, {}));
+  } catch (err) {
+    fail("This browser could not load the module (it needs WebAssembly GC and exception handling): " + err.message);
+    return;
+  }
+
+  // ---- state
+  let n = 5, preset = 3, K = [], gray = 0, W = 0, H = 0, separable = false;
+  const presetSel = $("preset"), sizeSel = $("size"), sigma = $("sigma"), gainIn = $("gain");
+  presetSel.add(new Option("custom", "0"));
+  PRESETS.forEach((p, i) => presetSel.add(new Option(p, String(i + 1))));
+  const GAINS = [0.25, 0.5, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24];
+  const gain = () => GAINS[+gainIn.value];
+  const setGain = (g) => { gainIn.value = String(GAINS.indexOf(g)); };
+
+  const fmt = (v) => {
+    if (Math.abs(v) < 5e-13) return "0";
+    const s = Math.abs(v) >= 1000 ? v.toFixed(0) : (+v.toPrecision(4)).toString();
+    return s.replace(/^(-?)0\./, "$1.");
+  };
+
+  // ---- the kernel grid
+  const grid = $("kgrid");
+  function readKernel() {
+    n = ex.kernel_size();
+    K = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => ex.kernel_get(i + 1, j + 1)));
+  }
+  function writeKernel() {
+    ex.kernel_resize(n);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) ex.kernel_set(i + 1, j + 1, K[i][j]);
+  }
+  function renderGrid() {
+    grid.style.gridTemplateColumns = `repeat(${n}, auto)`;
+    grid.replaceChildren();
+    const c = (n - 1) / 2;
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      const inp = document.createElement("input");
+      inp.inputMode = "decimal"; inp.spellcheck = false; inp.autocomplete = "off";
+      inp.value = fmt(K[i][j]);
+      inp.dataset.i = i; inp.dataset.j = j;
+      inp.setAttribute("aria-label", `weight at row ${i - c}, column ${j - c}`);
+      if (i === c && j === c) inp.classList.add("center");
+      grid.append(inp);
+    }
+    tint();
+  }
+  function tint() {
+    let m = 0;
+    for (const row of K) for (const v of row) m = Math.max(m, Math.abs(v));
+    for (const inp of grid.children) {
+      const v = K[inp.dataset.i][inp.dataset.j];
+      const a = m > 0 ? Math.round(Math.sqrt(Math.abs(v) / m) * 62) : 0;
+      inp.style.background = v === 0 ? "" :
+        `color-mix(in oklab, var(${v > 0 ? "--pos" : "--neg"}) ${a}%, var(--code-bg))`;
+    }
+  }
+  grid.addEventListener("input", (e) => {
+    const inp = e.target, v = Number(inp.value.trim().replace(/^(-?)\./, "$10."));
+    const ok = inp.value.trim() !== "" && Number.isFinite(v);
+    inp.classList.toggle("bad", !ok);
+    if (!ok) return;
+    K[inp.dataset.i][inp.dataset.j] = v;
+    ex.kernel_set(+inp.dataset.i + 1, +inp.dataset.j + 1, v);
+    presetSel.value = "0"; preset = 0;
+    tint(); kernelInfo(); schedule();
+  });
+  grid.addEventListener("change", (e) => { if (!e.target.classList.contains("bad")) e.target.value = fmt(K[e.target.dataset.i][e.target.dataset.j]); });
+  grid.addEventListener("keydown", (e) => {
+    // arrows move between cells
+    const inp = e.target, i = +inp.dataset.i, j = +inp.dataset.j;
+    const d = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }[e.key];
+    if (!d || ((d[1] !== 0) && inp.selectionStart !== (d[1] < 0 ? 0 : inp.value.length))) return;
+    const ni = i + d[0], nj = j + d[1];
+    if (ni < 0 || nj < 0 || ni >= n || nj >= n) return;
+    e.preventDefault();
+    const next = grid.children[ni * n + nj]; next.focus(); next.select();
+  });
+
+  function kernelInfo() {
+    let s = 0;
+    for (const row of K) for (const v of row) s += v;
+    $("k-sum").textContent = fmt(s);
+    separable = ex.kernel_separable() === 1;
+    $("k-sep").textContent = separable ? "yes, rank 1" : "no";
+    $("k-pass").textContent = separable ? "2 × 1-D" : "1 × 2-D";
+    $("kdesc").textContent = `${preset ? PRESETS[preset - 1] : "custom"}, ${n} × ${n}`;
+    callText();
+  }
+
+  function loadPreset() {
+    ex.kernel_preset(preset, n, +sigma.value);
+    readKernel(); renderGrid(); kernelInfo();
+  }
+  function showFor(p) {
+    const [post, g] = SHOW[p] ?? [1, 1];
+    $("post").value = String(post); setGain(g); gainLabel();
+  }
+  presetSel.addEventListener("change", () => {
+    preset = +presetSel.value;
+    if (preset === 0) return;
+    if (THREE.has(preset)) { n = 3; sizeSel.value = "3"; }
+    showFor(preset); loadPreset(); syncSigma(); schedule();
+  });
+  sizeSel.addEventListener("change", () => {
+    const m = +sizeSel.value;
+    if (preset !== 0) { n = m; loadPreset(); schedule(); return; }
+    // a custom kernel: keep its weights about the center, cropped or padded with zeros
+    const d = (m - n) / 2;
+    K = Array.from({ length: m }, (_, i) => Array.from({ length: m }, (_, j) => K[i - d]?.[j - d] ?? 0));
+    n = m; writeKernel(); renderGrid(); kernelInfo(); schedule();
+  });
+  const syncSigma = () => { sigma.disabled = !SIGMA.has(preset); $("sigma-v").textContent = (+sigma.value).toFixed(1); };
+  sigma.addEventListener("input", () => { syncSigma(); if (SIGMA.has(preset)) { loadPreset(); schedule(); } });
+
+  const edit = (f) => () => { K = f(K); writeKernel(); presetSel.value = "0"; preset = 0; syncSigma(); renderGrid(); kernelInfo(); schedule(); };
+  $("normalize").addEventListener("click", edit((K) => {
+    const s = K.flat().reduce((a, b) => a + b, 0);
+    return Math.abs(s) < 1e-12 ? K : K.map((r) => r.map((v) => v / s));
+  }));
+  $("negate").addEventListener("click", edit((K) => K.map((r) => r.map((v) => -v))));
+  $("transpose").addEventListener("click", edit((K) => K.map((r, i) => r.map((_, j) => K[j][i]))));
+  $("zero").addEventListener("click", edit((K) => K.map((r) => r.map(() => 0))));
+
+  // ---- output options
+  const border = $("border"), post = $("post");
+  const gainLabel = () => { $("gain-v").textContent = gain() + "×"; };
+  gainIn.addEventListener("input", () => { gainLabel(); callText(); schedule(); });
+  border.addEventListener("change", () => { callText(); schedule(); });
+  post.addEventListener("change", () => { callText(); schedule(); });
+  for (const [id, g] of [["mode-rgb", 0], ["mode-gray", 1]]) {
+    $(id).addEventListener("click", () => {
+      gray = g;
+      $("mode-rgb").setAttribute("aria-pressed", String(g === 0));
+      $("mode-gray").setAttribute("aria-pressed", String(g === 1));
+      callText(); schedule();
+    });
+  }
+
+  function callText() {
+    const b = border.options[border.selectedIndex].text;
+    const img = gray ? "Gray.(img)" : "img";
+    const g = gain(), p = +post.value;
+    const v = p === 1 ? "v" : p === 2 ? "mapc(abs, v)" : "v + RGB(0.5, 0.5, 0.5)";
+    const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    $("call").innerHTML =
+      `f = <span class="k">imfilter</span>(${esc(img)}, centered(K),\n` +
+      `             <span class="l">${esc(b)}</span>, Algorithm.FIR())\n` +
+      `out = map(f) do c\n` +
+      `    v = ${g === 1 ? "" : `<span class="l">${g}</span> * `}RGB{Float64}(c)\n` +
+      `    RGB{N0f8}(clamp01nan(${v}))\n` +
+      `end`;
+  }
+
+  // ---- images
+  const cin = $("in"), cout = $("out");
+  const xin = cin.getContext("2d"), xout = cout.getContext("2d");
+  let outData = null;
+
+  // (drawn off screen and its pixels read first: an image whose pixels the browser keeps to
+  // itself, as an SVG of HTML, throws there and changes nothing)
+  function setImage(draw, w, h) {
+    const s = Math.min(1, MAXSIDE / Math.max(w, h));
+    const w1 = Math.max(1, Math.round(w * s)), h1 = Math.max(1, Math.round(h * s));
+    const c = document.createElement("canvas");
+    c.width = w1; c.height = h1;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    draw(x, w1, h1);
+    const img = x.getImageData(0, 0, w1, h1), px = img.data;
+    W = w1; H = h1;
+    cin.width = cout.width = W; cin.height = cout.height = H;
+    xin.putImageData(img, 0, 0);
+    ex.img_resize(H, W);
+    for (let i = 0, k = 0; i < W * H; i++, k += 4) ex.img_set(i + 1, px[k] | (px[k + 1] << 8) | (px[k + 2] << 16));
+    outData = xout.createImageData(W, H);
+    $("dims").textContent = `${W} × ${H}`;
+    schedule();
+  }
+
+  // the test card: Julia's colors, hard edges, text, fine lines and a smooth gradient
+  function testCard(x, w, h) {
+    const g = x.createLinearGradient(0, 0, w, 0);
+    g.addColorStop(0, "#1b2433"); g.addColorStop(1, "#e9edf2");
+    x.fillStyle = g; x.fillRect(0, 0, w, h);
+    x.fillStyle = "#f4efe6"; x.fillRect(w * 0.04, h * 0.06, w * 0.5, h * 0.6);
+    // Julia's three dots
+    const r = h * 0.11, cx = w * 0.29, cy = h * 0.36;
+    for (const [c, dx, dy] of [["#389826", 0, -1], ["#CB3C33", 0.87, 0.5], ["#9558B2", -0.87, 0.5]]) {
+      x.fillStyle = c; x.beginPath(); x.arc(cx + 1.2 * r * dx, cy + 1.2 * r * dy, r, 0, 2 * Math.PI); x.fill();
+    }
+    x.fillStyle = "#18202b"; x.font = `600 ${Math.round(h * 0.12)}px "Source Serif 4", Georgia, serif`;
+    x.fillText("imfilter", w * 0.06, h * 0.86);
+    // stripes of rising frequency
+    for (let k = 0; k < 6; k++) {
+      const p = 2 + k, x0 = w * 0.6, y0 = h * (0.08 + k * 0.075);
+      for (let s = 0; s < w * 0.35; s += 2 * p) { x.fillStyle = "#18202b"; x.fillRect(x0 + s, y0, p, h * 0.06); }
+    }
+    // a checkerboard
+    const q = Math.max(4, Math.round(h * 0.035));
+    for (let i = 0; i < 6; i++) for (let j = 0; j < 8; j++) {
+      x.fillStyle = (i + j) % 2 ? "#e9edf2" : "#18202b";
+      x.fillRect(w * 0.6 + j * q, h * 0.58 + i * q, q, q);
+    }
+    // a lone thin line and a dot
+    x.strokeStyle = "#CB3C33"; x.lineWidth = 1;
+    x.beginPath(); x.moveTo(w * 0.6, h * 0.95); x.lineTo(w * 0.96, h * 0.82); x.stroke();
+    x.fillStyle = "#ffffff"; x.fillRect(Math.round(w * 0.9), Math.round(h * 0.6), 2, 2);
+  }
+  // a zone plate: rings whose frequency rises with the radius, for the kernels' frequency response
+  function zonePlate(x, w, h) {
+    // (the phase k r², of frequency 2 k r: π, the highest a grid of pixels has, at the corners)
+    const img = x.createImageData(w, h), d = img.data, k = Math.PI / Math.hypot(w, h);
+    for (let y = 0; y < h; y++) for (let i = 0; i < w; i++) {
+      const r2 = (i - w / 2) ** 2 + (y - h / 2) ** 2, v = Math.round(127.5 + 127.5 * Math.cos(k * r2));
+      const o = 4 * (y * w + i); d[o] = d[o + 1] = d[o + 2] = v; d[o + 3] = 255;
+    }
+    x.putImageData(img, 0, 0);
+  }
+  // (the last image chosen wins: a file still decoding is dropped when another is chosen, or
+  // another source)
+  let fileBitmap = null, fileGen = 0;
+  // (on white: the module's pixels are RGB, without transparency)
+  const onWhite = (bitmap) => (x, w, h) => { x.fillStyle = "#ffffff"; x.fillRect(0, 0, w, h); x.drawImage(bitmap, 0, 0, w, h); };
+  function loadSource() {
+    const s = $("source").value;
+    if (s === "card") setImage(testCard, 480, 360);
+    else if (s === "rings") setImage(zonePlate, 400, 400);
+    else if (fileBitmap) setImage(onWhite(fileBitmap), fileBitmap.width, fileBitmap.height);
+  }
+  $("source").addEventListener("change", () => { fileGen++; loadSource(); });
+  function decode(file) {
+    return createImageBitmap(file).catch(() => new Promise((ok, no) => {
+      const im = new Image(), url = URL.createObjectURL(file);
+      im.onload = () => { URL.revokeObjectURL(url); ok(im); };
+      im.onerror = () => { URL.revokeObjectURL(url); no(); };
+      im.src = url;
+    }));
+  }
+  async function useFile(file) {
+    // (whatever its type says, or none: decoding tells an image)
+    if (!file) return;
+    const gen = ++fileGen;
+    let bitmap;
+    try {
+      bitmap = await decode(file);
+    } catch {
+      if (gen === fileGen) fail(`This browser could not read ${file.name} as an image.`);
+      return;
+    }
+    if (gen !== fileGen) return;
+    try {
+      setImage(onWhite(bitmap), bitmap.width, bitmap.height);
+    } catch {
+      fail(`This browser does not let the page read the pixels of ${file.name}.`);
+      return;
+    }
+    fileBitmap = bitmap;
+    const opt = $("source").querySelector('option[value="file"]');
+    opt.disabled = false; opt.textContent = file.name.length > 28 ? file.name.slice(0, 26) + "…" : file.name;
+    $("source").value = "file";
+  }
+  // (emptied, so that choosing the same file again loads it again)
+  $("file").addEventListener("change", (e) => { useFile(e.target.files[0]); e.target.value = ""; });
+  const pane = $("image-pane");
+  pane.addEventListener("dragover", (e) => { e.preventDefault(); pane.classList.add("drop"); });
+  pane.addEventListener("dragleave", () => pane.classList.remove("drop"));
+  pane.addEventListener("drop", (e) => { e.preventDefault(); pane.classList.remove("drop"); useFile(e.dataTransfer.files[0]); });
+
+  // ---- filtering: at most once a frame
+  let queued = false;
+  function schedule() { if (!queued) { queued = true; requestAnimationFrame(run); } }
+  function run() {
+    queued = false;
+    if (!W) return;
+    let t0 = performance.now();
+    try {
+      ex.filter_image(+border.value, gray, +post.value, gain());
+    } catch (err) {
+      // (a Julia exception, without a message here)
+      fail(+border.value === 2 && Math.min(W, H) < 2
+        ? `imfilter threw: the "reflect" border needs 2 pixels each way (natively a BoundsError), and the image is ${W} × ${H}.`
+        : "The filter failed: " + (err instanceof Error ? err.message : "imfilter threw a Julia exception."));
+      return;
+    }
+    const t1 = performance.now();
+    const d = outData.data;
+    for (let i = 0, k = 0; i < W * H; i++, k += 4) {
+      const p = ex.out_get(i + 1);
+      d[k] = p & 255; d[k + 1] = (p >> 8) & 255; d[k + 2] = (p >> 16) & 255; d[k + 3] = 255;
+    }
+    xout.putImageData(outData, 0, 0);
+    const t2 = performance.now();
+    $("r-filter").textContent = `${(t1 - t0).toFixed(1)} ms`;
+    $("r-copy").textContent = `${(t2 - t1).toFixed(1)} ms`;
+    status.classList.remove("error");
+    const madds = (separable ? 2 * n : n * n) * W * H * (gray ? 1 : 3);
+    status.textContent = `${W} × ${H} pixels, ${gray ? 1 : 3} channel${gray ? "" : "s"}: ` +
+      `${(madds / 1e6).toFixed(1)} M multiply-adds (${separable ? `2 passes of ${n}` : `${n * n}`} per value).`;
+  }
+
+  // ---- start: a Gaussian blur on the test card
+  $("r-native").textContent = `${NATIVE[0]} ms`;
+  $("native-note").textContent = `Native Julia, for scale: a 7 × 7 Gaussian on 512 × 512 takes ${NATIVE[0]} ms, a 5 × 5 sharpening ${NATIVE[1]} ms.`;
+  sizeSel.value = String(n); presetSel.value = String(preset);
+  showFor(preset); syncSigma(); gainLabel();
+  loadPreset();
+  if (document.fonts) await document.fonts.ready.catch(() => {});
+  loadSource();
+})();
+</script>
