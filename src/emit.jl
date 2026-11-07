@@ -605,7 +605,9 @@ function analyze_uses!(fc::FnCtx, block)
     for name in fieldnames(typeof(t))
         isdefined(t, name) || continue
         x = getfield(t, name)
-        if x isa AbstractVector
+        # (a field of values, as a yield's; any other is one value, as a `return`ed constant
+        # vector)
+        if fieldtype(typeof(t), name) <: Vector
             for (j, v) in enumerate(x)
                 use!(v)
                 v isa Core.SSAValue && (u.interm[v.id] = (block, j))
@@ -644,11 +646,15 @@ function analyze_split_unions!(fc::FnCtx, block)
             uses[x.id] = get(uses, x.id, 0) + 1
         elseif x isa IRStructurizer.Block
             scan!(x)
-        elseif x isa Expr || x isa AbstractVector || x isa Tuple
-            foreach(count!, x isa Expr ? x.args : x)
+        elseif x isa Expr
+            foreach(count!, x.args)
         elseif x isa IR_NODES || parentmodule(typeof(x)) === IRStructurizer
             for i in 1:nfields(x)
-                isdefined(x, i) && count!(getfield(x, i))
+                isdefined(x, i) || continue
+                # (a field of operands, as a phi's values; any other is one operand, and an
+                # operand that is a constant, of an array or tuple type too, is a value)
+                y = getfield(x, i)
+                fieldtype(typeof(x), i) <: Vector ? foreach(count!, y) : count!(y)
             end
         end
     end
