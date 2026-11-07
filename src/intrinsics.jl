@@ -382,6 +382,11 @@ end
 
 function emit_bswap!(fc::FnCtx, x::CGVal)
     T = x.typ
+    if T === Float32 || T === Float64
+        # (the shifts and masks are integer instructions: on the bits)
+        I = T === Float32 ? UInt32 : UInt64
+        return emit_bitcast!(fc, T, emit_bswap!(fc, emit_bitcast!(fc, I, x)))
+    end
     n = nbits(T)
     n <= 8 && return x
     t = prim_wtype(fc, T)

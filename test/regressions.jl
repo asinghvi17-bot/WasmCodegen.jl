@@ -301,6 +301,15 @@ const RG_HOLES = Vector{Any}(undef, 2)
 @eval @noinline rg_holes_get(x::Float64) = (RG_SINK[] = x; $RG_HOLES)
 @noinline rg_holes_len(t::Tuple{Vector{Any}}) = length(t[1])
 @eval rg_holes(x::Float64) = (v = rg_holes_get(x); (length(v), isassigned(v, 1), rg_holes_len($((RG_HOLES,)))))
+rg_bswap32(x::Float32) = reinterpret(UInt32, bswap(x))
+rg_hton32(x::Float32) = reinterpret(UInt32, hton(x))
+rg_ntoh32(x::Float32) = reinterpret(UInt32, ntoh(x))
+rg_bswap64(x::Float64) = reinterpret(UInt64, bswap(x))
+rg_hton64(x::Float64) = reinterpret(UInt64, hton(x))
+rg_ntoh64(x::Float64) = reinterpret(UInt64, ntoh(x))
+# (from the bits, for the NaNs whose payloads a Float32 argument may not carry in)
+rg_bswap32_bits(u::UInt32) = reinterpret(UInt32, bswap(reinterpret(Float32, u)))
+rg_bswap64_bits(u::UInt64) = reinterpret(UInt64, bswap(reinterpret(Float64, u)))
 @testset "regressions" begin
     @wtest rg_unionfield(true, true)
     @wtest rg_unionfield(false, false)
@@ -395,4 +404,17 @@ const RG_HOLES = Vector{Any}(undef, 2)
     end
     @wtest rg_triple(1.5)
     @wtest rg_holes(1.5)
+    # bswap of floats: the bits, as the unsigned integers (a NaN's payload and a zero's sign are bits)
+    for x in (1.5f0, -2f-3, 123456.789f0, 0f0, -0f0, 1f-45, -1f-40, Inf32, -Inf32, NaN32)
+        @wtest rg_bswap32(x); @wtest rg_hton32(x); @wtest rg_ntoh32(x)
+    end
+    for x in (1.5, -2e-3, 123456.789, 0.0, -0.0, 5e-324, -1e-310, Inf, -Inf, NaN)
+        @wtest rg_bswap64(x); @wtest rg_hton64(x); @wtest rg_ntoh64(x)
+    end
+    for u in (0x7fc00001, 0xffa12345, 0x7f800001)
+        @wtest rg_bswap32_bits(u)
+    end
+    for u in (0x7ff8000000000001, 0xfff4123456789abc, 0x7ff0000000000001)
+        @wtest rg_bswap64_bits(u)
+    end
 end
