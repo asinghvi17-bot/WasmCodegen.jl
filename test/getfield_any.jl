@@ -107,6 +107,36 @@ function tuple_name(i::Int)
     end
     return false
 end
+# a tuple of known length of an element type not concrete (`Type`): its fields by the value's
+# type, at a constant index and at one known only at run time (as `print(io, xs...)` reads its
+# arguments); out of bounds a BoundsError
+const MIXED = Tuple{Type,String,Int}[(Int, "a", 1), (Vector{Float64}, "bcd", 2)]
+mixed_const(i::Int) = (t = MIXED[i]; (getfield(t, 1) === Int, ncodeunits(getfield(t, 2)), getfield(t, 3)))
+function mixed_at(i::Int, k::Int)
+    v = getfield(MIXED[i], k)
+    return v isa Type ? (v === Int ? 1 : 2) : v isa String ? 10 * ncodeunits(v) : 100 * (v::Int)
+end
+mixed_at_caught(i::Int, k::Int) =
+    try
+        mixed_at(i, k)
+    catch e
+        e isa BoundsError ? -1 : -2
+    end
+# of a tuple type with a parameter (a `UnionAll`), of two fields
+const PAIRS = (Tuple{T,T} where T)[(1, 2), ("a", "bc")]
+pair_at(i::Int, k::Int) = (v = getfield(PAIRS[i], k); v isa Int ? v : -ncodeunits(v::String))
+# of a union of tuples (of different lengths): unsupported at an index known only at run time
+const UNEQUAL = Union{Tuple{Int},Tuple{String,String}}[(1,), ("a", "bc")]
+unequal_at(i::Int, k::Int) = getfield(UNEQUAL[i], k) isa String
+# at an index not of type `Int` (natively a TypeError, or a FieldError for a name): unsupported
+const INDICES = Any[1, :missing]
+any_index_at(i::Int, j::Int) = getfield(MIXED[i], INDICES[j]) isa Int
+# with an ordering (natively checked against the field's atomicity): unsupported
+const ORDERS = [:not_atomic, :acquire]
+ordered_at(i::Int, k::Int) = getfield(MIXED[i], k, ORDERS[i]) isa Int
+# printed, a type among the values (`print` reads them at run-time indices of a tuple of type
+# `Tuple{Type, String, Int64, Char}`)
+mixed_string(i::Int) = hash(string(Box, "[", i, ']'))
 # with a value of a type whose type object is not a ghost (`Core.TypeofBottom`)
 const WITH_BOTTOM = Any[Union{}, (7,), Box(8)]
 with_bottom(i::Int) = getfield(WITH_BOTTOM[i], 1)::Int
@@ -158,6 +188,16 @@ end
         @test got === f(1000)
     end
     HOLD[1] = (); HOLD_T[1] = ()
+    for i in 1:2
+        @wtest mixed_const(i)
+        @wtest mixed_string(i)
+        for k in 0:4
+            @wtest mixed_at_caught(i, k)
+        end
+        for k in 1:2
+            @wtest pair_at(i, k)
+        end
+    end
     @wtest with_bottom(2)
     @wtest with_bottom(3)
     @wtest const_module_field(2)
@@ -167,6 +207,9 @@ end
     @wtest module_field(1)
     for f in (ordered_field, type_name)
         @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(f, (Int,))
+    end
+    for f in (ordered_at, unequal_at, any_index_at)
+        @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(f, (Int, Int))
     end
 end
 

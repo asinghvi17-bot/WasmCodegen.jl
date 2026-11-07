@@ -103,8 +103,9 @@ it returns is optimized by `wasm-opt -O3` (Binaryen_jll); `Config(optimize=nothi
 the raw module, for debugging the code generator only.
 
 Each example builds a page: `examples/lorenz` solves the Lorenz system with adjustable
-parameters, `examples/mtk` simulates a ModelingToolkit model with sliders, and
-`examples/juliasyntax` parses Julia source in the browser.
+parameters, `examples/mtk` simulates a ModelingToolkit model with sliders,
+`examples/juliasyntax` parses Julia source in the browser, and `examples/images` filters
+images with ImageFiltering's `imfilter` and a kernel of your choosing.
 
 ## Host runtimes
 

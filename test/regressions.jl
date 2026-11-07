@@ -1,5 +1,6 @@
 # Programs that were compiled wrong: identity, layouts, pointers, undefined values, tuples of
-# unknown length, varargs with type objects, and LAPACK's extreme magnitudes
+# unknown length, varargs with type objects, constants of array types, and LAPACK's extreme
+# magnitudes
 
 using LinearAlgebra
 
@@ -282,6 +283,24 @@ function rg_user(flag::Bool)
     v = flag ? [1] : ["a"]
     return rg_callit(() -> length(v))
 end
+# a constant of an array type the code generator's world does not have (one defined after it,
+# as a package's `SVector`), in a call and returned: a value, not a vector of the IR to look into
+struct RGTriple <: AbstractVector{Float64}
+    a::Float64
+    b::Float64
+    c::Float64
+end
+Base.size(::RGTriple) = (3,)
+Base.getindex(t::RGTriple, i::Int) = getfield(t, i)
+const RG_SINK = Ref(0.0)
+@noinline rg_triple_dot(t::RGTriple, x::Float64) = t.a + t.b * x + t.c * x^2
+@noinline rg_triple_get(x::Float64) = (RG_SINK[] = x; RGTriple(1.0, 2.0, 3.0))
+rg_triple(x::Float64) = rg_triple_dot(RGTriple(1.0, 2.0, 3.0), x) + rg_triple_get(x)[2]
+# and a constant vector (here of elements not assigned) returned, and in a constant tuple
+const RG_HOLES = Vector{Any}(undef, 2)
+@eval @noinline rg_holes_get(x::Float64) = (RG_SINK[] = x; $RG_HOLES)
+@noinline rg_holes_len(t::Tuple{Vector{Any}}) = length(t[1])
+@eval rg_holes(x::Float64) = (v = rg_holes_get(x); (length(v), isassigned(v, 1), rg_holes_len($((RG_HOLES,)))))
 @testset "regressions" begin
     @wtest rg_unionfield(true, true)
     @wtest rg_unionfield(false, false)
@@ -374,4 +393,6 @@ end
         @wtest_approx rg_svd(x)
         @wtest_approx rg_eig(x)
     end
+    @wtest rg_triple(1.5)
+    @wtest rg_holes(1.5)
 end
