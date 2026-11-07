@@ -382,7 +382,7 @@ end
 
 function emit_bswap!(fc::FnCtx, x::CGVal)
     T = x.typ
-    if T <: AbstractFloat
+    if T <: Base.IEEEFloat
         # (the shifts and masks are integer instructions: on the bits)
         I = Base.uinttype(T)
         return emit_bitcast!(fc, T, emit_bswap!(fc, emit_bitcast!(fc, I, x)))
