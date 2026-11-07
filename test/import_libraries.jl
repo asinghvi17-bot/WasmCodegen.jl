@@ -128,14 +128,20 @@ end
         end
     end
 
-    # for WASI: after the runtime's part of the memory
-    c = WasmCodegen.compile([(jsb_vector, (Int,)), (jsb_string, (Int,))];
+    # for WASI: after the runtime's part of the memory (the same layout from there)
+    c = WasmCodegen.compile([(jsb_vector, (Int,)), (jsb_string, (Int,)), (jsb_mixed, (Int,))];
                             config = WasmCodegen.Config(host = :wasi, import_libraries = ["jsb_test"]))
-    r, log = run_js_bytes(c, JSB_LIB, [("jsb_vector", Any[300]), ("jsb_string", Any[2])])
+    r, log = run_js_bytes(c, JSB_LIB, [("jsb_vector", Any[300]), ("jsb_string", Any[2]),
+                                       ("jsb_mixed", Any[0]), ("jsb_mixed", Any[9])])
     base = Int(WasmCodegen.Runtime.Staging.SIZE)
-    @test r == ["300", "6"]
+    @test r == ["300", "6", "4", "22"]
     @test jsb_log(log[1]) == ("send", [base, 300], [jsb_pattern(300)])
     @test jsb_log(log[2]) == ("text", [base, 10], "αβcαβc")
+    for (n, line) in zip((0, 9), log[3:4])
+        o2 = base + ((n + 7) & ~7)
+        @test jsb_log(line) == ("mixed", [-7, n, base, n, o2, 1, o2 + 8, 3],
+                                [jsb_pattern(n), Vector{UInt8}("x"), UInt8[0x01, 0x02, 0xff]])
+    end
 
     # other arrays, and pointers, are not bytes for the host
     for (f, at) in ((jsb_ints, (Vector{Int},)), (jsb_ptr, (Vector{UInt8},)))
