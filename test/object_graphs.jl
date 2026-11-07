@@ -167,6 +167,11 @@ const SHELL_FIRST = WasmCodegen.Config(shell_first_mutables = true)
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(InlineCycle.read, (Float64,); config = WasmCodegen.Config(verify = :off))
     # (the cycle through the immutable `Step` too)
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(StructCycle.run, (Float64,); config = WasmCodegen.Config(verify = :off))
+    # the error names the option that serializes them
+    err = try WasmCodegen.compile(ClosureCycle.run, (Float64,); config = WasmCodegen.Config(verify = :off)); nothing catch e; e end
+    @test err isa WasmCodegen.UnsupportedConstructs
+    @test occursin("serializing a cycle of objects through", sprint(showerror, err))
+    @test occursin("Config(shell_first_mutables = true) serializes cycles through mutable objects", sprint(showerror, err))
     # compiled first: the serialized state is the initial one, so an alias is needed to see the new value
     cases = [(ClosureCycle.run, 1.5), (StructCycle.run, 2.5), (InlineCycle.read, 1.5), (InlineCycle.write, 7.0),
              (DeferredHash.same, 2.0)]

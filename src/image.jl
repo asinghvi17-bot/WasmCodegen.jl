@@ -373,8 +373,10 @@ function note_reach!(img::Image, @nospecialize(x))
     return
 end
 
+const CYCLE_HINT = "; Config(shell_first_mutables = true) serializes cycles through mutable objects"
+
 function new_object_global!(img::Image, @nospecialize(x))
-    x in img.inprogress && unsupported("serializing a cycle of objects through ", typeof(x))
+    x in img.inprogress && unsupported("serializing a cycle of objects through ", typeof(x), CYCLE_HINT)
     # types are objects even where their type is a singleton (`Union{}`)
     x isa Type && return type_object_global!(img, x)
     ts = types(img)
@@ -526,7 +528,7 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout; register::Bool=
     g = add_global!(img.cgm.mod, global_name(img, x), RefType(l.wtype, false), false, init)
     register && (img.globals[x] = g)
     if !isempty(back)
-        ismutabletype(T) || unsupported("a cycle of objects through the immutable ", T)
+        ismutabletype(T) || unsupported("a cycle of objects through the immutable ", T, CYCLE_HINT)
         for (wfield, v, FT, reset) in back
             push!(img.patches, (g, :struct, l.wtype, wfield, v, FT, img.owner, reset))
         end
