@@ -63,6 +63,17 @@ cvt_float(n::Int) = try (t = convert(NTuple{3,Float64}, (IS[1:n]...,)); t[1] + t
                     catch e; e isa MethodError ? -1.0 : -2.0 end
 cvt_mixed(n::Int) = try (t = convert(Tuple{Float64,Int,Float64}, (IS[1:n]...,)); t[1] + t[2] / 4 + t[3] / 16)
                     catch e; e isa MethodError ? -1.0 : -2.0 end
+# (target types of a fixed length that are UnionAlls, `NTuple{3}`, `Tuple{T,Int} where T` and
+# `NTuple{2,T} where T<:Integer`: a field of a type variable its bound, as `fieldtype` of the UnionAll
+# gives, i.e. as natively; constants, as a `where` in a function's code makes the type at run time)
+const FS = [1.5, 2.0, 3.0, 4.5]
+const TINT = Tuple{T,Int} where T
+const NTINT = NTuple{2,T} where T<:Integer
+cvt_ntuple3(n::Int) = try bits(convert(NTuple{3}, (BS[1:n]...,))) catch e; e isa MethodError ? -1 : -2 end
+cvt_tint(i::Int, n::Int) = try (t = convert(TINT, (FS[i:i+n-1]...,)); t[1] + 10 * t[2])
+                           catch e; e isa MethodError ? -1.0 : e isa InexactError ? -3.0 : -2.0 end
+cvt_ntint(i::Int, n::Int) = try (t = convert(NTINT, (FS[i:i+n-1]...,)); t[1] + 10 * t[2])
+                            catch e; e isa MethodError ? -1 : e isa InexactError ? -3 : -2 end
 
 @testset "tuples of unknown length" begin
     for f in (vn_parts, vn_iter, vn_maxmethods1)
@@ -79,7 +90,8 @@ cvt_mixed(n::Int) = try (t = convert(Tuple{Float64,Int,Float64}, (IS[1:n]...,));
     @test_throws WasmCodegen.UnsupportedConstructs wcompile(MaxMethods1.own_limit, (VersionNumber,))
     @testset "convert to a tuple type of a fixed length" begin
         for (f, args) in ((cvt_mwe, ()), (cvt_bool3, (Int,)), (cvt_bool13, (Int,)), (cvt_float, (Int,)),
-                          (cvt_mixed, (Int,)))
+                          (cvt_mixed, (Int,)), (cvt_ntuple3, (Int,)), (cvt_tint, (Int, Int)),
+                          (cvt_ntint, (Int, Int)))
             @test (WasmCodegen.compile(f, args; config=WasmCodegen.Config(verify=:error)); true)
         end
         @wtest cvt_mwe()
@@ -90,6 +102,13 @@ cvt_mixed(n::Int) = try (t = convert(Tuple{Float64,Int,Float64}, (IS[1:n]...,));
         end
         for n in 12:14
             @wtest cvt_bool13(n)
+        end
+        for n in 2:4
+            @wtest cvt_ntuple3(n)
+        end
+        for (i, n) in ((1, 1), (1, 2), (2, 2), (3, 2), (1, 3))
+            @wtest cvt_tint(i, n)
+            @wtest cvt_ntint(i, n)
         end
     end
     @testset "egal and comparison" begin
