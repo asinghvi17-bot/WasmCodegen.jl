@@ -60,6 +60,24 @@ function setprop(k::Int)
         return (r[], e isa MethodError ? 1 : e isa FieldError ? 2 : 3)
     end
 end
+# setfield! of a field known only at run time: of a name or an index; a value its type does not
+# admit a TypeError, a name of none a FieldError, an index out of range a BoundsError, a const
+# field an error, as natively
+mutable struct Point3; x::Float64; y::Float64; n::Int; const id::Int; end
+const KEYS = [:x, :y, :n, :id, :zz]
+const NAMES = [:x, :value]
+code(e) = e isa TypeError ? (e.func === :setfield! ? 1 : 2) : e isa FieldError ? 3 :
+          e isa BoundsError ? 4 : e isa InexactError ? 5 : e isa ErrorException ? 6 : 7
+fields(p::Point3) = (p.x, p.y, p.n, p.id)
+setkey(i::Int, v::Float64) = (p = Point3(1.0, 2.0, 3, 4);
+    try setproperty!(p, KEYS[i], v); (fields(p), 0) catch e; (fields(p), code(e)) end)
+setkey_any(i::Int, k::Int) = (p = Point3(1.0, 2.0, 3, 4); v = Any[5.0, 6, "s"][k];
+    try setfield!(p, KEYS[i], v); (fields(p), 0) catch e; (fields(p), code(e)) end)
+setindex_field(i::Int, v::Int) = (p = Point3(1.0, 2.0, 3, 4);
+    try setfield!(p, i, v); (fields(p), 0) catch e; (fields(p), code(e)) end)
+# (of a Ref, as Makie's ComputePipeline: `setproperty!(::RefValue, name, v)`)
+setref(k::Int, v::Float64) = (r = Ref(0.0);
+    try setproperty!(r, NAMES[k], v); (r[], 0) catch e; (r[], code(e)) end)
 
 @testset "run-time reflection without the C runtime" begin
     @testset "modules" begin
@@ -79,6 +97,21 @@ end
         end
         @wtest setprop(1)
         @wtest setprop(2)
+    end
+    @testset "setfield! of a field known only at run time" begin
+        for i in 1:length(KEYS)
+            @wtest setkey(i, 7.5)
+            @wtest setkey(i, 7.0)
+            for k in 1:3
+                @wtest setkey_any(i, k)
+            end
+        end
+        for i in 0:5
+            @wtest setindex_field(i, 9)
+        end
+        for k in 1:2
+            @wtest setref(k, 3.0)
+        end
     end
     @testset "operator ccalls in Wasm" begin
         for i in 1:length(OPNAMES)

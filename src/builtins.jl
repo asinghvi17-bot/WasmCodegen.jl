@@ -311,7 +311,7 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return get_field_dynamic(fc, x, idx, typ)
     elseif f === Core.setfield!
         x, idx, v = args[1], args[2], args[3]
-        isconstant(idx) || unsupported("setfield! with a field not known at compile time")
+        isconstant(idx) || return set_field_dynamic!(fc, x, idx, v)
         is_no_field(x.typ, constant_value(idx)) && return no_field!(fc, x.typ, constant_value(idx))
         return set_field!(fc, x, field_index(x.typ, constant_value(idx)), v)
     elseif f === Core.swapfield! || f === Core.modifyfield! || f === Core.replacefield! ||
@@ -576,6 +576,41 @@ function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
     res = new_val!(fc, typ)
     for_field_at!(k -> assign!(fc, res, get_field(fc, x, k)), fc, idx, n)
     return res
+end
+
+"""
+    set_field_dynamic!(fc, x, i, v) -> CGVal
+
+`setfield!(x, i, v)` of the run-time index or name `i` (checked as by `get_field_dynamic`): a
+chain of tests of the index, each field a store of `v`, checked at run time where `v`'s type
+does not tell whether the field's admits it; as natively, a TypeError where it does not, and
+an error for a const field.
+"""
+function set_field_dynamic!(fc::FnCtx, x::CGVal, i::CGVal, v::CGVal)
+    T = x.typ
+    (T isa DataType && isconcretetype(T) && ismutabletype(T) && (i.typ === Symbol || i.typ <: Integer)) ||
+        unsupported("setfield! of a value of type ", T, " with a field not known at compile time")
+    idx = checked_field_index!(fc, x, i)
+    for_field_at!(fc, idx, fieldcount(T)) do k
+        if isconst(T, k)
+            throw_error!(fc, Runtime.throw_const_field_error, const_value(fc, nameof(T)),
+                         const_value(fc, fieldname(T, k)))
+            return
+        end
+        FT = fieldtype(T, k)
+        t = emit_isa!(fc, v, FT)
+        if !(isconstant(t) && constant_value(t))
+            push_val!(fc, t)
+            emit!(fc.b, :i32_eqz)
+            if!(fc.b)
+            throw_error!(fc, Runtime.throw_type_error, const_value(fc, :setfield!),
+                         () -> convert_repr(fc, const_value(fc, FT), Any), () -> convert_repr(fc, v, Any))
+            end!(fc.b)
+            isconstant(t) && return
+        end
+        set_field!(fc, x, k, v.typ <: FT ? v : convert_repr(fc, v, typeintersect(v.typ, FT)))
+    end
+    return v
 end
 
 # the number of fields of every value of the tuple type `T` (of parameters or not), if it is

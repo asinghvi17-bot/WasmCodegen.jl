@@ -8,8 +8,12 @@
 @noinline throw_undefvar_error(s::Symbol, m::Module) = throw(UndefVarError(s, m))
 @noinline throw_type_error(@nospecialize(expected), @nospecialize(got)) =
     throw(TypeError(:typeassert, "", expected::Type, got))
+@noinline throw_type_error(f::Symbol, @nospecialize(expected), @nospecialize(got)) =
+    throw(TypeError(f, "", expected::Type, got))
 @noinline throw_method_error(@nospecialize(f), @nospecialize(args)) = throw(MethodError(f, args))
 @noinline throw_field_error(@nospecialize(T), s::Symbol) = throw(FieldError(T::DataType, s))
+@noinline throw_const_field_error(T::Symbol, s::Symbol) =
+    error("setfield!: const field .", s, " of type ", T, " cannot be changed")
 @noinline throw_rethrow_error() = error("rethrow() not allowed outside a catch block")
 @noinline throw_rethrow_other_error() = error("rethrow(exc) not allowed outside a catch block")
 @noinline throw_not_cfunction() = error("a ccall through a pointer that is not a cfunction of the call's signature")
