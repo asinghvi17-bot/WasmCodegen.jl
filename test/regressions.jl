@@ -310,6 +310,16 @@ rg_ntoh64(x::Float64) = reinterpret(UInt64, ntoh(x))
 # (from the bits, for the NaNs whose payloads a Float32 argument may not carry in)
 rg_bswap32_bits(u::UInt32) = reinterpret(UInt32, bswap(reinterpret(Float32, u)))
 rg_bswap64_bits(u::UInt64) = reinterpret(UInt64, bswap(reinterpret(Float64, u)))
+rg_bswap16(x::Float16) = reinterpret(UInt16, bswap(x))
+rg_hton16(x::Float16) = reinterpret(UInt16, hton(x))
+rg_ntoh16(x::Float16) = reinterpret(UInt16, ntoh(x))
+rg_bswap16_bits(u::UInt16) = reinterpret(UInt16, bswap(reinterpret(Float16, u)))
+# twice: the bits of the argument
+rg_bswap2_16(u::UInt16) = reinterpret(UInt16, bswap(bswap(reinterpret(Float16, u))))
+rg_bswap2_32(u::UInt32) = reinterpret(UInt32, bswap(bswap(reinterpret(Float32, u))))
+rg_bswap2_64(u::UInt64) = reinterpret(UInt64, bswap(bswap(reinterpret(Float64, u))))
+# the parts of a complex number are swapped each
+rg_bswap_c32(re::Float32, im::Float32) = (z = bswap(complex(re, im)); (reinterpret(UInt32, real(z)), reinterpret(UInt32, imag(z))))
 @testset "regressions" begin
     @wtest rg_unionfield(true, true)
     @wtest rg_unionfield(false, false)
@@ -417,4 +427,24 @@ rg_bswap64_bits(u::UInt64) = reinterpret(UInt64, bswap(reinterpret(Float64, u)))
     for u in (0x7ff8000000000001, 0xfff4123456789abc, 0x7ff0000000000001)
         @wtest rg_bswap64_bits(u)
     end
+    # Float16 (not Float32 with a rounding): normals, subnormals, zeros, infinities and NaNs, by their bits
+    for x in (Float16(1.5), Float16(-2e-3), Float16(123.4), Float16(0), -Float16(0), reinterpret(Float16, 0x0001),
+              reinterpret(Float16, 0x83ff), Inf16, -Inf16, NaN16)
+        @wtest rg_bswap16(x); @wtest rg_hton16(x); @wtest rg_ntoh16(x)
+    end
+    for u in (0x7e01, 0xfd23, 0x7c01)
+        @wtest rg_bswap16_bits(u)
+    end
+    # and swapped back
+    for u in (0x3e00, 0x7e01, 0x8001, 0xfc00)
+        @wtest rg_bswap2_16(u); @test rg_bswap2_16(u) === u
+    end
+    for u in (0x3fc00000, 0x7fa12345, 0x80000001)
+        @wtest rg_bswap2_32(u); @test rg_bswap2_32(u) === u
+    end
+    for u in (0x3ff8000000000000, 0x7ff4123456789abc, 0x8000000000000001)
+        @wtest rg_bswap2_64(u); @test rg_bswap2_64(u) === u
+    end
+    @wtest rg_bswap_c32(1.5f0, -2f-3)
+    @wtest rg_bswap_c32(-0f0, Inf32)
 end
