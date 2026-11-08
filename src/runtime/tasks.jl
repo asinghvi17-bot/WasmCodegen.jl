@@ -843,38 +843,72 @@ set_next_task_wasm(t::Task) = (NEXT[] = t; nothing)
 @wasm_method sync_end(c::Channel{Any}) = sync_end_wasm(c)
 
 """
-    asyncmap_typed(f, ntasks, c...)
+    asyncmap_typed(f, ntasks, batch_size, c...)
 
-`asyncmap(f, c...; ntasks)` without `batch_size` (`Base.async_usemap`), as Base's: `ntasks`
-worker tasks take the arguments from an unbuffered channel, the first failure of a worker
-(a `CapturedException`) or of the driver is thrown once all workers are done, and the results
-are in the shape Base's `asyncmap` gives (`map(f, c...)`'s on Julia 1.12, whose `async_usemap`
-this replaces; `Base._asyncmap_result`'s on 1.13, whose `asyncmap` over an `AsyncCollector`
-this replaces: arrays keep their axes, tuples stay tuples). But typed: Base's collects the results from `Ref{Any}`s
-with a `map` of unknown element type, fetches workers of a `Vector{Any}` and splats channel
-items of type `Any` (dynamic calls, not trim-safe). Here the channel's items are of the
-arguments' types, the results' type is the one inferred for `f` (`Base.promote_op`), which
-is native's element type when it is concrete (natively, `map` narrows the type to the
+`asyncmap(f, c...; ntasks, batch_size)` (`Base.async_usemap` on Julia 1.12, `Base.asyncmap` on
+1.13), as Base's: `ntasks` worker tasks take the arguments from an unbuffered channel (with a
+`batch_size`, up to that many at a time, `f` of a vector of argument tuples returning the
+batch's results), the first failure of a worker (a `CapturedException`) or of the driver is
+thrown once all workers are done, and the results are in the shape Base's `asyncmap` gives
+(`map(f, c...)`'s on 1.12: arrays keep their axes, tuples stay tuples, several tuples too;
+`Base._asyncmap_result`'s on 1.13: arrays keep their axes, a tuple stays a tuple, several are
+zipped into a vector). An input empty by its type (`()`, element type `Union{}`) gives what
+Base's does: `()` of a tuple, else empty of element type `Union{}` on 1.12 (`map`'s inference),
+`Any` on 1.13. An empty array gives Base's shape, of the inferred element type (Base's is `Any`:
+a result of type `Vector{Any}` when empty would make every caller's code of the result dynamic).
+But typed: Base's collects the results from `Ref{Any}`s with a `map` of unknown element
+type, fetches workers of a `Vector{Any}` and splats channel items of type `Any` (dynamic calls,
+not trim-safe). Here the channel's items are of the arguments' types, the results' type is the
+one inferred for `f` (`Base.promote_op`; with a `batch_size`, the element type of `f`'s result),
+which is native's element type when it is concrete (natively, `map` narrows the type to the
 results'; here an abstract inferred type stays as it is), and a worker's failure is captured
-without its backtrace, which the module has not.
+without its backtrace, which the module has not. (With a `batch_size` and an `ntasks` function,
+the workers started later take batches too: 1.12's call `f` of each argument tuple, and fail.)
 """
-function asyncmap_typed(f::F, ntasks, c...) where {F}
-    R = Base.promote_op(f, map(eltype, c)...)
-    A = Tuple{map(eltype, c)...}
-    chnl = Channel{Tuple{Base.RefValue{Any},A}}(0)
+function asyncmap_typed(f::F, ntasks, batch_size, c...) where {F}
+    # (an input of element type `Union{}` has no elements, nor a tuple type of arguments)
+    asyncmap_bottom(c...) && return asyncmap_bottom_result(c...)
+    exec = asyncmap_exec(f, batch_size, c...)
+    refs = asyncmap_run(exec, ntasks, asyncmap_drive, c...)
+    return asyncmap_result(refs, asyncmap_eltype(exec), c...)
+end
+
+"""
+    asyncmap_typed!(f, r, ntasks, batch_size, c...)
+
+`asyncmap!(f, r, c...; ntasks, batch_size)`, as Base's (over an `AsyncCollector`, whose
+fields are untyped): `r[i] = f(args...)` for the `i`th arguments of `zip(c...)`, by
+`asyncmap_typed`'s workers, the results stored once all are done. Base's `asyncmap` of a
+string is this one's. (With a `batch_size`, 1.12's `AsyncCollector` calls `f` of each argument
+tuple, and fails; 1.13's, and this one, of a batch.)
+"""
+function asyncmap_typed!(f::F, r, ntasks, batch_size, c...) where {F}
+    asyncmap_bottom(c...) && return r
+    exec = asyncmap_exec(f, batch_size, c...)
+    refs = asyncmap_run(exec, ntasks, asyncmap_zip_drive, c...)
+    R = asyncmap_eltype(exec)
+    for (i, ref) in enumerate(refs)
+        r[i] = ref.x::R
+    end
+    return r
+end
+
+"The workers of `exec` and the driver `drive` over `c`: the results' `Ref`s."
+function asyncmap_run(exec::E, ntasks, drive::D, c...) where {E,D}
+    T = Tuple{Base.RefValue{Any},asyncmap_argtype(exec)}
+    chnl = Channel{T}(0)
     worker_tasks = Task[]
-    exec = AsyncmapExec{F,A}(f)
     nt = ntasks isa Function ? (n = ntasks()::Int; n == 0 ? 1 : n) : ntasks::Int
     for _ in 1:nt
         push!(worker_tasks, asyncmap_worker(exec, chnl))
     end
     yield()
-    push_arg = AsyncmapPush{Tuple{Base.RefValue{Any},A}}(chnl)
+    push_arg = AsyncmapPush{T}(chnl)
     refs, asyncrun_excp = if ntasks isa Function
         # (as Base's: a worker more whenever `ntasks()` asks for one)
-        asyncmap_drive(AsyncmapGrow(push_arg, exec, worker_tasks, ntasks), c...)
+        drive(AsyncmapGrow(push_arg, exec, worker_tasks, ntasks), c...)
     else
-        asyncmap_drive(push_arg, c...)
+        drive(push_arg, c...)
     end
     Base.close(chnl)
     for t in worker_tasks
@@ -883,31 +917,43 @@ function asyncmap_typed(f::F, ntasks, c...) where {F}
     end
     asyncrun_excp === nothing || throw(asyncrun_excp)
     refs === nothing && error("asyncmap: no results") # (never: no exception, so the first run's)
-    return asyncmap_result(refs, R, c...)
+    return refs
+end
+
+# Base 1.13 (`asyncmap` over an `AsyncCollector`, asyncmap.jl:76-93, `AsyncCollector` 195-300),
+# and `asyncmap!` on both: the arguments to the workers in the order of `zip(c...)`, a `Ref`
+# for each result, or the `InvalidStateException` of a channel a failing worker closed
+function asyncmap_zip_drive(map_f::M, c...) where {M}
+    refs = Base.RefValue{Any}[]
+    try
+        for args in zip(c...)
+            push!(refs, map_f(args...))
+        end
+    catch ex
+        ex isa InvalidStateException || rethrow()
+        return (nothing, ex::InvalidStateException)
+    end
+    return (refs, nothing)
 end
 
 @static if VERSION >= v"1.13-"
-    # Base 1.13 (`asyncmap` over an `AsyncCollector`, asyncmap.jl:76-93, `AsyncCollector` 195-300): the arguments
-    # to the workers in the order of `zip(c...)`, a `Ref` for each result; the results then are
-    # shaped by Base's own `_asyncmap_result(results, src)` (asyncmap.jl:96-100)
-    function asyncmap_drive(map_f::M, c...) where {M}
-        refs = Base.RefValue{Any}[]
-        try
-            for args in zip(c...)
-                push!(refs, map_f(args...))
-            end
-        catch ex
-            ex isa InvalidStateException || rethrow()
-            return (nothing, ex::InvalidStateException)
-        end
-        return (refs, nothing)
-    end
+    # the results then are shaped by Base's own `_asyncmap_result(results, src)` (asyncmap.jl:96-100)
+    asyncmap_drive(map_f::M, c...) where {M} = asyncmap_zip_drive(map_f, c...)
     function asyncmap_result(refs::Vector{Base.RefValue{Any}}, ::Type{R}, c...) where {R}
         src = isone(length(c)) ? c[1] : zip(c...)
         v = R[ref.x::R for ref in refs]
         # (Base's `Tuple(map(identity, v))` has a length the compiler does not know)
         src isa Tuple && !Base.isvatuple(typeof(src)) && return ntuple(i -> v[i], Val(fieldcount(typeof(src))))
         return Base._asyncmap_result(v, src)
+    end
+    # Base's `_asyncmap_result` of an empty `Vector{Any}`, whose `collect`s of unknown element
+    # type are dynamic: `()` of a tuple, else empty of element type `Any`, an array's axes
+    function asyncmap_bottom_result(c...)
+        src = isone(length(c)) ? c[1] : zip(c...)
+        src isa Tuple && return ()
+        src isa AbstractArray && return similar(src, Any)
+        Base.IteratorSize(src) isa Base.HasShape && return similar(Array{Any}, axes(src))
+        return Any[]
     end
 else
     # Base 1.12 (`async_usemap` and `maptwice`, asyncmap.jl:80 and `maptwice` 152): `map(f, c...)`
@@ -928,6 +974,9 @@ else
         # (the axes of `refs`, as `map`'s)
         return R[ref.x::R for ref in refs]
     end
+    # (Base's maps of an element type `Union{}`, whose results are the inferred `Union{}`)
+    asyncmap_bottom_result(c...) = map(asyncmap_unreachable, c...)
+    asyncmap_unreachable(x...) = error("asyncmap: an element of type Union{}")
 end
 
 struct AsyncmapGrow{P,E,N}
@@ -946,6 +995,22 @@ struct AsyncmapExec{F,A}
 end
 (e::AsyncmapExec{F,A})(r::Base.RefValue{Any}, args::A) where {F,A} = (r.x = e.f(args...); nothing)
 
+struct AsyncmapBatch{F,A}
+    f::F
+    batch_size::Int
+end
+
+asyncmap_argtype(::AsyncmapExec{F,A}) where {F,A} = A
+asyncmap_argtype(::AsyncmapBatch{F,A}) where {F,A} = A
+
+asyncmap_bottom() = false
+asyncmap_bottom(x, c...) = eltype(x) === Union{} || asyncmap_bottom(c...)
+
+asyncmap_exec(f::F, ::Nothing, c...) where {F} = AsyncmapExec{F,Tuple{map(eltype, c)...}}(f)
+asyncmap_exec(f::F, batch_size::Int, c...) where {F} = AsyncmapBatch{F,Tuple{map(eltype, c)...}}(f, batch_size)
+asyncmap_eltype(e::AsyncmapExec{F,A}) where {F,A} = Base._return_type(e.f, A)
+asyncmap_eltype(e::AsyncmapBatch{F,A}) where {F,A} = eltype(Base._return_type(e.f, Tuple{Vector{A}}))
+
 struct AsyncmapPush{T}
     chnl::Channel{T}
 end
@@ -955,14 +1020,33 @@ function asyncmap_worker(exec::E, chnl::Channel{T}) where {E,T}
     return @async begin
         retval::Union{Nothing,CapturedException} = nothing
         try
-            for (r, args) in chnl
-                exec(r, args)
-            end
+            asyncmap_work(exec, chnl)
         catch e
             Base.close(chnl)
             retval = e isa CapturedException ? e : CapturedException(e, Any[])
         end
         retval
+    end
+end
+
+function asyncmap_work(exec::AsyncmapExec, chnl::Channel)
+    for (r, args) in chnl
+        exec(r, args)
+    end
+end
+# (Base's, asyncmap.jl:212-223 on 1.12: up to `batch_size` items, while the channel is open)
+function asyncmap_work(exec::AsyncmapBatch{F,A}, chnl::Channel{T}) where {F,A,T}
+    while isopen(chnl)
+        batch = T[]
+        for item in chnl
+            push!(batch, item)
+            length(batch) == exec.batch_size && break
+        end
+        isempty(batch) && continue
+        results = exec.f(A[item[2] for item in batch])
+        for (j, v) in enumerate(results)
+            batch[j][1].x = v
+        end
     end
 end
 

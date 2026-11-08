@@ -31,49 +31,19 @@ let T = WasmCodegen.Runtime.Tasks
     @eval WasmCodegen.Runtime.Host sleep_ms(ms::UInt64) = $(T.sleep_ms)(ms)
     # (a constant of the compilation, for packages: the module has tasks)
     @eval WasmCodegen.Runtime.Tasks enabled() = true
-    # `asyncmap` without `batch_size`: typed (Base's collects its results from `Ref{Any}`s, or
-    # from a `Vector{Any}` and an `AsyncCollector` of untyped fields); with one, Base's own.
-    # Which function that is depends on Base: 1.12's `async_usemap` (asyncmap.jl:80), which
-    # `asyncmap` calls; 1.13 has none, its `asyncmap` (asyncmap.jl:76) itself runs the
-    # `AsyncCollector`
+    # `asyncmap` and `asyncmap!`: typed (Base's collect their results from `Ref{Any}`s, or from
+    # a `Vector{Any}` and an `AsyncCollector` of untyped fields; with a `batch_size`, from
+    # `Vector{Any}` batches). Which function runs the workers depends on Base: 1.12's
+    # `async_usemap` (asyncmap.jl:80), which `asyncmap` calls, and that of a `BitArray`; 1.13
+    # has none, its `asyncmap` (asyncmap.jl:76) itself runs the `AsyncCollector`. `asyncmap!`
+    # is that of a string, on both
     @static if VERSION >= v"1.13-"
-        @eval Base function asyncmap(f, c...; ntasks=0, batch_size=nothing)
-            batch_size = verify_batch_size(batch_size)
-            batch_size === nothing &&
-                return $(T.asyncmap_typed)(f, verify_ntasks(enumerate(zip(c...)), ntasks), c...)
-            # (Base's, asyncmap.jl:77-93)
-            src = isone(length(c)) ? c[1] : zip(c...)
-            if haslength(src)
-                n = length(src)
-                results = Vector{Any}(undef, n)
-            else
-                results = Dict{Int,Any}()
-            end
-            foreach(identity, AsyncCollector(f, results, c...; ntasks=ntasks, batch_size=batch_size))
-            if results isa Dict
-                v = Any[results[i] for i in 1:length(results)]
-            else
-                v = results
-            end
-            return _asyncmap_result(v, src)
-        end
+        @eval Base asyncmap(f, c...; ntasks=0, batch_size=nothing) =
+            $(T.asyncmap_typed)(f, verify_ntasks(enumerate(zip(c...)), ntasks), verify_batch_size(batch_size), c...)
     else
-        @eval Base function async_usemap(f, c...; ntasks=0, batch_size=nothing)
-            ntasks = verify_ntasks(c[1], ntasks)
-            batch_size = verify_batch_size(batch_size)
-            batch_size === nothing && return $(T.asyncmap_typed)(f, ntasks, c...)
-            exec_func = batch -> begin
-                # extract the Refs from the input tuple
-                batch_refs = map(x->x[1], batch)
-
-                # and the args tuple....
-                batched_args = map(x->x[2], batch)
-
-                results = f(batched_args)
-                foreach(x -> (batch_refs[x[1]].x = x[2]), enumerate(results))
-            end
-            chnl, worker_tasks = setup_chnl_and_tasks(exec_func, ntasks, batch_size)
-            return wrap_n_exec_twice(chnl, worker_tasks, ntasks, exec_func, c...)
-        end
+        @eval Base async_usemap(f, c...; ntasks=0, batch_size=nothing) =
+            $(T.asyncmap_typed)(f, verify_ntasks(c[1], ntasks), verify_batch_size(batch_size), c...)
     end
+    @eval Base asyncmap!(f, r, c1, c...; ntasks=0, batch_size=nothing) =
+        $(T.asyncmap_typed!)(f, r, verify_ntasks(enumerate(zip(c1, c...)), ntasks), verify_batch_size(batch_size), c1, c...)
 end
