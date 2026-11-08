@@ -287,7 +287,10 @@ elements between bytes and wider elements (`Float32`s; arrays of two element sto
 two arrays, so only copies within one storage may overlap and are ordered), and byte by
 byte through the two helpers only for other owners. `memset` without origin is a byte
 loop in the runtime (`Runtime.ptr_memset`). An owner whose bytes are not addressable (a
-memory of references) traps.
+memory of references) traps. Copies between arrays and dense arrays reinterpreted
+(`collect(reinterpret(UInt8, img))`), which Base makes element by element through `Ref`s
+and pointers, are one `memmove` of their bytes when neither element type has padding
+(`trim/wasm-base.jl`; a reinterpreted `Array` has all its parent's bytes, from its first).
 
 ## 6. The image: serializing objects
 
