@@ -76,7 +76,7 @@ include("types_runtime.jl")
 include("patches.jl")
 include("driver.jl")
 
-export compile, Entry, Config, UnsupportedConstructs
+export compile, Entry, Config, UnsupportedConstructs, install_trim_patches!
 
 function __init__()
     COMPILER_WORLD[] = Base.get_world_counter()
