@@ -1,4 +1,21 @@
 add1(x::Int) = x + 1
+# byte swaps: of the integers, and of the floats (`ntoh` of what is read from a big-endian stream, as MsgPack's
+# unpack does), which are the swap of the integer of their size
+swaps(a::UInt16, b::UInt32, c::UInt64, d::Int32) = (bswap(a), bswap(b), bswap(c), bswap(d), bswap(UInt128(c) << 64 | b))
+swapf32(x::Float32) = ntoh(x)
+swapf64(x::Float64) = hton(x)
+swapf16(x::Float16) = bswap(x)
+# a float read from a message of the big-endian formats, in a Union
+function msg_number(tag::UInt8, payload::UInt64)
+    bytes = UInt8[tag]
+    for i in 7:-1:0
+        push!(bytes, (payload >> 8i) % UInt8)
+    end
+    io = IOBuffer(bytes)
+    b = read(io, UInt8)
+    x = b == 0xca ? ntoh(read(io, Float32)) : b == 0xcb ? ntoh(read(io, Float64)) : Int(b)
+    return x isa Float32 ? Float64(x) + 1 : x isa Float64 ? x * 2 : Float64(x)
+end
 fmuladd(a::Float64, b::Float64, c::Float64) = a * b + c
 function loopsum(n::Int)
     s = 0.0
@@ -36,6 +53,18 @@ divs(a::Int, b::Int) = (div(a, b), rem(a, b))
     @wtest cmpf(NaN, NaN)
     @wtest divs(-7, 2)
     @wtest divs(1, 0)
+    @wtest swaps(0x1234, 0x12345678, 0x0123456789abcdef, Int32(-2))
+    for x in (1.5f0, -0.1f0, Inf32, NaN32, reinterpret(Float32, 0x7fc00001))
+        @wtest swapf32(x)
+    end
+    for x in (1.5, -0.1, -Inf, reinterpret(Float64, 0x7ff8000000000001))
+        @wtest swapf64(x)
+    end
+    @wtest swapf16(Float16(1.5))
+    @wtest swapf16(reinterpret(Float16, 0x1234))
+    @wtest msg_number(0xca, 0x3fc0000000000000)
+    @wtest msg_number(0xcb, 0x400921fb54442d18)
+    @wtest msg_number(0x07, 0x0000000000000000)
 end
 
 i128ops(a::Int64, b::Int64) = (x = Int128(a) * Int128(b) * 1000; (x + 1, x - 7, x * 3, x ÷ 7, x % 7, x < 0, x >> 70, x << 3, leading_zeros(x), Int64(x >> 64)))

@@ -110,7 +110,7 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         r = emit_intrinsic128!(fc, f, args, typ)
         r === nothing || return r
     end
-    if f !== II.bitcast && !(f in NO_FOLD) && (any(a -> a.typ === Float16, args) || typ === Float16)
+    if f !== II.bitcast && f !== II.bswap_int && !(f in NO_FOLD) && (any(a -> a.typ === Float16, args) || typ === Float16)
         return emit_float16!(fc, f, args, typ)
     end
     if haskey(INT_BINOPS, f)
@@ -385,6 +385,11 @@ function emit_bswap!(fc::FnCtx, x::CGVal)
     n = nbits(T)
     n <= 8 && return x
     t = prim_wtype(fc, T)
+    if t === F32 || t === F64
+        # (`ntoh`/`hton` of a float, as MsgPack reads one: the bytes of the integer of its size)
+        U = t === F32 ? UInt32 : UInt64
+        return emit_bitcast!(fc, T, emit_bswap!(fc, emit_bitcast!(fc, U, x)))
+    end
     acc = new_local!(fc, t)
     emit!(fc.b, wop(t, "const"), 0)
     emit!(fc.b, :local_set, acc)
