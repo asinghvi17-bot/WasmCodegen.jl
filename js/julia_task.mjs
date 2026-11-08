@@ -55,7 +55,7 @@
 // abandoned tasks do not run: host handles they held stay open until the embedder releases
 // the `julia_io` adapter.
 
-import { macrotask } from './macrotask.mjs';
+import { macrotask, cancelMacrotask } from './macrotask.mjs';
 
 export const JULIA_TASK_VERSION = 1;
 export const MAX_TASK_ID = 65535;
@@ -77,6 +77,7 @@ export function makeJuliaTask(opts = {}) {
   let terminal = null;       // why the instance is terminal (an Error), or null
   let deadlocked = false;    // no task can run any more (the root call stays in flight)
   let keeper = null;         // the interval that keeps Node alive after a deadlock
+  const macrotasks = new Set(); // the macrotasks this instance has queued and that have not run
   const st = { roots: 0, switches: 0, starts: 0, exits: 0, handoffs: 0, maxParked: 0, maxLive: 0 };
 
   // A failure: the root call in flight fails with it; the instance becomes terminal.
@@ -94,6 +95,10 @@ export function makeJuliaTask(opts = {}) {
     live.clear();
     current = -1;
     if (keeper) { clearInterval(keeper); keeper = null; }
+    // (the macrotasks queued do not run: in a browser, they would stay in macrotask.mjs's queue
+    // until their messages arrive)
+    for (const t of macrotasks) cancelMacrotask(t);
+    macrotasks.clear();
     // (a stack suspended in julia_io's poll must not resume either)
     if (events) events.stop();
   }
@@ -101,10 +106,15 @@ export function makeJuliaTask(opts = {}) {
   // about to), in one slot, run by one function (no allocation per switch)
   let pending = null;
   const runPending = () => { const f = pending; pending = null; if (f) f(); };
+  // `fn` in a later turn of the event loop, unless the instance ends first
+  function later(fn) {
+    const t = macrotask(() => { macrotasks.delete(t); fn(); });
+    macrotasks.add(t);
+  }
   function defer(fn, turn) {
     if (pending) { fail(new JuliaTaskError('julia_task: two transfers pending (internal error)')); return; }
     pending = fn;
-    if (turn) { st.handoffs++; macrotask(runPending); } else queueMicrotask(runPending);
+    if (turn) { st.handoffs++; later(runPending); } else queueMicrotask(runPending);
   }
   const invalid = (msg) => new JuliaTaskError(`julia_task: invalid transfer: ${msg}`);
   // Pass the thread from `from` (which suspends or ends) to `to`; false after a failure.
@@ -119,7 +129,7 @@ export function makeJuliaTask(opts = {}) {
       current = -1;
       deadlocked = true;
       if (keepAlive && !keeper) keeper = setInterval(() => {}, 1 << 30);
-      macrotask(() => { if (!terminal) onDeadlock(); });
+      later(() => { if (!terminal) onDeadlock(); });
       return true;
     }
     const r = parked.get(to);

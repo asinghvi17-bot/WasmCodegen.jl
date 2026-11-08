@@ -24,6 +24,11 @@ function post(fn) {
 /** Run `fn` in a later turn of the event loop; returns what `cancelMacrotask` takes. */
 export const macrotask = typeof globalThis.setImmediate === 'function' ? (fn) => globalThis.setImmediate(fn) : post;
 
-/** Cancel a macrotask that has not run. */
+/**
+ * Cancel a macrotask that has not run. (There is no reset of the whole queue: the module is
+ * shared by every `julia_io` and `julia_task` instance of the page, and a message that arrives
+ * removes its entry, so the queue is empty again as soon as the messages have been delivered.
+ * An instance that ends cancels the macrotasks it queued.)
+ */
 export const cancelMacrotask = typeof globalThis.clearImmediate === 'function'
   ? (t) => globalThis.clearImmediate(t) : (id) => { queued.delete(id); };

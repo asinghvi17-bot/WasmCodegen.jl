@@ -848,7 +848,9 @@ set_next_task_wasm(t::Task) = (NEXT[] = t; nothing)
 `asyncmap(f, c...; ntasks)` without `batch_size` (`Base.async_usemap`), as Base's: `ntasks`
 worker tasks take the arguments from an unbuffered channel, the first failure of a worker
 (a `CapturedException`) or of the driver is thrown once all workers are done, and the results
-are in the shape of `map(f, c...)`. But typed: Base's collects the results from `Ref{Any}`s
+are in the shape Base's `asyncmap` gives (`map(f, c...)`'s on Julia 1.12, whose `async_usemap`
+this replaces; `Base._asyncmap_result`'s on 1.13, whose `asyncmap` over an `AsyncCollector`
+this replaces: arrays keep their axes, tuples stay tuples). But typed: Base's collects the results from `Ref{Any}`s
 with a `map` of unknown element type, fetches workers of a `Vector{Any}` and splats channel
 items of type `Any` (dynamic calls, not trim-safe). Here the channel's items are of the
 arguments' types, the results' type is the one inferred for `f` (`Base.promote_op`), which
@@ -868,7 +870,7 @@ function asyncmap_typed(f::F, ntasks, c...) where {F}
     end
     yield()
     push_arg = AsyncmapPush{Tuple{Base.RefValue{Any},A}}(chnl)
-    asyncrun, asyncrun_excp = if ntasks isa Function
+    refs, asyncrun_excp = if ntasks isa Function
         # (as Base's: a worker more whenever `ntasks()` asks for one)
         asyncmap_drive(AsyncmapGrow(push_arg, exec, worker_tasks, ntasks), c...)
     else
@@ -880,19 +882,51 @@ function asyncmap_typed(f::F, ntasks, c...) where {F}
         v === nothing || throw(v)
     end
     asyncrun_excp === nothing || throw(asyncrun_excp)
-    asyncrun === nothing && error("asyncmap: no results") # (never: no exception, so the first run's)
-    asyncrun isa Base.RefValue{Any} && return asyncrun.x::R
-    return R[ref.x::R for ref in asyncrun]
+    refs === nothing && error("asyncmap: no results") # (never: no exception, so the first run's)
+    return asyncmap_result(refs, R, c...)
 end
 
-# the first run: the arguments to the workers, a `Ref` for each result (in `map`'s shape), or
-# the `InvalidStateException` of a channel a failing worker closed
-function asyncmap_drive(map_f::M, c...) where {M}
-    try
-        return (map(map_f, c...), nothing)
-    catch ex
-        ex isa InvalidStateException || rethrow()
-        return (nothing, ex::InvalidStateException)
+@static if VERSION >= v"1.13-"
+    # Base 1.13 (`asyncmap` over an `AsyncCollector`, asyncmap.jl:76-93, `AsyncCollector` 195-300): the arguments
+    # to the workers in the order of `zip(c...)`, a `Ref` for each result; the results then are
+    # shaped by Base's own `_asyncmap_result(results, src)` (asyncmap.jl:96-100)
+    function asyncmap_drive(map_f::M, c...) where {M}
+        refs = Base.RefValue{Any}[]
+        try
+            for args in zip(c...)
+                push!(refs, map_f(args...))
+            end
+        catch ex
+            ex isa InvalidStateException || rethrow()
+            return (nothing, ex::InvalidStateException)
+        end
+        return (refs, nothing)
+    end
+    function asyncmap_result(refs::Vector{Base.RefValue{Any}}, ::Type{R}, c...) where {R}
+        src = isone(length(c)) ? c[1] : zip(c...)
+        v = R[ref.x::R for ref in refs]
+        # (Base's `Tuple(map(identity, v))` has a length the compiler does not know)
+        src isa Tuple && !Base.isvatuple(typeof(src)) && return ntuple(i -> v[i], Val(fieldcount(typeof(src))))
+        return Base._asyncmap_result(v, src)
+    end
+else
+    # Base 1.12 (`async_usemap` and `maptwice`, asyncmap.jl:80 and `maptwice` 152): `map(f, c...)`
+    # with a `Ref` for each result, or the `InvalidStateException` of a channel a failing worker
+    # closed; then `map(ref -> ref.x, refs)`
+    function asyncmap_drive(map_f::M, c...) where {M}
+        try
+            return (map(map_f, c...), nothing)
+        catch ex
+            ex isa InvalidStateException || rethrow()
+            return (nothing, ex::InvalidStateException)
+        end
+    end
+    function asyncmap_result(refs, ::Type{R}, c...) where {R}
+        refs isa Base.RefValue{Any} && return refs.x::R
+        # (a tuple stays a tuple)
+        refs isa Tuple && return map(ref -> ref.x::R, refs)
+        # (the axes of `refs`, as `map`'s)
+        return R[ref.x::R for ref in refs]
     end
 end
 

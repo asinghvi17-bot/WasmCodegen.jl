@@ -128,6 +128,15 @@ end
     end
 end
 
+@testset "macrotask without setImmediate (js/macrotask.mjs)" begin
+    out = read(`$(node_cmd()) --disable-warning=ExperimentalWarning $(joinpath(@__DIR__, "macrotask.mjs"))`, String)
+    ls = split(chomp(out), '\n')
+    @test length(ls) == 4
+    for l in ls
+        @test endswith(l, ": true")
+    end
+end
+
 @testset "Config(tasks)" begin
     # without tasks, a module imports and exports nothing of them
     c = WasmCodegen.compile([Entry(+, (Int, Int))])
