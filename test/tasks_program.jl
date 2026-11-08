@@ -562,6 +562,28 @@ function monitor_own()
     println(Core.stdout, "own error monitored ", istaskfailed(t))
 end
 
+struct MapError <: Exception
+    i::Int
+end
+
+# asyncmap (without batch_size): the results in order, in `map`'s shape, of the inferred type;
+# a worker's failure, captured
+function asyncmaps()
+    r = asyncmap(i -> (sleep(0.001 * (6 - i)); i * i), 1:5)
+    println(Core.stdout, "asyncmap ", r, " ", eltype(r))
+    r2 = asyncmap((a, b) -> string(a, b), [1, 2, 3], ["x", "y", "z"]; ntasks=2)
+    println(Core.stdout, "asyncmap two ", r2)
+    m = asyncmap(x -> x + 0.5, [1 2; 3 4])
+    println(Core.stdout, "asyncmap shape ", size(m), " ", m[2, 1])
+    try
+        asyncmap(i -> i == 3 ? throw(MapError(i)) : i, 1:4)
+        println(Core.stdout, "asyncmap no error")
+    catch e
+        x = e isa CapturedException ? (e::CapturedException).ex : nothing
+        println(Core.stdout, "asyncmap ", x isa MapError ? string("CapturedException of MapError ", x.i) : "other error")
+    end
+end
+
 function main()::Int32
     root_state()
     producer_consumer()
@@ -595,6 +617,7 @@ function main()::Int32
     many_timers()
     sync_typed_channel()
     sync_own_wait()
+    asyncmaps()
     println(Core.stdout, "done")
     return Int32(0)
 end
@@ -673,6 +696,28 @@ function shared_handle()::Int32
     end
     return Int32(0)
 end
+
+# a wait for a handle the embedder makes ready (julia_io's external handles: `h`, ready after
+# a while): only this task waits, the other one runs meanwhile; the count of its turns
+function external_wait(h::Int32)::Int64
+    n = Ref(0)
+    done = Ref(false)
+    t = @async while !done[]
+        n[] += 1
+        yield()
+    end
+    try
+        H.await_handle(h)
+    finally
+        done[] = true
+        H.close(h)
+    end
+    wait(t)
+    return n[]
+end
+
+"Whether the module has tasks (`Runtime.Tasks.enabled()`, a constant of the compilation)."
+tasks_enabled()::Int32 = WasmCodegen.Runtime.Tasks.enabled() ? Int32(1) : Int32(0)
 
 # returns while a task waits forever: the host keeps it parked (the next root call may run)
 function early_return()::Int32

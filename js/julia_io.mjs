@@ -68,9 +68,37 @@
 //
 // **Readiness** is level-triggered: a timer is ready from when it fires (or is cancelled)
 // until it is closed. Callers close every handle (in `finally` blocks).
+//
+// **External handles** (the embedder's API, not imports): a host library of the embedder that
+// starts work for the module without suspending it (an HTTP request, say) hands the module a
+// handle of this interface for it, so that the module waits for it as for a timer: `poll`, and
+// with `Config(tasks = :jspi)` a wait of the Julia task alone (`Runtime.Tasks.await_handle`),
+// while the other tasks run; the stack suspends only when every task waits.
+//
+//   const h = events.external({ onClose, onCancel });   // a handle, pending
+//   ...                                                  // (the library returns h to the module)
+//   events.ready(h);                                     // the work is done: ready, a poll wakes
+//
+// `external()` returns a new handle that is not ready; `ready(h, message?)` makes it ready
+// (once; `message` for `errmsg`) and wakes a suspended `poll` waiting for it: `false` if the
+// handle is closed or unknown (the module gave up: drop the result). The module's `close(h)`
+// calls `onClose(h)` (abort the work, release its result); its `cancel(h)` makes the handle
+// ready, cancelled, and calls `onCancel(h)`. `stop()` calls the `onClose` of the external
+// handles still open. How the module gets the work's result is the library's business (its
+// own import, called after the wait). `polling()` is whether a `poll` is suspended: a call into
+// the module, or a host call of it, then is a re-entry (the page called the module again).
 
-import fs from 'node:fs';
-import path from 'node:path';
+import { macrotask, cancelMacrotask } from './macrotask.mjs';
+
+// node:fs and node:path, for the paths only (loaded when a factory of them is called): the events
+// load in browsers too
+let fs = null, path = null;
+function nodeModules() {
+  if (fs) return;
+  const get = globalThis.process?.getBuiltinModule;
+  if (typeof get !== 'function') throw new Error('julia_io: the paths need node:fs (Node 22.3+, Bun or Deno); the events do not');
+  fs = get('node:fs'); path = get('node:path');
+}
 
 export const JULIA_IO_VERSION = 1;
 
@@ -132,6 +160,7 @@ const components = (s) => s.split('/').filter((c) => c !== '');
 const MAX_LINKS = 40;
 
 export function makeResolve(preopens) {
+  nodeModules();
   // each preopen by its path and by its real path, as components
   const roots = preopens.map((p) => {
     if (typeof p !== 'string' || !path.isAbsolute(p)) throw new Error('julia_io: preopen must be an absolute path: ' + p);
@@ -244,6 +273,7 @@ function makeMemory(initial) {
 // The file modes and symbolic links: `path_mode`, `path_chmod`, `path_symlink`. Synchronous
 // (no JSPI). Options: `preopens` (WASI's), `memory` (or `bindMemory` later).
 export function makeJuliaIOPaths(opts = {}) {
+  nodeModules();
   const { readBytes, readPath, bindMemory } = makeMemory(opts.memory);
   const resolve = makeResolve(opts.preopens || []);
   let lastError = '';
@@ -374,6 +404,30 @@ export function makeJuliaIOEvents(opts = {}) {
   }
   const isPending = (x) => !x.fired;
 
+  // ---- external handles (the embedder's) ----
+  function external({ onClose, onCancel } = {}) {
+    if (stopped) throw new JuliaIOAssertion('external called after stop()');
+    // (pending until `ready`; its `deadline` is then when it became ready, for poll's order)
+    return newHandle({ kind: 'external', fired: false, cancelled: false, t: null, immediate: false,
+                       deadline: Infinity, errmsg: '', closed: false, onClose, onCancel });
+  }
+  function ready(h, message) {
+    const x = get(h);
+    if (!x || x.kind !== 'external') return false;
+    if (!x.fired) {
+      x.fired = true;
+      x.deadline = performance.now();
+      if (message) x.errmsg = String(message);
+      notify();
+    }
+    return true;
+  }
+  // (an embedder's callback: its exception is not the module's)
+  function callback(f, h) {
+    if (typeof f !== 'function') return;
+    try { f(h); } catch (e) { lastError = describe(e); }
+  }
+
   // ---- timers ----
   function timer_start(ns) {
     ns = BigInt.asIntN(64, BigInt(ns));
@@ -389,12 +443,12 @@ export function makeJuliaIOEvents(opts = {}) {
     const h = newHandle(x);
     // (first in the event loop's next turn, even when due: libuv runs a timer of 0 there, so
     // that `sleep(0)` lets the host's other events progress)
-    x.t = setImmediate(arm);
+    x.t = macrotask(arm);
     x.immediate = true;
     return h;
   }
   function disarm(x) {
-    if (x.t !== null) (x.immediate ? clearImmediate : clearTimeout)(x.t);
+    if (x.t !== null) (x.immediate ? cancelMacrotask : clearTimeout)(x.t);
     x.t = null;
   }
 
@@ -494,9 +548,10 @@ export function makeJuliaIOEvents(opts = {}) {
     const x = get(h);
     if (!x) return -E.BADF;
     if (!x.fired) {
-      disarm(x); x.fired = true; x.cancelled = true; x.errmsg = 'timer cancelled';
+      disarm(x); x.fired = true; x.cancelled = true; x.errmsg = x.kind === 'timer' ? 'timer cancelled' : 'cancelled';
       x.deadline = Math.min(x.deadline, performance.now());
       notify();
+      if (x.kind === 'external') callback(x.onCancel, h | 0);
     }
     return 0;
   }
@@ -509,6 +564,7 @@ export function makeJuliaIOEvents(opts = {}) {
     x.closed = true;
     handles.delete(h);
     notify();
+    if (x.kind === 'external') callback(x.onClose, h);
     return 0;
   }
 
@@ -523,12 +579,16 @@ export function makeJuliaIOEvents(opts = {}) {
   return {
     imports,
     bindMemory,
+    // the embedder's handles (see "External handles" above)
+    external,
+    ready,
+    polling: () => inPoll,
     // introspection, for tests and diagnostics
     stats() { return { open: handles.size, ...stats }; },
     handleState(h) {
       const x = get(h);
       if (!x) return null;
-      return { kind: 'timer', fired: x.fired, cancelled: x.cancelled, ready: isReady(x) };
+      return { kind: x.kind, fired: x.fired, cancelled: x.cancelled, ready: isReady(x) };
     },
     // The instance is done (it trapped, or its embedder shut it down: `julia_task.mjs` calls
     // this): a suspended `poll` never resumes its stack, the timers are released, and later
@@ -537,7 +597,10 @@ export function makeJuliaIOEvents(opts = {}) {
       stopped = true;
       waker = null;
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-      for (const x of handles.values()) disarm(x);
+      for (const x of handles.values()) {
+        disarm(x);
+        if (x.kind === 'external' && !x.closed) { x.closed = true; callback(x.onClose, x.id); }
+      }
     },
   };
 }

@@ -29,4 +29,25 @@ let T = WasmCodegen.Runtime.Tasks
     # the runtime's host waits as tasks' waits; `sleep` on a `Timer`, as Base's
     @eval WasmCodegen.Runtime.Host await_handle(h::Int32) = $(T.await)(h)
     @eval WasmCodegen.Runtime.Host sleep_ms(ms::UInt64) = $(T.sleep_ms)(ms)
+    # (a constant of the compilation, for packages: the module has tasks)
+    @eval WasmCodegen.Runtime.Tasks enabled() = true
+    # `asyncmap` without `batch_size`: typed (Base's collects its results from `Ref{Any}`s);
+    # with one, Base's own
+    @eval Base function async_usemap(f, c...; ntasks=0, batch_size=nothing)
+        ntasks = verify_ntasks(c[1], ntasks)
+        batch_size = verify_batch_size(batch_size)
+        batch_size === nothing && return $(T.asyncmap_typed)(f, ntasks, c...)
+        exec_func = batch -> begin
+            # extract the Refs from the input tuple
+            batch_refs = map(x->x[1], batch)
+
+            # and the args tuple....
+            batched_args = map(x->x[2], batch)
+
+            results = f(batched_args)
+            foreach(x -> (batch_refs[x[1]].x = x[2]), enumerate(results))
+        end
+        chnl, worker_tasks = setup_chnl_and_tasks(exec_func, ntasks, batch_size)
+        return wrap_n_exec_twice(chnl, worker_tasks, ntasks, exec_func, c...)
+    end
 end

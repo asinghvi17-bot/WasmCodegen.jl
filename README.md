@@ -135,7 +135,18 @@ For speed, keep the defaults: `wasm-opt -O3` and Node's own tiering. Node's
 Only V8 has been checked, through Node and workerd. No minimum browser version has been
 verified. The example pages' error message gives the versions that added WebAssembly GC
 (Chrome 119, Firefox 120, Safari 18.2), which is not all a module may use. Browser support
-for `exnref` and JSPI hasn't been tested here.
+for `exnref` and JSPI hasn't been tested here, but for one program: WasmHost.jl's e2e runs a
+`tasks = :jspi` module (Julia tasks doing HTTP requests) on `js/julia_task.mjs` and
+`js/julia_io.mjs`'s events in headless Chromium 158. Both load in browsers (their macrotasks
+are a `MessageChannel`'s messages where there is no `setImmediate`; `julia_io.mjs` loads
+`node:fs` only for the paths, `makeJuliaIOPaths`, which a page replaces with its own).
+
+A host library that starts work for the module without suspending it (an HTTP request, say)
+can hand the module a handle of the `julia_io` events for it (`events.external()`, made ready
+by `events.ready(h)`): the module waits for it as for a timer, with tasks a wait of the task
+alone (`Runtime.Host.await_handle`) while the others run. `Runtime.Tasks.enabled()` (a
+constant of the compilation) tells a package whether the module has tasks. See the table and
+"External handles" in `js/julia_io.mjs`.
 
 ### wasmtime
 

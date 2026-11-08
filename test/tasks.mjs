@@ -7,6 +7,8 @@
 // setTimeout(0) is armed before the call; the result says
 // whether it fired before the call returned. `shutdownAfter`: the host is shut down that many
 // ms into the call (which then fails); `settleAfter`: that many ms are waited after the call.
+// `external`: the call's first argument is a new external handle of the julia_io events, made
+// ready that many ms into the call (the result then has `externalClosed`: the module closed it).
 // A call that deadlocks (it never returns, as the native program hangs) is reported, and its
 // instance dropped. Prints the module's stdout as it goes and one JSON line per call (prefixed
 // with "@@ ") on stderr: {fn, result, ms, host, open, jsTimerFired}, {fn, trap, terminal} or
@@ -53,6 +55,13 @@ for (const c of calls) {
   }
   const { instance, events, jt, deadlock } = cur;
   const args = (c.args || []).map((a) => (c.i64 ? BigInt(a) : a));
+  let externalClosed = null;
+  if (c.external !== undefined) {
+    externalClosed = false;
+    const h = events.external({ onClose: () => { externalClosed = true; } });
+    args.unshift(h);
+    setTimeout(() => events.ready(h), c.external);
+  }
   let jsTimerFired = null;
   if (c.jsTimer) { jsTimerFired = false; setTimeout(() => { jsTimerFired = true; }, 0); }
   const t0 = performance.now();
@@ -68,7 +77,7 @@ for (const c of calls) {
       continue;
     }
     out({ fn: c.fn, result: typeof r.r === 'bigint' ? r.r.toString() : r.r, ms: performance.now() - t0,
-          host: jt.stats(), open: events.stats().open, jsTimerFired });
+          host: jt.stats(), open: events.stats().open, jsTimerFired, externalClosed });
   } catch (e) {
     if (!c.expectTrap) code = 1;
     out({ fn: c.fn, trap: String((e && e.message) || e), terminal: !!jt.terminal(), host: jt.stats() });

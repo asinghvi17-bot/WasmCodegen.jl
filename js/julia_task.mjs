@@ -34,7 +34,8 @@
 // The resumption or start of `to` is deferred until the calling stack has suspended
 // (`switch`) or returned (`exit`): exactly one Wasm stack runs at a time, and there is never a
 // JS frame between a `promising` call and a suspension. It is a microtask, which costs no
-// event-loop turn, but for `switch(id, id)`: a macrotask (`setImmediate`), after which Node's
+// event-loop turn, but for `switch(id, id)`: a macrotask (`setImmediate`; in a browser, a
+// MessageChannel's message: `macrotask.mjs`), after which Node's
 // timers and I/O have run. (The module asks for one while it has handles of the host, as
 // native Julia's `wait()` runs libuv's loop; so tasks that keep yielding without them starve
 // JavaScript's own timers, as they would starve the other tasks natively without preemption.)
@@ -53,6 +54,8 @@
 // dropped too (`events`, the julia_io events adapter, is stopped). The `finally` blocks of
 // abandoned tasks do not run: host handles they held stay open until the embedder releases
 // the `julia_io` adapter.
+
+import { macrotask } from './macrotask.mjs';
 
 export const JULIA_TASK_VERSION = 1;
 export const MAX_TASK_ID = 65535;
@@ -101,7 +104,7 @@ export function makeJuliaTask(opts = {}) {
   function defer(fn, turn) {
     if (pending) { fail(new JuliaTaskError('julia_task: two transfers pending (internal error)')); return; }
     pending = fn;
-    if (turn) { st.handoffs++; setImmediate(runPending); } else queueMicrotask(runPending);
+    if (turn) { st.handoffs++; macrotask(runPending); } else queueMicrotask(runPending);
   }
   const invalid = (msg) => new JuliaTaskError(`julia_task: invalid transfer: ${msg}`);
   // Pass the thread from `from` (which suspends or ends) to `to`; false after a failure.
@@ -116,7 +119,7 @@ export function makeJuliaTask(opts = {}) {
       current = -1;
       deadlocked = true;
       if (keepAlive && !keeper) keeper = setInterval(() => {}, 1 << 30);
-      setImmediate(() => { if (!terminal) onDeadlock(); });
+      macrotask(() => { if (!terminal) onDeadlock(); });
       return true;
     }
     const r = parked.get(to);

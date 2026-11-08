@@ -41,6 +41,17 @@ using ..Runtime: @wasm_method, original
 
 const EINVAL = Int32(28)
 
+"""
+    enabled() -> Bool
+
+Whether the module has Julia Tasks (`Config(tasks = :jspi)`): `true` in such a module (the
+session's patches, `trim/wasm-tasks.jl`, define it so), else `false` (natively too). A constant
+of the compilation, for a package that waits on the host as a task does when it can
+(`Host.await_handle` of a handle another library of the host makes ready: `julia_io.mjs`'s
+external handles, while the other tasks run) and otherwise as a program of one task does.
+"""
+enabled() = false
+
 ## host imports (`julia_task`)
 
 host_switch(from::Int32, to::Int32) = ccall((:switch, "julia_task"), Cvoid, (Int32, Int32), from, to)
@@ -830,6 +841,96 @@ set_next_task_wasm(t::Task) = (NEXT[] = t; nothing)
 @wasm_method close(t::Timer) = timer_close!(t)
 @wasm_method errormonitor(t::Task) = errormonitor_wasm(t)
 @wasm_method sync_end(c::Channel{Any}) = sync_end_wasm(c)
+
+"""
+    asyncmap_typed(f, ntasks, c...)
+
+`asyncmap(f, c...; ntasks)` without `batch_size` (`Base.async_usemap`), as Base's: `ntasks`
+worker tasks take the arguments from an unbuffered channel, the first failure of a worker
+(a `CapturedException`) or of the driver is thrown once all workers are done, and the results
+are in the shape of `map(f, c...)`. But typed: Base's collects the results from `Ref{Any}`s
+with a `map` of unknown element type, fetches workers of a `Vector{Any}` and splats channel
+items of type `Any` (dynamic calls, not trim-safe). Here the channel's items are of the
+arguments' types, the results' type is the one inferred for `f` (`Base.promote_op`), which
+is native's element type when it is concrete (natively, `map` narrows the type to the
+results'; here an abstract inferred type stays as it is), and a worker's failure is captured
+without its backtrace, which the module has not.
+"""
+function asyncmap_typed(f::F, ntasks, c...) where {F}
+    R = Base.promote_op(f, map(eltype, c)...)
+    A = Tuple{map(eltype, c)...}
+    chnl = Channel{Tuple{Base.RefValue{Any},A}}(0)
+    worker_tasks = Task[]
+    exec = AsyncmapExec{F,A}(f)
+    nt = ntasks isa Function ? (n = ntasks()::Int; n == 0 ? 1 : n) : ntasks::Int
+    for _ in 1:nt
+        push!(worker_tasks, asyncmap_worker(exec, chnl))
+    end
+    yield()
+    push_arg = AsyncmapPush{Tuple{Base.RefValue{Any},A}}(chnl)
+    asyncrun, asyncrun_excp = if ntasks isa Function
+        # (as Base's: a worker more whenever `ntasks()` asks for one)
+        asyncmap_drive(AsyncmapGrow(push_arg, exec, worker_tasks, ntasks), c...)
+    else
+        asyncmap_drive(push_arg, c...)
+    end
+    Base.close(chnl)
+    for t in worker_tasks
+        v = fetch(t)::Union{Nothing,CapturedException}
+        v === nothing || throw(v)
+    end
+    asyncrun_excp === nothing || throw(asyncrun_excp)
+    asyncrun === nothing && error("asyncmap: no results") # (never: no exception, so the first run's)
+    asyncrun isa Base.RefValue{Any} && return asyncrun.x::R
+    return R[ref.x::R for ref in asyncrun]
+end
+
+# the first run: the arguments to the workers, a `Ref` for each result (in `map`'s shape), or
+# the `InvalidStateException` of a channel a failing worker closed
+function asyncmap_drive(map_f::M, c...) where {M}
+    try
+        return (map(map_f, c...), nothing)
+    catch ex
+        ex isa InvalidStateException || rethrow()
+        return (nothing, ex::InvalidStateException)
+    end
+end
+
+struct AsyncmapGrow{P,E,N}
+    push::P
+    exec::E
+    worker_tasks::Vector{Task}
+    ntasks::N
+end
+function (g::AsyncmapGrow)(x...)
+    length(g.worker_tasks) < g.ntasks()::Int && push!(g.worker_tasks, asyncmap_worker(g.exec, g.push.chnl))
+    return g.push(x...)
+end
+
+struct AsyncmapExec{F,A}
+    f::F
+end
+(e::AsyncmapExec{F,A})(r::Base.RefValue{Any}, args::A) where {F,A} = (r.x = e.f(args...); nothing)
+
+struct AsyncmapPush{T}
+    chnl::Channel{T}
+end
+(p::AsyncmapPush)(x...) = (r = Base.RefValue{Any}(nothing); put!(p.chnl, (r, x)); r)
+
+function asyncmap_worker(exec::E, chnl::Channel{T}) where {E,T}
+    return @async begin
+        retval::Union{Nothing,CapturedException} = nothing
+        try
+            for (r, args) in chnl
+                exec(r, args)
+            end
+        catch e
+            Base.close(chnl)
+            retval = e isa CapturedException ? e : CapturedException(e, Any[])
+        end
+        retval
+    end
+end
 
 "Counters for the overhead measurements: (switches, polls, live task ids)."
 stats() = (SWITCHES[], POLLS[], length(TASKS) - length(FREE))
