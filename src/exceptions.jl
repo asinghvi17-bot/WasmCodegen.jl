@@ -152,7 +152,8 @@ end
 function emit_upsilon!(fc::FnCtx, idx::Int, u::Core.UpsilonNode)
     dst = get(fc.upsilons, idx, nothing)
     (dst === nothing || !isdefined(u, :val)) && return
-    v = convert_repr(fc, operand(fc, u.val), dst.typ)
+    dst.kind === Bottom && return   # (an argument of type `Union{}`: nothing to assign)
+    v =convert_repr(fc, operand(fc, u.val), dst.typ)
     v.kind === Bottom && return
     assign!(fc, dst, v)
 end

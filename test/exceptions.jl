@@ -133,6 +133,85 @@ end
 # an exception nothing catches
 uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
 
+# a local assigned in a `try` and used after it: its handler argument is undefined on the
+# path where the `try` ran no assignment (typed `Union{}` when nothing but the undefined
+# value and an `Int` reach it)
+@noinline try_step(n::Int) = n > 100 ? throw(ArgumentError("big")) : n + 1
+function try_local1(n::Int)   # the catch returns
+    local x
+    try
+        x = try_step(n)
+    catch
+        return -1
+    end
+    return x
+end
+function try_local2(n::Int)   # assigned before the try
+    x = 0
+    ok = true
+    try
+        x = try_step(n)
+    catch
+        ok = false
+    end
+    return ok ? x : -1
+end
+function try_local3(n::Int)   # assigned in both branches
+    local x
+    try
+        x = try_step(n)
+    catch
+        x = -1
+    end
+    return x
+end
+function try_local4(n::Int)   # the catch falls through
+    local x
+    ok = true
+    try
+        x = try_step(n)
+    catch
+        ok = false
+    end
+    return ok ? x : -1
+end
+function try_local_map(n::Int)
+    local x
+    ok = true
+    try
+        x = map(try_step, (n, n + 1))
+    catch
+        ok = false
+    end
+    return ok ? x[1] + x[2] : -1
+end
+function try_local_nested(n::Int)
+    local x, z
+    ok = true
+    ok2 = true
+    try
+        try
+            x = try_step(n)
+        catch
+            ok = false
+        end
+        z = try_step(n * 2)
+    catch
+        ok2 = false
+    end
+    return (ok ? x : -1) + (ok2 ? z : -10)
+end
+function try_local_read_in_catch(n::Int)   # the handler argument read in the catch
+    y = n
+    try
+        y = try_step(y)
+        y = try_step(y * 50)
+    catch
+        return y * 1000
+    end
+    return y
+end
+
 @testset "exceptions" begin
     for b in -1:1
         @wtest catch_div(7, b)
@@ -162,6 +241,18 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
     end
     @wtest uncaught(0)
     @wtest uncaught(1)
+    # a local assigned in a `try`, used after it
+    for n in (3, 60, 300)
+        @wtest try_local1(n)
+        @wtest try_local2(n)
+        @wtest try_local3(n)
+        @wtest try_local4(n)
+        @wtest try_local_map(n)
+        @wtest try_local_read_in_catch(n)
+    end
+    for n in (3, 60, 99, 300)
+        @wtest try_local_nested(n)
+    end
     # what a program needs of exceptions decides how they are compiled
     @test wcompile(catch_div, (Int, Int)).cgm.exceptions === :control
     @test wcompile(catch_message, (Int,)).cgm.exceptions === :values
