@@ -523,7 +523,8 @@ byte_ptr(p::CGVal) = CGVal(Ptr{UInt8}, Inline, p.leaves)
 
 `memmove` (or `jl_genericmemory_copyto`) of `n` bytes (or elements) from `src` to `dst`:
 an `array.copy` between the arrays they point into, if known, of one type, and aligned to
-their elements, else a copy byte by byte (`Runtime.ptr_memmove`).
+their elements, else a copy by their owners at run time (`jl_ptr_memmove`: one
+`array.copy` or loop for owners that are arrays, byte by byte for others).
 """
 function emit_memmove!(fc::FnCtx, dst, src, n, bytes::Bool)
     dst, src, n = dst::CGVal, src::CGVal, n::CGVal
@@ -546,15 +547,24 @@ function emit_memmove!(fc::FnCtx, dst, src, n, bytes::Bool)
             emit!(fc.b, :array_copy, md.array, md.array)
             if s > 1
                 else!(fc.b)
-                call_runtime!(fc, Runtime.ptr_memmove, CGVal[byte_ptr(dst), byte_ptr(src), convert_repr(fc, n, UInt)])
+                emit_ptr_memmove!(fc, dst, src, n)
                 end!(fc.b)
             end
             return bytes ? dst : ghost(Nothing, nothing)
         end
     end
     bytes || unsupported("copying elements between memories not known at compile time")
-    call_runtime!(fc, Runtime.ptr_memmove, CGVal[byte_ptr(dst), byte_ptr(src), convert_repr(fc, n, UInt)])
+    emit_ptr_memmove!(fc, dst, src, n)
     return dst
+end
+
+# `memmove` of `n` bytes by the owners of the pointers `dst` and `src`, at run time
+function emit_ptr_memmove!(fc::FnCtx, dst::CGVal, src::CGVal, n::CGVal)
+    for p in (dst, src)
+        push_leaf!(fc, p.leaves[1]); push_leaf!(fc, ptr_owner(p))
+    end
+    push_val!(fc, convert_repr(fc, n, UInt))
+    call!(fc.b, ptr_memmove_helper!(fc.cgm))
 end
 
 """
