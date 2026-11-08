@@ -796,6 +796,22 @@ end
 "Whether the module has tasks (`Runtime.Tasks.enabled()`, a constant of the compilation)."
 tasks_enabled()::Int32 = WasmCodegen.Runtime.Tasks.enabled() ? Int32(1) : Int32(0)
 
+# asyncmap of empty arrays: Base's shape, of the inferred element type (natively `Any`, which
+# `main` does not print; a `BitArray` of `Bool` results, as for a non-empty one); `()` exactly.
+# A bit for each check (none printed: `main`'s output is compared with native's)
+function asyncmap_empty_eltypes()::Int32
+    a = asyncmap(x -> x + 1, Int[])
+    m = asyncmap(x -> x + 0.5, zeros(Int, 0, 3))
+    r = asyncmap(x -> x + 1, 1:0)
+    z = asyncmap(+, [1, 2], Int[])
+    b = asyncmap(!, BitVector())
+    bb = asyncmap(b -> map(x -> x[1] * 2, b), Int[]; batch_size=2)
+    t = asyncmap(identity, ())
+    checks = (a isa Vector{Int}, m isa Matrix{Float64}, size(m) == (0, 3), r isa Vector{Int},
+              z isa Vector{Int}, b isa BitVector, bb isa Vector{Int}, t === (), isempty(a) && isempty(z))
+    return Int32(sum(i -> checks[i] << (i - 1), 1:length(checks)))
+end
+
 # returns while a task waits forever: the host keeps it parked (the next root call may run)
 function early_return()::Int32
     c = Condition()

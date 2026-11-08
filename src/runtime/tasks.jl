@@ -855,7 +855,9 @@ thrown once all workers are done, and the results are in the shape Base's `async
 zipped into a vector). An input empty by its type (`()`, element type `Union{}`) gives what
 Base's does: `()` of a tuple, else empty of element type `Union{}` on 1.12 (`map`'s inference),
 `Any` on 1.13. An empty array gives Base's shape, of the inferred element type (Base's is `Any`:
-a result of type `Vector{Any}` when empty would make every caller's code of the result dynamic).
+a result of type `Vector{Any}` when empty would make every caller's code of the result dynamic;
+so an empty `BitArray` mapped to `Bool`s gives a `BitArray`, as a non-empty one does, where
+Base's gives a `Vector{Any}`).
 But typed: Base's collects the results from `Ref{Any}`s with a `map` of unknown element
 type, fetches workers of a `Vector{Any}` and splats channel items of type `Any` (dynamic calls,
 not trim-safe). Here the channel's items are of the arguments' types, the results' type is the
