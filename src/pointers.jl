@@ -655,6 +655,25 @@ function ptr_byte_helper!(cgm::CGModule, kind::Symbol)
     end
 end
 
+"""
+    ptr_memmove_helper!(cgm) -> Func
+
+`jl_ptr_memmove(dst, dst_owner, src, src_owner, n)`: `memmove` of `n` bytes between pointers
+whose arrays are not known statically (or are arrays of different types). Each owner's
+array is found from its type id once, then the copy is one `array.copy` (between arrays
+of one type, aligned to their elements) or one loop over the elements of the two arrays;
+only other owners (the isbits fields of a mutable object, memories of widened or padded
+elements) are copied byte by byte through `jl_ptr_load_byte`/`jl_ptr_store_byte`. Its body
+is generated with the module's types (`finish_pointers!`).
+"""
+function ptr_memmove_helper!(cgm::CGModule)
+    get!(cgm.helpers, (:ptr, :memmove)) do
+        jl = jlvalue_ref(cgm.types)
+        ptr_byte_helper!(cgm, :load); ptr_byte_helper!(cgm, :store)
+        add_func!(cgm.mod, "jl_ptr_memmove", ValType[I64, jl, I64, jl, I64], ValType[])
+    end
+end
+
 # the owners whose bytes are addressable, by the Wasm types of their objects (object struct
 # type, array type, element storage) => their type ids: memories whose elements are stored
 # as Julia lays them out, strings and symbols
@@ -1045,4 +1064,208 @@ function finish_pointers!(cgm::CGModule)
         unreachable!(b)
         finish!(b)
     end
+    f = get(cgm.helpers, (:ptr, :memmove), nothing)
+    f === nothing || finish_memmove!(cgm, f, something(owners, byte_owners(cgm)))
+end
+
+# the body of `jl_ptr_memmove(dst, dst_owner, src, src_owner, n)`
+function finish_memmove!(cgm::CGModule, f::Func, owners)
+    ts = cgm.types
+    b = Builder(cgm.mod, f)
+    # the arrays of the owners, by their Wasm array type and element storage
+    groups = unique!([(at, stg) for (_, at, stg) in keys(owners)])
+    # of each side (its address and owner parameters): the owner's array (in the local of
+    # its group), its group (1-based, 0 if none), the offset into it and its length in bytes
+    side(addr, owner) = (; addr, owner, arrs = [add_local!(f, RefType(at, true)) for (at, _) in groups],
+                         k = add_local!(f, I32), off = add_local!(f, I64), len = add_local!(f, I64))
+    d, s = side(0, 1), side(2, 3)
+    n = 4
+    tid = add_local!(f, I32)
+    i, step, cnt, x = (add_local!(f, I64) for _ in 1:4)
+    byte = add_local!(f, I32)
+    # nothing to copy (from or to any pointer, as natively)
+    emit!(b, :local_get, n); emit!(b, :i64_eqz)
+    if!(b); return!(b); end!(b)
+    for o in (d, s)
+        emit!(b, :i32_const, 0); emit!(b, :local_set, o.k)
+        emit!(b, :local_get, o.owner); emit!(b, :ref_is_null); emit!(b, :i32_eqz)
+        if!(b)
+        emit!(b, :local_get, o.owner); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+        for ((st, at, stg), ids) in owners
+            g = findfirst(==((at, stg)), groups)
+            for (j, id) in enumerate(ids)
+                emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+                j > 1 && emit!(b, :i32_or)
+            end
+            if!(b)
+            emit!(b, :local_get, o.owner); emit!(b, :ref_cast, st)
+            emit!(b, :struct_get, st, DATA_FIELD)
+            emit!(b, :local_tee, o.arrs[g])
+            emit!(b, :array_len); emit!(b, :i64_extend_i32_u)
+            emit!(b, :i64_const, storage_bytes(stg)); emit!(b, :i64_mul)
+            emit!(b, :local_set, o.len)
+            emit!(b, :i32_const, g); emit!(b, :local_set, o.k)
+            end!(b)
+        end
+        # the offset into the owner: the address minus its base
+        emit!(b, :local_get, o.addr)
+        emit!(b, :local_get, o.owner); call!(b, object_hash_func!(cgm))
+        emit!(b, :i64_extend_i32_u); emit!(b, :i64_const, 32); emit!(b, :i64_shl)
+        emit!(b, :i64_sub); emit!(b, :local_set, o.off)
+        end!(b)
+    end
+    # the order of the bytes: backwards when they may overlap, the destination after the source
+    emit!(b, :i64_const, 0); emit!(b, :local_set, i)
+    emit!(b, :i64_const, 1); emit!(b, :local_set, step)
+    emit!(b, :local_get, d.owner); emit!(b, :local_get, s.owner); emit!(b, :ref_eq)
+    emit!(b, :local_get, d.addr); emit!(b, :local_get, s.addr); emit!(b, :i64_gt_u)
+    emit!(b, :i32_and)
+    if!(b)
+    emit!(b, :local_get, n); emit!(b, :i64_const, 1); emit!(b, :i64_sub); emit!(b, :local_set, i)
+    emit!(b, :i64_const, -1); emit!(b, :local_set, step)
+    end!(b)
+    # the loop over the bytes: `load!` pushes the byte at offset `i` from the source (an
+    # i32), `store!` stores the local `byte` at offset `i` from the destination
+    function byte_loop!(load!, store!)
+        emit!(b, :i64_const, 0); emit!(b, :local_set, cnt)
+        block!(b); loop!(b)
+        emit!(b, :local_get, cnt); emit!(b, :local_get, n); emit!(b, :i64_ge_u); br_if!(b, 1)
+        load!(); emit!(b, :local_set, byte)
+        store!()
+        emit!(b, :local_get, i); emit!(b, :local_get, step); emit!(b, :i64_add); emit!(b, :local_set, i)
+        emit!(b, :local_get, cnt); emit!(b, :i64_const, 1); emit!(b, :i64_add); emit!(b, :local_set, cnt)
+        br!(b, 0)
+        end!(b); end!(b)
+    end
+    # the byte offset `i` from the side `o` in the local `x`
+    at_offset!(o) = (emit!(b, :local_get, o.off); emit!(b, :local_get, i); emit!(b, :i64_add);
+                     emit!(b, :local_set, x))
+    function load_elem_byte!(a, at, stg)
+        sz = storage_bytes(stg)
+        push_byte_elem!(b, a, x, sz)
+        if sz == 1
+            emit!(b, stg isa PackedType ? :array_get_u : :array_get, at)
+        else
+            get_elem_bits!(b, at, stg)
+            push_byte_shift!(b, x, sz); emit!(b, :i64_shr_u)
+            emit!(b, :i32_wrap_i64); emit!(b, :i32_const, 0xff); emit!(b, :i32_and)
+        end
+    end
+    function store_elem_byte!(a, at, stg)
+        sz = storage_bytes(stg)
+        push_byte_elem!(b, a, x, sz)
+        if sz == 1
+            emit!(b, :local_get, byte)
+        else
+            # the element with the byte replaced
+            push_byte_elem!(b, a, x, sz); get_elem_bits!(b, at, stg)
+            emit!(b, :i64_const, 0xff); push_byte_shift!(b, x, sz); emit!(b, :i64_shl)
+            emit!(b, :i64_const, -1); emit!(b, :i64_xor); emit!(b, :i64_and)
+            emit!(b, :local_get, byte); emit!(b, :i64_extend_i32_u)
+            push_byte_shift!(b, x, sz); emit!(b, :i64_shl)
+            emit!(b, :i64_or)
+            bits_to_storage!(b, stg)
+        end
+        emit!(b, :array_set, at)
+    end
+    # the loop over the elements of `wsz` bytes of the wide side (the source if `from_wide`,
+    # else the destination), from its offset, and the bytes of the other array
+    k, e, j, bits = (add_local!(f, I64) for _ in 1:4)
+    function elem_loop!(from_wide, darr, datt, sarr, satt, wsz, wstg)
+        wide, narrow = from_wide ? (s, d) : (d, s)
+        emit!(b, :local_get, wide.off); emit!(b, :i64_const, wsz); emit!(b, :i64_div_u); emit!(b, :local_tee, k)
+        emit!(b, :local_get, n); emit!(b, :i64_const, wsz); emit!(b, :i64_div_u); emit!(b, :i64_add)
+        emit!(b, :local_set, e)
+        emit!(b, :local_get, narrow.off); emit!(b, :local_set, j)
+        block!(b); loop!(b)
+        emit!(b, :local_get, k); emit!(b, :local_get, e); emit!(b, :i64_ge_u); br_if!(b, 1)
+        if from_wide
+            emit!(b, :local_get, sarr); emit!(b, :local_get, k); emit!(b, :i32_wrap_i64)
+            get_elem_bits!(b, satt, wstg); emit!(b, :local_set, bits)
+            for t in 0:wsz-1
+                emit!(b, :local_get, darr); emit!(b, :local_get, j); emit!(b, :i32_wrap_i64)
+                t > 0 && (emit!(b, :i32_const, t); emit!(b, :i32_add))
+                emit!(b, :local_get, bits)
+                t > 0 && (emit!(b, :i64_const, 8t); emit!(b, :i64_shr_u))
+                emit!(b, :i32_wrap_i64)
+                emit!(b, :array_set, datt)
+            end
+        else
+            emit!(b, :local_get, darr); emit!(b, :local_get, k); emit!(b, :i32_wrap_i64)
+            for t in 0:wsz-1
+                emit!(b, :local_get, sarr); emit!(b, :local_get, j); emit!(b, :i32_wrap_i64)
+                t > 0 && (emit!(b, :i32_const, t); emit!(b, :i32_add))
+                emit!(b, :array_get_u, satt); emit!(b, :i64_extend_i32_u)
+                if t > 0
+                    emit!(b, :i64_const, 8t); emit!(b, :i64_shl); emit!(b, :i64_or)
+                end
+            end
+            bits_to_storage!(b, wstg)
+            emit!(b, :array_set, datt)
+        end
+        emit!(b, :local_get, k); emit!(b, :i64_const, 1); emit!(b, :i64_add); emit!(b, :local_set, k)
+        emit!(b, :local_get, j); emit!(b, :i64_const, wsz); emit!(b, :i64_add); emit!(b, :local_set, j)
+        br!(b, 0)
+        end!(b); end!(b)
+    end
+    # both owners' arrays known, the bytes within them
+    emit!(b, :local_get, d.k); emit!(b, :i32_eqz); emit!(b, :local_get, s.k); emit!(b, :i32_eqz)
+    emit!(b, :i32_or); emit!(b, :i32_eqz)
+    for o in (d, s)
+        emit!(b, :local_get, o.off); emit!(b, :local_get, o.len); emit!(b, :i64_le_u)
+        emit!(b, :local_get, n); emit!(b, :local_get, o.len); emit!(b, :local_get, o.off); emit!(b, :i64_sub)
+        emit!(b, :i64_le_u)
+        emit!(b, :i32_and); emit!(b, :i32_and)
+    end
+    if!(b)
+    for (gd, (atd, stgd)) in enumerate(groups), (gs, (ats, stgs)) in enumerate(groups)
+        # (between arrays of one type, or bytes and any other)
+        (gd == gs || stgd === I8 || stgs === I8) || continue
+        emit!(b, :local_get, d.k); emit!(b, :i32_const, gd); emit!(b, :i32_eq)
+        emit!(b, :local_get, s.k); emit!(b, :i32_const, gs); emit!(b, :i32_eq)
+        emit!(b, :i32_and)
+        if!(b)
+        sz = storage_bytes(stgd)
+        if gd == gs
+            # one `array.copy` (which may overlap), of whole elements if aligned to them
+            if sz > 1
+                emit!(b, :local_get, d.off); emit!(b, :local_get, s.off); emit!(b, :i64_or)
+                emit!(b, :local_get, n); emit!(b, :i64_or)
+                emit!(b, :i64_const, sz - 1); emit!(b, :i64_and); emit!(b, :i64_eqz)
+                if!(b)
+            end
+            push_byte_elem!(b, d.arrs[gd], d.off, sz)
+            push_byte_elem!(b, s.arrs[gs], s.off, sz)
+            emit!(b, :local_get, n); sz != 1 && (emit!(b, :i64_const, sz); emit!(b, :i64_div_u))
+            emit!(b, :i32_wrap_i64)
+            emit!(b, :array_copy, atd, atd)
+            return!(b)
+            sz > 1 && end!(b)
+        end
+        if gd != gs
+            # between bytes and wider elements, aligned to them: element by element
+            wide, ws = stgd === I8 ? (s, stgs) : (d, stgd)
+            wsz = storage_bytes(ws)
+            emit!(b, :local_get, wide.off); emit!(b, :local_get, n); emit!(b, :i64_or)
+            emit!(b, :i64_const, wsz - 1); emit!(b, :i64_and); emit!(b, :i64_eqz)
+            if!(b)
+            elem_loop!(wide === s, d.arrs[gd], atd, s.arrs[gs], ats, wsz, ws)
+            return!(b)
+            end!(b)
+        end
+        if !(gd == gs && sz == 1)
+            byte_loop!(() -> (at_offset!(s); load_elem_byte!(s.arrs[gs], ats, stgs)),
+                       () -> (at_offset!(d); store_elem_byte!(d.arrs[gd], atd, stgd)))
+            return!(b)
+        end
+        end!(b)
+    end
+    end!(b)
+    # other owners: byte by byte, each found from its owner
+    loadb, storeb = ptr_byte_helper!(cgm, :load), ptr_byte_helper!(cgm, :store)
+    byte_loop!(() -> (emit!(b, :local_get, s.addr); emit!(b, :local_get, i); emit!(b, :i64_add);
+                      emit!(b, :local_get, s.owner); call!(b, loadb)),
+               () -> (emit!(b, :local_get, d.addr); emit!(b, :local_get, i); emit!(b, :i64_add);
+                      emit!(b, :local_get, d.owner); emit!(b, :local_get, byte); call!(b, storeb)))
+    finish!(b)
 end

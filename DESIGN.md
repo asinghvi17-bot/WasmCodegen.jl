@@ -279,9 +279,16 @@ byte through two run-time helpers, `jl_ptr_load_byte(address, owner)` and
 `jl_ptr_store_byte(address, owner, byte)`, generated once the module's types are known:
 they find the byte from the owner's type id: of a memory whose elements are stored as
 laid out, of a memory of widened or padded isbits elements (by the leaves of an element),
-of a string, or of the isbits fields of a mutable object. `memmove` and `memset` without
-origins are byte loops in the runtime (`Runtime.ptr_memmove`/`ptr_memset`). An owner whose
-bytes are not addressable (a memory of references) traps.
+of a string, or of the isbits fields of a mutable object. `memmove` without origins (a
+`write` of an array to an IOBuffer: `unsafe_write` takes a pointer) is a third helper,
+`jl_ptr_memmove(dst, dst_owner, src, src_owner, n)`, which finds both owners' arrays once:
+one `array.copy` between arrays of one type (aligned to their elements), one loop over the
+elements between bytes and wider elements (`Float32`s), and byte by byte through the two
+helpers only for other owners. `memset` without origin is a byte loop in the runtime
+(`Runtime.ptr_memset`). An owner whose bytes are not addressable (a memory of references)
+traps. Copies between arrays and dense arrays reinterpreted (`collect(reinterpret(UInt8,
+img))`), which Base makes element by element through `Ref`s and pointers, are one
+`memmove` of their bytes when neither element type has padding (`trim/wasm-base.jl`).
 
 ## 6. The image: serializing objects
 
@@ -404,7 +411,7 @@ as other pointers of the build process are.
   point; `utf8proc_grapheme_break_stateful`: utf8proc's rules over its classes);
   `strtod`/`strtof`/`jl_try_substrtod` (the extent of the number as C finds it, the value
   from Parsers.jl, which is correctly rounded without C or big floats) and `errno`;
-  `memmove`/`memset`/`memcmp`/`memchr`/`strlen` through pointers without origins (a C
+  `memset`/`memcmp`/`memchr`/`strlen` through pointers without origins (a C
   string ends at its owner's end: Julia's strings and symbols are NUL-terminated);
   `jl_symbol_name` (a pointer into the symbol's bytes; `Cstring`s are pointers too);
   identity hash tables (`IdDict`: `jl_eqtable_*`, `iddict.c`'s open addressing by

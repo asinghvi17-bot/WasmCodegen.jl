@@ -18,6 +18,34 @@ let Runtime = WasmCodegen.Runtime
                 return _reinterpret_padding(Out, x)
             end
         end
+        # copies between arrays and dense arrays reinterpreted (`collect(reinterpret(UInt8, img))`,
+        # `Vector{UInt8}(r)`, `copyto!(reinterpret(UInt8, img), bytes)`), of elements without
+        # padding: one `memmove` of their bytes (an `array.copy`). Base copies each element
+        # through `Ref`s and pointers, which LLVM makes registers; in Wasm each `Ref` would be
+        # an object, its bytes read and written through pointers by their owner.
+        @inline _bytes_copyable(::Type{T}, ::Type{S}) where {T, S} =
+            isbitstype(T) && isbitstype(S) &&
+                $(Runtime.packedsize)(T) == sizeof(T) && $(Runtime.packedsize)(S) == sizeof(S)
+        function copyto_unaliased!(deststyle::IndexStyle, dest::Array{T}, srcstyle::IndexStyle,
+                                   src::ReinterpretArray{T, N, S, <:Array}) where {T, N, S}
+            if _bytes_copyable(T, S) && length(dest) >= length(src)
+                GC.@preserve dest src unsafe_copyto!(Ptr{UInt8}(pointer(dest)),
+                    Ptr{UInt8}(pointer(src.parent)), UInt(length(src) * sizeof(T)))
+                return dest
+            end
+            return invoke(copyto_unaliased!, Tuple{IndexStyle, AbstractArray, IndexStyle, AbstractArray},
+                          deststyle, dest, srcstyle, src)
+        end
+        function copyto_unaliased!(deststyle::IndexStyle, dest::ReinterpretArray{T, N, S, <:Array},
+                                   srcstyle::IndexStyle, src::Array{T}) where {T, N, S}
+            if _bytes_copyable(T, S) && length(dest) >= length(src)
+                GC.@preserve dest src unsafe_copyto!(Ptr{UInt8}(pointer(dest.parent)),
+                    Ptr{UInt8}(pointer(src)), UInt(length(src) * sizeof(T)))
+                return dest
+            end
+            return invoke(copyto_unaliased!, Tuple{IndexStyle, AbstractArray, IndexStyle, AbstractArray},
+                          deststyle, dest, srcstyle, src)
+        end
         # a call in the latest world (to keep it unspecialized natively): a direct call, which
         # specializes it on the type, so its reflection is done at compile time
         _typeinfo_implicit(@nospecialize(T)) = typeinfo_implicit(T)::Bool
