@@ -409,7 +409,7 @@ them: a case that cannot be compiled traps there, and is not an error of the pro
 function compile_runtime_cases!(cgm::CGModule)
     with_optional_config(cgm) do
         while true
-            n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm) +
+            n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_elem_cases!(cgm) + add_tuple_cases!(cgm) +
                 add_by_type_cases!(cgm) + add_getfield_any_cases!(cgm) + add_new_cases!(cgm)
             n == 0 && break
             process_worklist!(cgm)
@@ -1236,6 +1236,101 @@ function finish_new!(cgm::CGModule)
             call!(b, (cgm.helpers[:splatnew_arity]::FuncInfo).func); unreachable!(b)
             end!(b)
         end
+        finish!(b)
+    end
+end
+
+## objectid of a tuple of a type the module does not have: its elements' layouts and ids
+
+"`Runtime.type_layout(x)`: of a table by the type id of `x`, of the module's types (`finish_tuple_elems!`)."
+function emit_type_layout!(fc::FnCtx, x::CGVal)
+    f = get!(fc.cgm.helpers, :type_layout) do
+        add_func!(fc.cgm.mod, "jl_type_layout", ValType[jlvalue_ref(fc.cgm.types)], ValType[I64])
+    end
+    push_val!(fc, convert_repr(fc, x, Any))
+    call!(fc.b, f)
+    return pop_val!(fc, UInt64)
+end
+
+"""
+`Runtime.tuple_elem(x, buf, off)`: by the type id of `x`, its case `Runtime.tuple_elem_as`, of
+each type of the module stored inline (`add_tuple_elem_cases!`, `finish_tuple_elems!`).
+"""
+function emit_tuple_elem!(fc::FnCtx, args::Vector{CGVal})
+    cgm = fc.cgm
+    x, buf, off = args
+    f = get!(cgm.helpers, :tuple_elem) do
+        add_func!(cgm.mod, "jl_tuple_elem",
+                  ValType[jlvalue_ref(cgm.types), only(layout(cgm.types, Vector{UInt8}).leaves).type, I64], ValType[I64])
+    end
+    push_val!(fc, convert_repr(fc, x, Any))
+    push_val!(fc, convert_repr(fc, buf, Vector{UInt8}))
+    push_val!(fc, convert_repr(fc, off, Int))
+    call!(fc.b, f)
+    return pop_val!(fc, UInt64)
+end
+
+# the cases of `jl_tuple_elem`: of each type of the module stored inline whose values may be
+# objects (the number added)
+function add_tuple_elem_cases!(cgm::CGModule)
+    haskey(cgm.helpers, :tuple_elem) || return 0
+    cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, :tuple_elem_cases)
+    ts = cgm.types
+    n = length(cases)
+    for (id, T) in enumerate(copy(ts.typelist))
+        haskey(cases, id) && continue
+        (objectid_case_type(ts, T) && Base.allocatedinline(T)) || continue
+        # (as `immut_id!`: of its bits, of no padding and no references)
+        bits = !Base.datatype_haspadding(T) && Base.datatype_pointerfree(T) &&
+               (isprimitivetype(T) || Base.datatype_isbitsegal(T))
+        cases[id] = runtime_function!(cgm, Runtime.tuple_elem_as, (Any, Vector{UInt8}, Int, Type{T}, Val{bits}))
+    end
+    return length(cases) - n
+end
+
+"""
+    finish_tuple_elems!(cgm)
+
+The helpers of `objectid` of a tuple of a type the module does not have: `jl_type_layout`, a
+table by type id of the module's types' layouts (`Runtime.layout_info`), and `jl_tuple_elem`,
+a case by type id of each type stored inline (a type id without one traps).
+"""
+function finish_tuple_elems!(cgm::CGModule)
+    ts = cgm.types
+    f = get(cgm.helpers, :type_layout, nothing)
+    if f !== nothing
+        n = length(ts.typelist)
+        n <= 10_000 || unsupported("objectid of a tuple of a type the module does not have in a module of more than 10000 types")
+        i64s = array_type!(ts, I64)
+        elems = Inst[Inst(:i64_const, reinterpret(Int64, Runtime.layout_info(T))) for T in ts.typelist]
+        table = add_global!(cgm.mod, "jl_type_layout_table", RefType(i64s, false), false,
+                            Inst[elems..., Inst(:array_new_fixed, i64s, n)])
+        b = Builder(cgm.mod, f)
+        emit!(b, :global_get, table)
+        emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0)
+        emit!(b, :i32_const, 1); emit!(b, :i32_sub)
+        emit!(b, :array_get, i64s)
+        finish!(b)
+    end
+    f = get(cgm.helpers, :tuple_elem, nothing)
+    if f !== nothing
+        cases = get(cgm.helpers, :tuple_elem_cases, Dict{Int,FuncInfo}())
+        b = Builder(cgm.mod, f)
+        tid = add_local!(f, I32)
+        emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+        for id in sort!(collect(keys(cases)))
+            info = cases[id]
+            info.func.params == f.params[1:3] ||
+                error("WasmCodegen: the case of `tuple_elem` of ", ts.typelist[id], " has an unexpected signature")
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            if!(b)
+            emit!(b, :local_get, 0); emit!(b, :local_get, 1); emit!(b, :local_get, 2)
+            call!(b, info.func)
+            # (a case that always throws returns nothing)
+            isempty(info.func.results) ? unreachable!(b) : return!(b)
+            end!(b)
+        end
+        unreachable!(b)
         finish!(b)
     end
 end

@@ -73,6 +73,14 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     elseif m.module === Runtime && m.name === :map_type_value
         f = mi.specTypes.parameters[2]
         return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
+    elseif m.module === Runtime && m.name === :type_layout
+        return emit_type_layout!(fc, operand(fc, ex.args[3]))
+    elseif m.module === Runtime && m.name === :tuple_elem
+        return emit_tuple_elem!(fc, CGVal[operand(fc, a) for a in ex.args[3:5]])
+    elseif m.module === Runtime && m.name === :immut_id
+        T = mi.specTypes.parameters[2]
+        return immut_id!(fc, convert_repr(fc, operand(fc, ex.args[3]), T), T,
+                         convert_repr(fc, operand(fc, ex.args[4]), UInt64))
     elseif m.module === Runtime && m.name === :by_type
         # (`f(x, y, typeof(x))` of the module's case for the type of `x`, see `BY_TYPE_CASES`)
         f = mi.specTypes.parameters[2].instance

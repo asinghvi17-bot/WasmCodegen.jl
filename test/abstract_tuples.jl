@@ -173,6 +173,32 @@ function at_isa_kinds(i::Int)
     return (t isa Tuple{Type{Int},AtUnnamed}, t isa Tuple{DataType,Any}, t isa Tuple{Type,AtUnnamed},
             t isa Union{Nothing,Tuple{Type{Int},AtUnnamed}}, t isa Union{Nothing,Tuple{DataType,AtUnnamed}})
 end
+# `objectid` of tuples, some of types no code names (objects of `Tuple`): as natively of their
+# concrete types, of those types' hashes and layouts: of their bytes (no padding, no references),
+# else of their elements' ids mixed (inline: from 0; references: their `objectid`)
+struct AtByte
+    a::UInt8
+end
+struct AtPad
+    a::Int8
+    b::Int64
+end
+function at_objectid(i::Int)
+    return (objectid(opaque((unnamed(i), opaque(i)))),                 # 16 bytes
+            objectid(opaque((opaque(Int32(i)), opaque(Int32(2i))))),   # 8 bytes
+            objectid(opaque((opaque(AtByte(UInt8(i))),))),             # 1 byte
+            objectid(opaque((opaque(Int8(i)), opaque(i)))),            # padding: by the elements
+            objectid(opaque((opaque(i), "s"))),                        # a reference
+            objectid(opaque((opaque((unnamed(i), i)), 2.5))),          # nested, of bytes
+            objectid(opaque((opaque((unnamed(i), "x")), i))),          # nested, with a reference
+            objectid(opaque((nothing, opaque(i)))),                     # a singleton
+            objectid(opaque((opaque(Some("a")), opaque(i)))),          # inline, with a reference
+            objectid(opaque((Int, opaque(i)))),                        # a type object
+            objectid(opaque((opaque(AtPad(Int8(i), i)), opaque(i)))),  # inline, with padding
+            objectid(opaque((opaque(1.5), opaque(-0.0)))),
+            objectid(opaque((opaque(:sym), opaque(i)))),
+            objectid(tuple(Any[unnamed(i), i, "z", (unnamed(i),)]...)))
+end
 function at_isa_vararg(n::Int)
     t = tuple(Any[Int, opaque(n), unnamed(n)][1:n]...)
     return (t isa Union{Nothing,Tuple{DataType}}, t isa Tuple{Type{Int}}, t isa Tuple{DataType,Int},
@@ -197,6 +223,7 @@ end
         @wtest at_isa_union(i)
         @wtest at_isa_freevars(i)
         @wtest at_isa_kinds(i)
+        @wtest at_objectid(i)
     end
     for n in 1:3
         @wtest at_isa_vararg(n)
