@@ -82,11 +82,29 @@ of `y`. `I` has as many lanes as `x`.
     end
 end
 
-# in Wasm: the foreign calls the code generator lowers (`emit_simd!`)
+# the lanes of a shuffle in range, or the BoundsError of the first that is not, as natively
+# (generated: the throw is the body, so that the foreign call after it is not reached)
+@generated function _check_lanes(x::NTuple{N}, ::Val{I}) where {N,I}
+    for j in 1:N
+        0 <= I[j] < N || return :(throw(BoundsError(x, $(I[j] + 1))))
+    end
+    return nothing
+end
+@generated function _check_lanes(x::NTuple{N}, y::NTuple{N}, ::Val{I}) where {N,I}
+    for j in 1:N
+        I[j] < 0 && return :(throw(BoundsError(x, $(I[j] + 1))))
+        I[j] < 2N || return :(throw(BoundsError(y, $(I[j] - N + 1))))
+    end
+    return nothing
+end
+
+# in Wasm: the foreign calls the code generator lowers (`emit_simd!`), of WasmCodegen's own
+# library name (`julia_*` names cannot be declared, see `foreigncall.jl`)
+const LIBRARY = "julia_simd128"
 for (V, s) in ((F64x2, "f64x2"), (F32x4, "f32x4"), (F32x2, "f32x2"))
     T = fieldtype(fieldtype(V, 1), 1)
     N = fieldcount(V)
-    q(op) = QuoteNode(Symbol("wasm_simd_", s, "_", op))
+    q(op) = :(($(QuoteNode(Symbol("wasm_simd_", s, "_", op))), $LIBRARY))
     for op in (:add, :sub, :mul, :div)
         @eval Base.Experimental.@overlay WASM_METHODS @inline $op(x::$V, y::$V) = ccall($(q(op)), $V, ($V, $V), x, y)
     end
@@ -102,10 +120,10 @@ for (V, s) in ((F64x2, "f64x2"), (F32x4, "f32x4"), (F32x2, "f32x2"))
         Base.Experimental.@overlay WASM_METHODS @inline vstore(x::$V, p::Ptr{$T}) =
             ccall($(q(:store)), Cvoid, ($V, Ptr{$T}), x, p)
         Base.Experimental.@overlay WASM_METHODS @inline shuffle(x::$V, ::Val{I}) where {I} =
-            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes"));
+            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes")); _check_lanes(x, Val(I));
              ccall($(q(:shuffle1)), $V, ($V, $(fill(Int, N)...)), x, $(lanes(N)...)))
         Base.Experimental.@overlay WASM_METHODS @inline shuffle(x::$V, y::$V, ::Val{I}) where {I} =
-            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes"));
+            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes")); _check_lanes(x, y, Val(I));
              ccall($(q(:shuffle2)), $V, ($V, $V, $(fill(Int, N)...)), x, y, $(lanes(N)...)))
     end
 end
@@ -254,6 +272,7 @@ function emit_simd!(fc::FnCtx, op::String, args::Vector{Any}, @nospecialize(typ)
         bytes = Int[]
         for a in idx, j in 0:sz-1
             s = Int(constant_value(a))
+            # (in range: the overlay throws natively's BoundsError otherwise)
             0 <= s < (two ? 2N : N) || unsupported("a shuffle lane out of range")
             push!(bytes, (s < N ? s : s - N + P) * sz + j)
         end

@@ -44,6 +44,18 @@ function shuffles_f2(k::Int)
 end
 # a shuffle must keep the number of lanes (an ArgumentError natively, a trap here)
 bad_shuffle(k::Int) = lanes(S.shuffle(mkvec(D2, i -> i + k), Val((0, 1, 0, 1))))
+# a lane out of range: natively's BoundsError, caught
+function oob_shuffle(k::Int)
+    a = mkvec(D2, i -> i + k)
+    caught(e) = e isa BoundsError ? Float64((e.i)::Int) : -2.0
+    r1 = try sum(lanes(S.shuffle(a, Val((0, 2))))) catch e; caught(e) end
+    r2 = try sum(lanes(S.shuffle(a, a, Val((1, 4))))) catch e; caught(e) end
+    r3 = try sum(lanes(S.shuffle(a, a, Val((-1, 0))))) catch e; caught(e) end
+    r4 = try sum(lanes(S.shuffle(a, a, Val((3, 0))))) catch e; caught(e) end
+    return r1, r2, r3, r4
+end
+# a foreign function of a name like the SIMD calls', of another library: the program's
+simd_named(x::Float64) = ccall((:wasm_simd_scale, "libscale"), Float64, (Float64,), x)
 
 # vectors through pointer arguments (no static origin): fused loads and stores
 @noinline function vaxpy!(py::Ptr{T}, px::Ptr{T}, n::Int, a::T, ::Type{V}) where {T,V}
@@ -171,6 +183,11 @@ has_inst(f, op) = any(i -> i.op === op, (i for g in wcompile(f, (Int,)).cgm.mod.
         @wtest shuffles_f2(k)
     end
     @wtest bad_shuffle(1)
+    @wtest oob_shuffle(1)
+    let c = WasmCodegen.compile(simd_named, (Float64,);
+                                config = test_config(foreign_functions = Pair{Tuple{Symbol,String},Any}[(:wasm_simd_scale, "libscale") => x -> 2x]))
+        @test wasm_run(c, "simd_named", 3.0; rettype = Float64) == 6.0
+    end
     for n in (8, 13)
         @wtest axpy_d2(n)
         @wtest axpy_d2_misaligned(n)
