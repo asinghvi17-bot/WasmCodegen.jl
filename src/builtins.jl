@@ -1128,8 +1128,8 @@ end
 
 The parts of a tuple type with type variables of the common shape, whose `isa` the types of a
 tuple's elements decide (`diagonal_vars_isa!`): `Tuple{P1, …, Pk[, Vararg{Pv}]} where V1, …, Vm`,
-each parameter a variable or of none of them, each variable's bounds of none and ordered
-(`lb <: ub`), a `Vararg` of no variable length. Else `nothing`.
+each parameter a variable or of none of them, each variable's bounds types of none (no variable,
+of these or free) and ordered (`lb <: ub`), a `Vararg` of no variable length. Else `nothing`.
 """
 function bound_tuple_shape(@nospecialize(T))
     vars = TypeVar[]
@@ -1139,7 +1139,7 @@ function bound_tuple_shape(@nospecialize(T))
     end
     (W isa DataType && W.name === Tuple.name) || return nothing
     any(v -> any(w -> Base.has_typevar(v.lb, w) || Base.has_typevar(v.ub, w), vars), vars) && return nothing
-    all(v -> v.lb <: v.ub, vars) || return nothing
+    all(v -> v.lb isa Type && v.ub isa Type && v.lb <: v.ub, vars) || return nothing
     ps = collect(Any, W.parameters)
     va = !isempty(ps) && ps[end] isa Core.TypeofVararg
     if va

@@ -305,7 +305,7 @@ end
 
 function const_global(world::UInt, m::Module, s::Symbol)
     Base.invoke_in_world(world, isconst, m, s) || return nothing
-    return Some(Base.invoke_in_world(world, getglobal, m, s))
+    return Some{Any}(Base.invoke_in_world(world, getglobal, m, s))
 end
 
 "The result `res` of the statement `stmt` in the representation of its type `typ`."

@@ -270,6 +270,11 @@ const AT_DEP_DIRECT = Tuple{S} where {T<:Real,S<:T}
 const AT_DEP_NESTED = Tuple{Vector{S}} where {T<:Real,S<:T}
 at_dependent(i::Int) = (opaque(("s",)) isa AT_DEP_DIRECT, opaque((opaque(i),)) isa AT_DEP_NESTED,
                         opaque((opaque("s"),)) isa AT_DEP_NESTED)
+# (a variable whose bound is a free variable, as some stock constants: compiled, the bounds test)
+const AT_FREE_UPPER = let T = TypeVar(:T, Int, Real), S = TypeVar(:S, T)
+    UnionAll(S, Tuple{S})
+end
+at_free_upper(i::Int) = opaque((opaque("s"),)) isa AT_FREE_UPPER
 # (a tuple of a concrete type the module has, named here: by the module's types, as natively,
 # whatever the bounds: `Real<:T`, no diagonal rule; `Int<:T<:Float64`, not ordered)
 const AT_LOW = Tuple{Vararg{T}} where Real<:T<:Number
@@ -354,6 +359,7 @@ end
         @test occursin("isa of a tuple whose concrete type the module does not have", LAST_OUTPUT[])
     end
     @wtest at_dependent(1)
+    @wtest at_free_upper(1)
     for i in 0:2
         @wtest at_bounds(i)
     end
