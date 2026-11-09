@@ -206,6 +206,26 @@ end
         @test read(cmd, String) == string(repr(Base.PkgId(Base.UUID(1), "X") => 1), ' ', sprint(show, Vector{Union{}}))
     end
 
+    # (patches that are all real methods: a program's `Base.invokelatest` is still the direct call)
+    @testset "an installation without overlays" begin
+        mktempdir() do dir
+            patch = joinpath(dir, "latest_patch.jl")
+            write(patch, "@eval Base begin\ninvokelatest_trimmed(f, args...) = f(args...)\n" *
+                         "const invokelatest = invokelatest_trimmed\nend\n")
+            script = joinpath(dir, "latest_run.jl")
+            write(script, """
+                include($(repr(joinpath(@__DIR__, "harness.jl"))))
+                latest(n::Int) = Base.invokelatest(identity, n)
+                install_trim_patches!(patches=[$(repr(patch))])
+                c = WasmCodegen.compile(latest, (Int,); config=test_config(trim_patches=false))
+                print(repr((length(WasmCodegen.RESIDENT_OVERLAYS), wasm_run(c, "latest", 5; rettype=Int), latest(5),
+                            length(c.cgm.diagnostics))))
+                """)
+            cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $script`
+            @test eval(Meta.parse(read(cmd, String))) == (0, 5, 5, 0)
+        end
+    end
+
     # (overlays that replace no native method, patches of other signatures, in a process of its
     # own: looked up as Julia's lookup does with them defined, compared with the same methods
     # defined natively (`Native1`, `Native2`), and with a session's module)

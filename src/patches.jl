@@ -269,7 +269,7 @@ const RESIDENT_PATCH_MODULE = Ref{Union{Nothing,Module}}(nothing)
 # the patches installed as methods of `WASM_METHODS` (see `CC.findall(::WasmMethodTable)`): the
 # native methods they replace, and those that replace none
 const RESIDENT_OVERLAYS = Method[]
-# the world they are installed in: a compilation of an earlier world has none of the patches
+# the world of the installation: a compilation of an earlier world has none of the patches
 # (in a system image's process, every world: see `__init__`)
 const RESIDENT_WORLD = Ref{UInt}(typemax(UInt))
 resident_at(world::UInt) = !isempty(RESIDENT_OVERLAYS) && world >= RESIDENT_WORLD[]
@@ -345,5 +345,6 @@ end
 
 # what a program's `Base.invokelatest` is, juliac's `invokelatest_trimmed` (see `CC.optimize(::WasmInterpreter, ...)`)
 const DIRECT_INVOKELATEST = Ref{Any}(nothing)
-direct_invokelatest(interp) = resident_at(CC.get_inference_world(interp)) ? DIRECT_INVOKELATEST[] : nothing
+# (in the worlds of the installation, whether or not it has overlays)
+direct_invokelatest(interp) = CC.get_inference_world(interp) >= RESIDENT_WORLD[] ? DIRECT_INVOKELATEST[] : nothing
 is_resident_overlay(m::Method) = !isempty(RESIDENT_OVERLAYS) && any(r -> r === m, RESIDENT_OVERLAYS)
