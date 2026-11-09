@@ -204,6 +204,60 @@ function at_objectid(i::Int)
             objectid(opaque((opaque(:sym), opaque(i)))),
             objectid(tuple(Any[unnamed(i), i, "z", (unnamed(i),)]...)))
 end
+
+# `isa` against tuple types with bound type variables, natively by the types of the elements:
+# the diagonal rule, a variable at two elements or more of one concrete type within its bounds
+# (at one: of a type within its upper bound; at none: any), else as against the bounds
+const AT_TA = Tuple{T,Vararg{T}} where T
+const AT_TB = Tuple{Vararg{T}} where T<:Real
+const AT_UTB = Union{Nothing,AT_TB}
+const AT_TI = Tuple{Vararg{T}} where Int<:T<:Real
+const AT_TPAIR = Tuple{T,T} where T
+const AT_TSPAN = Tuple{T,S,T} where {T,S}
+const AT_TCHAR = Tuple{T,Char} where Int<:T<:Real
+# (not of the common shape: a variable in a parameter, a `Vararg` of a variable length)
+const AT_TVEC = Tuple{Any,Vector{T}} where T
+const AT_TVN = Tuple{Vararg{T,N}} where {T<:Real,N}
+at_tb_strings(n::Int) = id(Any[tuple(fill("a", n)...)])[1] isa AT_TB
+at_tb_union(n::Int) = id(Any[tuple(collect(1:n)...)])[1] isa AT_UTB
+at_ta_vararg(n::Int) = tuple(Vector{Any}(collect(1:n))...) isa AT_TA
+at_tb_ints(n::Int) = id(Any[tuple(collect(1:n)...)])[1] isa AT_TB
+function at_diag(i::Int)
+    x, y = opaque((opaque(i), opaque(2i))), opaque((opaque(i), opaque(2.5)))
+    u, v = opaque((unnamed(i), unnamed(2i))), opaque((unnamed(i), opaque(i)))
+    w, z = opaque((opaque(Int), opaque(String))), opaque((opaque(Int), opaque(Vector)))
+    return (x isa AT_TPAIR, y isa AT_TPAIR, u isa AT_TPAIR, v isa AT_TPAIR, w isa AT_TPAIR, z isa AT_TPAIR,
+            x isa AT_TI, y isa AT_TI, opaque((opaque(1.5),)) isa AT_TI, opaque((opaque(1.5), opaque(1.5))) isa AT_TI,
+            opaque((opaque(i), 'c', opaque(3i))) isa AT_TSPAN, opaque((opaque(i), 'c', opaque(3.0))) isa AT_TSPAN,
+            opaque((unnamed(i), opaque(i), unnamed(3i))) isa AT_TSPAN, opaque((opaque(1.5), 'c')) isa AT_TCHAR,
+            opaque((opaque("a"), 'c')) isa AT_TCHAR, u isa AT_TA, v isa AT_TA, x isa AT_TB, y isa AT_TB)
+end
+function at_diag_vararg(n::Int)
+    a = tuple(Any[1, 2, 3, 4.5][1:n]...)
+    b = tuple(Any[unnamed(1), unnamed(2), "s", unnamed(3)][1:n]...)
+    c = tuple(Any[1.5, 2.5, 3.5, 4.5][1:n]...)
+    return (a isa AT_TA, a isa AT_TB, a isa AT_TI, b isa AT_TA, b isa AT_TPAIR, a isa AT_TPAIR,
+            c isa AT_TI, c isa AT_TB, a isa AT_UTB, b isa AT_NUM_OR_PAIR, a isa AT_NUM_OR_PAIR)
+end
+# (a union with a member with type variables, ruled out by the elements, or of them)
+function at_union_bound(i::Int)
+    return (opaque((opaque("s"),)) isa AT_NUM_OR_PAIR, opaque((unnamed(i), unnamed(2i))) isa AT_NUM_OR_PAIR,
+            opaque((unnamed(i), opaque(i))) isa AT_NUM_OR_PAIR, opaque((opaque((unnamed(i), i)),)) isa AT_NUM_OR_PAIR,
+            opaque((opaque((unnamed(i), i)), opaque((unnamed(i), i)))) isa AT_NUM_OR_PAIR,
+            tuple(Any["s", unnamed(i), i][1:i % 3 + 1]...) isa AT_NUM_OR_PAIR)
+end
+# (not of the common shape: false where the elements are not of the bounds)
+at_shape_false(i::Int) = (opaque((unnamed(i), "s")) isa AT_TVEC, opaque((opaque("a"), opaque(i))) isa AT_TVN,
+                          tuple(Any[unnamed(i), "s"]...) isa AT_TVEC)
+# (where they are: the closed world's error; natively true)
+at_shape_error(i::Int) = opaque((unnamed(i), [i])) isa AT_TVEC
+# free type variables with a lower bound of tuples: natively `<:` of the lower bound
+@eval function at_free_lower(i::Int)
+    F, G = $(let T = TypeVar(:T, Tuple{Number}, Any); (Tuple{T}, Tuple{Union{Int,T}}); end)
+    return (opaque((opaque((opaque(i),)),)) isa F, opaque((opaque((opaque("s"),)),)) isa F,
+            opaque((opaque((unnamed(i),)),)) isa G, opaque((opaque((opaque(1.5),)),)) isa G,
+            tuple(Any[(opaque(1.5),)]...) isa G, tuple(Any[(unnamed(i),)]...) isa G, opaque((opaque(i),)) isa G)
+end
 function at_isa_vararg(n::Int)
     t = tuple(Any[Int, opaque(n), unnamed(n)][1:n]...)
     return (t isa Union{Nothing,Tuple{DataType}}, t isa Tuple{Type{Int}}, t isa Tuple{DataType,Int},
@@ -232,6 +286,27 @@ end
     end
     for n in 1:3
         @wtest at_isa_vararg(n)
+    end
+    for n in (0, 1, 2, 17)
+        @wtest at_tb_strings(n)
+        @wtest at_tb_union(n)
+        @wtest at_ta_vararg(n)
+        @wtest at_tb_ints(n)
+    end
+    for i in 1:3
+        @wtest at_diag(i)
+        @wtest at_union_bound(i)
+        @wtest at_shape_false(i)
+        @wtest at_free_lower(i)
+    end
+    for n in 0:4
+        @wtest at_diag_vararg(n)
+    end
+    # (not of the common shape, of an element of the bounds: the closed world's error)
+    @test at_shape_error(1)
+    let got = wasm_run(wcompile(at_shape_error, (Int,)), "at_shape_error", 1; rettype=Bool)
+        @test got isa Tuple && got[1] === :trap
+        @test occursin("isa of a tuple whose concrete type the module does not have", LAST_OUTPUT[])
     end
     for i in 0:2
         @wtest at_bounds(i)

@@ -332,6 +332,24 @@ function tuple_layout(t::Tuple)
     return UInt64(sz) << 32 | UInt64(alignm) << 8 | f
 end
 
+"""
+    same_tuple_type(a, b)
+
+Whether the tuples `a` and `b`, of concrete types the module does not have (objects of `Tuple`),
+are of one type: of as many elements, of one type each (`isa` of the diagonal rule).
+"""
+function same_tuple_type(@nospecialize(a), @nospecialize(b))
+    x, y = a::Tuple, b::Tuple
+    length(x) == length(y) || return false
+    for i in 1:length(x)
+        e, f = x[i], y[i]
+        g = type_layout(e) & LAYOUT_TUPLE != 0
+        g == (type_layout(f) & LAYOUT_TUPLE != 0) || return false
+        (g ? same_tuple_type(e, f) : typeof(e) === typeof(f)) || return false
+    end
+    return true
+end
+
 const TUPLE_NAME_HASH = reinterpret(UInt64, Tuple.name.hash)
 
 """
