@@ -266,6 +266,6 @@ const RESIDENT_PATCH_MODULE = Ref{Union{Nothing,Module}}(nothing)
 const RESIDENT_OVERLAYS = Method[]
 const RESIDENT_REPLACED = IdDict{Method,Method}()
 const RESIDENT_ADDED = Method[]
-# what a program's `Core.invokelatest` is, juliac's `invokelatest_trimmed` (see `CC.optimize(::WasmInterpreter, ...)`)
+# what a program's `Base.invokelatest` is, juliac's `invokelatest_trimmed` (see `CC.optimize(::WasmInterpreter, ...)`)
 const DIRECT_INVOKELATEST = Ref{Any}(nothing)
 is_resident_overlay(m::Method) = !isempty(RESIDENT_OVERLAYS) && any(r -> r === m, RESIDENT_OVERLAYS)

@@ -50,6 +50,12 @@ hue_ambiguous(n::Int) = try
 latest_helper(f, x) = f(x) + 1
 latest_union(n::Int) = (n > 0 ? Base.invokelatest : latest_helper)(latest_target, n) +
                        (n < 0 ? Base.invokelatest : latest_helper)(latest_target, n)
+# the builtin as the value of other bindings, which the patches do not rebind (only
+# `Base.invokelatest`): one object; and `Core.invokelatest` called, the builtin, as in a session
+const SAVED_LATEST = Core.invokelatest
+const BOXED_LATEST = (Core.invokelatest,)
+latest_alias(n::Int) = SAVED_LATEST === BOXED_LATEST[1] ? n : -n
+core_latest(n::Int) = Core.invokelatest(latest_target, n)
 end
 
 session_worlds(compiler_world, program_world) = (compiler_world, program_world)
@@ -83,7 +89,8 @@ end
                 (R.shade_shown, 1, Tuple{Int,UInt}), (R.shade_invoked, 2, Tuple{Int,UInt}),
                 (R.tone_returned, 1, Int), (R.latest_called, 4, Int), (R.latest_splat, 4, Int),
                 (R.latest_kw, 4, Int), (R.latest_nested, 4, Int), (R.mood_shown, 2, Int),
-                (R.hue_ambiguous, 1, Int), (R.latest_union, 4, Int), (R.dynamic, 5, Int)]
+                (R.hue_ambiguous, 1, Int), (R.latest_union, 4, Int), (R.latest_alias, 2, Int),
+                (R.core_latest, 4, Int), (R.dynamic, 5, Int)]
     config = test_config(trim=:unsafe)
     compiled(f) = WasmCodegen.compile(f, (Int,); config)
     diagnostics(c) = [(sprint(show, mi), sprint(showerror, e)) for (mi, e) in c.cgm.diagnostics]
@@ -138,7 +145,7 @@ end
         # (and what native Julia computes, but for the names of types and enums, which juliac's
         # patches print their own way)
         for ((f, n, rettype), s) in zip(programs, stock)
-            f in (R.type_named, R.fruit_named, R.bottom_named, R.hue_ambiguous, R.dynamic) && continue
+            f in (R.type_named, R.fruit_named, R.bottom_named, R.hue_ambiguous, R.core_latest, R.dynamic) && continue
             @test result(s, f, n, rettype) == f(n)
         end
         # (the ambiguity, as natively with the method the patch replaces: no method matches)
@@ -182,6 +189,39 @@ end
                "print(repr(Base.PkgId(Base.UUID(1), \"X\") => 1), ' ', sprint(show, Vector{Union{}}))"
         cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $code`
         @test read(cmd, String) == string(repr(Base.PkgId(Base.UUID(1), "X") => 1), ' ', sprint(show, Vector{Union{}}))
+    end
+
+    # (an overlay that replaces no native method, a patch of another signature, in a process of
+    # its own: looked up as Julia's lookup does with both defined, a call or an `invoke` of both
+    # ambiguous, as in a session)
+    @testset "an overlay of another signature" begin
+        mktempdir() do dir
+            patch = joinpath(dir, "added.jl")
+            write(patch, "Target.wait_forever(x::Int, y) = 10\n")
+            script = joinpath(dir, "added_run.jl")
+            write(script, """
+                include($(repr(joinpath(@__DIR__, "harness.jl"))))
+                module Target
+                wait_forever(x, y::Int) = 20
+                end
+                const BINDINGS = Pair{Symbol,Any}[:Target => Target]
+                invoked(n::Int) = try invoke(Target.wait_forever, Tuple{Int,Int}, n, n) catch e; e isa MethodError ? -1 : -2 end
+                called(n::Int) = try Target.wait_forever(n, n) catch e; e isa MethodError ? -1 : -2 end
+                patched(n::Int) = Target.wait_forever(n, "s") + Target.wait_forever("s", n)
+                config = test_config(trim=:unsafe, extra_patches=[$(repr(patch))], patch_bindings=BINDINGS)
+                run(f) = (c = WasmCodegen.compile(f, (Int,); config);
+                          (wasm_run(c, string(nameof(f)), 3; rettype=Int), length(c.cgm.diagnostics)))
+                stock = map(run, (invoked, called, patched))
+                install_trim_patches!(patches=[WasmCodegen.TRIM_PATCHES; $(repr(patch))], bindings=BINDINGS)
+                resident = map(run, (invoked, called, patched))
+                print(repr((stock, resident)))
+                """)
+            cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $script`
+            stock, resident = eval(Meta.parse(read(cmd, String)))
+            @test resident == stock
+            # (natively with both methods: only the patch's of `(3, "s")`, only the native one of `("s", 3)`)
+            @test stock[3][1] == 30
+        end
     end
 
     @testset "precompiling a package" begin
