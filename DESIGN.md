@@ -449,7 +449,10 @@ as other pointers of the build process are.
   SimpleVectors). Their `objectid` is `jl_object_id`, by type too: of each type whose
   values may be objects, the code of `objectid` for that type, compiled once the program's
   code is (until it adds no types; a type whose `objectid` cannot be compiled traps there,
-  not an error of the program). So is `getfield` of a value whose type is not concrete (an
+  not an error of the program). Both call a function per type through a table by type id
+  (arrays of function references, as the `cfunction`s are kept): constant time, and each
+  type's case stays a function the engine compiles when it runs it, not one function over
+  every type of the module. So is `getfield` of a value whose type is not concrete (an
   abstract type, a `Union`, a `UnionAll`), which natively the builtin finds by the value's
   type: of each concrete type of the module whose objects may be of that type, `getfield` of
   that type (with the native `FieldError`, `BoundsError` and `UndefRefError`), chosen by the
