@@ -22,6 +22,7 @@ include("errors.jl")
 
 "Functions the code generator calls for what Wasm lacks, compiled into the module on demand."
 module Runtime
+include("runtime/owner.jl")
 include("runtime/int128.jl")
 include("runtime/io.jl")
 include("runtime/methods.jl")

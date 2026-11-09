@@ -33,6 +33,8 @@ little-endian and unaligned, `str` a `u32` length then the bytes.
 """
 module Staging
 
+import ..owner_bytes
+
 "The memory's pages when the runtime uses it: the host interface's, then the runtime's."
 const PAGES = 97
 const SIZE = UInt32(PAGES * 65536)
@@ -178,6 +180,9 @@ end
 
 "Copy the `n` bytes at the pointer `p` to the linear memory at `off`."
 function copy_ptr_to_linear!(off::UInt32, p::Ptr{UInt8}, n::Int)
+    # (from a memory of bytes or a String: their bytes, without the pointer at each)
+    o, j = owner_bytes(p, n)
+    o === nothing || return copy_to_linear!(off, o, j, n)
     check(off, n)
     for k in 1:n
         store8(off + UInt32(k - 1), unsafe_load(p, k))
