@@ -180,6 +180,50 @@ function catch_sees_tuple_length(i::Int)
     end
     return 100 * length(x) + (isempty(x) ? 0 : x[1])
 end
+# (where it sees one of a few lengths; a tuple holding one of a few lengths; a tuple of a union
+# element; one of unknown length of another element type)
+function catch_sees_tuple_lengths(i::Int)
+    x = i > 3 ? (42,) : (42, 43)
+    try
+        coded_work(i)
+        x = Tuple(fill(7, i - 1))
+    catch
+    end
+    return 100 * length(x) + (isempty(x) ? 0 : x[1])
+end
+mutable struct TupleHolder
+    x::Tuple{Union{Tuple{Int},Tuple{Int,Int}}}
+    y::Tuple{Union{Int,Float64}}
+    z::Tuple{Vararg{Int}}
+end
+const TUPLE_HOLDER = TupleHolder(((42,),), (42,), (42, 43))
+function catch_sees_nested_lengths(i::Int)
+    x = TUPLE_HOLDER.x
+    try
+        coded_work(i)
+        x = Tuple(Tuple{Vararg{Int}}[Tuple(fill(7, i - 1))])
+    catch
+    end
+    return length(x[1])
+end
+function catch_sees_union_element(i::Int)
+    x = TUPLE_HOLDER.y
+    try
+        coded_work(i)
+        x = Tuple(fill(7, i - 1))
+    catch
+    end
+    return 100 * length(x) + (isempty(x) ? 0 : Int(x[1]))
+end
+function catch_sees_other_elements(i::Int)
+    x = TUPLE_HOLDER.z
+    try
+        coded_work(i)
+        x = Tuple(fill(7.5, i))
+    catch
+    end
+    return 100 * length(x) + (isempty(x) ? 0 : Int(2 * x[1]))
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -217,6 +261,10 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_sees_narrower_type(i)
         @wtest catch_sees_narrower_boxed(i)
         @wtest catch_sees_tuple_length(i)
+        @wtest catch_sees_tuple_lengths(i)
+        @wtest catch_sees_nested_lengths(i)
+        @wtest catch_sees_union_element(i)
+        @wtest catch_sees_other_elements(i)
     end
     for i in 1:4
         @wtest catch_parse(i)
