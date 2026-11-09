@@ -174,6 +174,11 @@ function uh_union(i::Int)
 end
 uh_bottom(a::Int) = uh_isdefined(UH{Union{}}(a))
 uh_bits(a::Int) = uh_isdefined(UH{NTuple{70,Int}}(a))
+# (a mutable type without pointers: natively a pointer, as here)
+mutable struct UHM
+    n::Int
+end
+uh_mutable(i::Int) = (h = i == 1 ? UH{UHM}(1) : UH{UHM}(1, UHM(i)); (uh_isdefined(h), uh_read(h)))
 
 # the closed-world limit: a type the module was not compiled with (natively `Val{4}`)
 valint(n::Int) = (T = Val{n}; T === Val{1} ? 1 : T === Val{2} ? 2 : 0)
@@ -266,6 +271,11 @@ end
     end
     @wtest RT.uh_bottom(1)
     @wtest RT.uh_bits(1)
+    @wtest RT.uh_mutable(1)
+    @wtest RT.uh_mutable(2)
+    # (natively a pointer, here no reference: refused, not answered wrong)
+    @test occursin("isdefined of a field of type Tuple{Type{Int64}}",
+                   unsupported_report(h -> RT.uh_isdefined(RT.UH{Tuple{Type{Int}}}(h)), (Int,)))
     @test has_apply_type(wcompile(RT.bounded_caught, (Int,)), RT.Bounded, 1)
     @test has_apply_type(wcompile(RT.valparam_caught, (Int,)), Val, 1)
     @test has_apply_type(wcompile(RT.tupleparam_caught, (Int,)), Tuple, 2)

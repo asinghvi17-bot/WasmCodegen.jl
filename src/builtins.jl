@@ -257,8 +257,9 @@ when defined (a tuple with union elements, natively a pointer, is inline here, i
 elements boxed).
 """
 function undef_leaf(ts::Types, @nospecialize(FT))
-    # (no pointers natively, though some are objects here: large isbits tuples)
-    FT isa DataType && isconcretetype(FT) && Base.datatype_pointerfree(FT) && return nothing
+    # (stored inline natively without pointers, though some are objects here: large isbits tuples)
+    FT isa DataType && isconcretetype(FT) && Base.allocatedinline(FT) && Base.datatype_pointerfree(FT) &&
+        return nothing
     l = layout(ts, FT)
     l.kind === Boxed && return 1            # one reference here (null if unset)
     l.kind === Inline || return nothing     # (a singleton: no leaves)
@@ -280,6 +281,9 @@ function check_field_defined!(fc::FnCtx, @nospecialize(T), i::Int, v::CGVal)
     FT = fieldtype(T, i)
     zero_defined(FT) && return
     k = undef_leaf(fc.cgm.types, FT)
+    # (of a field natively a pointer but stored here without a reference, `Tuple{Type{Int}}`,
+    # an undefined one cannot be told: read as its value, where natively an UndefRefError;
+    # its `isdefined` is refused, `emit_isdefined!`)
     (k === nothing || v.kind === Ghost || v.kind === Bottom) && return
     push_leaf!(fc, v.leaves[k]); emit!(fc.b, :ref_is_null)
     if!(fc.b); throw_error!(fc, Runtime.throw_undefref_error); end!(fc.b)
@@ -517,8 +521,12 @@ function emit_isdefined!(fc::FnCtx, x::CGVal, i::Int)
     (maybe_undef_field(T, i) && !isempty(l.fields) && l.elements === nothing) ||
         return const_value(fc, true)
     # (a field of type `Union{}` is never assigned)
-    fieldtype(T, i) === Union{} && return const_value(fc, false)
-    k = undef_leaf(fc.cgm.types, fieldtype(T, i))
+    FT = fieldtype(T, i)
+    FT === Union{} && return const_value(fc, false)
+    k = undef_leaf(fc.cgm.types, FT)
+    # (natively a pointer, but here of no reference that could be null: `Tuple{Type{Int}}`)
+    k === nothing && !Base.allocatedinline(FT) &&
+        unsupported("isdefined of a field of type ", FT, ", which constructors may leave out and is stored without a reference here")
     k === nothing && return const_value(fc, true)
     if l.kind === Boxed
         tmp = materialize!(fc, x)
