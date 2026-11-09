@@ -1124,12 +1124,17 @@ function emit_splatnew_rt!(fc::FnCtx, T::CGVal, args::Vector{CGVal}, @nospeciali
     return emit_new_rt!(fc, T, args, typ)
 end
 
+# whether natively the layout of the concrete type `C` is opaque (not a struct's: `new` of it is a
+# TypeError, before its number of fields is checked)
+opaque_layout(@nospecialize(C)) =
+    is_memory_type(C) || C === String || C === Symbol || C === Core.SimpleVector || C === Module
+
 # whether `C` is a concrete type `new` of a type known only at run time, of inferred type
 # `Tinf`, may build with `n` fields (`nothing`: of that type, but not with `n` fields, natively
 # "invalid struct allocation")
 function new_case_kind(ts::Types, @nospecialize(C), @nospecialize(Tinf), n::Int)
     (C isa DataType && isconcretetype(C) && C isa Tinf) || return false
-    (is_memory_type(C) || C === String || C === Symbol || C === Core.SimpleVector || C === Module) && return false
+    opaque_layout(C) && return false
     any(R -> C === R, RUNTIME_TYPES) && return false
     fieldcount(C) - C.name.n_uninitialized <= n <= fieldcount(C) || return nothing
     return true
@@ -1228,9 +1233,11 @@ function finish_new!(cgm::CGModule)
         emit!(b, :local_get, 0); emit!(b, :ref_cast, st); emit!(b, :struct_get, st, 2); emit!(b, :local_set, tid)
         end!(b)
         for (id, C) in enumerate(ts.typelist)
-            # (of any concrete type, as `jl_new_structt` checks the number before the type: also
-            # of those `new` builds no case of, `UnionAll`, `String`, ...)
-            (C isa DataType && isconcretetype(C) && fieldcount(C) != n && any(B -> C isa B, bounds)) || continue
+            # (of any concrete type of a struct's layout, as `jl_new_structt` checks the number
+            # before the type: also of those `new` builds no case of, `UnionAll`, ...; of an opaque
+            # layout, `String`, the TypeError comes first)
+            (C isa DataType && isconcretetype(C) && !opaque_layout(C) && fieldcount(C) != n &&
+             any(B -> C isa B, bounds)) || continue
             emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
             if!(b)
             emit!(b, :i64_const, n); emit!(b, :i64_const, fieldcount(C))

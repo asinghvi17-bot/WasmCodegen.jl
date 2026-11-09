@@ -134,7 +134,7 @@ struct AtPart{T}
     AtPart{T}(a, b) where {T} = new{T}(a, b)
 end
 const AtPartType = Type{<:AtPart}
-const AtTypeType = Type{<:Type}
+const AtTypeType = Union{Type{<:Type}, Type{String}, Type{Symbol}, Type{Memory{Int}}}
 @noinline at_ptype(i::Int) = Base.inferencebarrier(i > 0 ? AtPart{Int} : AtPart{Float64})::AtPartType
 @generated at_sn(i, t) = Expr(:splatnew, :(at_ptype(i)), :t)
 at_arity_msg(e) = e isa ArgumentError ? (occursin("too few arguments (expected 2)", e.msg::String) ? -1 :
@@ -143,7 +143,8 @@ at_splat1(a::Int) = try (at_sn(a, (a,)); 1) catch e; at_arity_msg(e) end
 at_splat2(a::Int) = (p = at_sn(a, (a, a + 1)); p isa AtPart{Int} ? p.a + p.b : -1)
 at_splat3(a::Int) = try (at_sn(a, (a, a, a)); 1) catch e; at_arity_msg(e) end
 # (of the runtime's own types, of which `new` builds nothing: the number first, as natively)
-@noinline at_rtype(i::Int) = Base.inferencebarrier(i == 1 ? UnionAll : i == 2 ? Union : DataType)::AtTypeType
+@noinline at_rtype(i::Int) = Base.inferencebarrier(i == 1 ? UnionAll : i == 2 ? Union : i == 3 ? DataType :
+                                                     i == 4 ? String : i == 5 ? Symbol : Memory{Int})::AtTypeType
 @generated at_sn_rt(i, t) = Expr(:splatnew, :(at_rtype(i)), :t)
 at_splat_rt(i::Int) = try (at_sn_rt(i, (1,)); 0) catch e; e isa ArgumentError ? 1 : e isa TypeError ? 2 : 3 end
 # (compared with a type, as `<: Tuple` of it is folded by inference)
@@ -361,7 +362,8 @@ end
         @wtest at_splat3(a)
     end
     @wtest at_splat2(2)
-    for i in 1:3
+    # (of an opaque layout, `String`, `Symbol`, `Memory`: the TypeError first, as natively)
+    for i in 1:6
         @wtest at_splat_rt(i)
     end
     # (with trim = :safe: none of them is an unsupported construct)
