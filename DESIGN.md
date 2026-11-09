@@ -110,18 +110,24 @@ keeps Core's binding), and the simplified printers of types, type names, functio
 the package loader sends `repr`s of `PkgId`s to a precompiling process as code, which then had
 `PkgId` for `Base.PkgId`. A function an overlay replaces that the native module does not have
 (`wait_forever` on 1.12, some initializers) is declared without methods, for the overlay to
-have a function, and an initializer is a native no-op, since loading a module calls it. These overlays replace only the native method of their own
-signature, as the patch's method does in a session: native methods more specific than one
-(Base's `show(::IO, ::Core.TypeofBottom)`, a package's `show` of its enum) are still the ones
-called (by `findall` and `findsup`), where an overlay of `WasmMethodTable` otherwise hides
-every method it covers. The real methods do natively what Base does (IO and the file
+have a function, and an initializer is a native no-op, since loading a module calls it. These overlays are looked up as the patch's method is in a
+session: in the native lookup (`findall`, `findsup`), in place of the native method of their
+own signature, which the patch's method replaces, so in its place in Julia's specificity order
+and with its ambiguities (native methods more specific than one, Base's
+`show(::IO, ::Core.TypeofBottom)` or a package's `show` of its enum, varargs included, are still
+the ones called, and a call ambiguous with the replaced method still is); one that replaces no
+native method is placed by Julia's specificity. (An overlay of `WasmMethodTable` otherwise hides
+every method it covers.) The real methods do natively what Base does (IO and the file
 system through the runtime, whose functions call the methods before the installation:
 `Runtime.original`; paths split by bytes; Random's vector operations element by element), or
 change only messages (assertions, deprecations) and specialization (`max_args`). The one
 constant juliac rebinds is not rebound: the process's `Base.invokelatest` stays the builtin
-`Core.invokelatest`, so where a program calls the builtin (directly, or applied to splatted
-arguments), the module's interpreter infers it as juliac's `invokelatest_trimmed` and replaces
-it with that before optimizing, as the rebinding does in a session.
+`Core.invokelatest`, so where a program reads it from that binding (as a `GlobalRef`, or as
+Julia 1.13 lowers `Base.invokelatest`, `getproperty(Base, :invokelatest)`: also a value, as one
+of the callees of a call) or calls the builtin (directly, or applied to splatted arguments), the
+module's interpreter infers it as juliac's `invokelatest_trimmed` and replaces it with that
+before optimizing, as the rebinding does in a session. Another session in the process must have
+the same patches and bindings, by identity (`same_session`).
 
 **The compiler runs in its own world**: the world WasmCodegen was loaded in. All of
 `compile` runs through `invoke_in_world(COMPILER_WORLD, ...)`, so the compiler's native

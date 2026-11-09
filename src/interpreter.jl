@@ -86,67 +86,103 @@ end
 WasmMethodTable(world::UInt, extensions=()) = WasmMethodTable(world, Runtime.overlay_tables(extensions))
 
 # (`CC.OverlayMethodTable`'s, for a list of tables: the matches of each table but those a
-# match of an earlier table covers, up to the first table whose last match covers `sig`. A
-# patch installed as an overlay (`install_trim_patches!`) replaces only the method of its own
-# signature, as the method a session defines does: a later table's match more specific than it
-# is kept, before it, and the tables after it are still looked at.)
+# match of an earlier table covers, up to the first table whose last match covers `sig`. The
+# patches installed as overlays (`install_trim_patches!`) are looked up as the methods a session
+# defines: in the native table, see `resident_matches`.)
 function CC.findall(@nospecialize(sig::Type), t::WasmMethodTable; limit::Int=-1)
     matches = Any[]
     min_world, max_world = typemin(UInt), typemax(UInt)
-    ambig = resident = false
+    ambig = false
     for mt in Union{Nothing,Core.MethodTable}[t.tables; nothing]
         result = CC._findall(sig, mt, t.world, limit)
         result === nothing && return nothing
-        earlier = length(matches)
-        for match in result.matches
-            m = (match::Core.MethodMatch).method
-            k = findfirst(i -> m.sig <: (matches[i]::Core.MethodMatch).method.sig, 1:earlier)
-            if k === nothing
-                push!(matches, match)
-            elseif is_resident_overlay(matches[k].method) && !(matches[k].method.sig <: m.sig)
-                insert!(matches, k, match)
-                earlier += 1
-                resident = true
+        ms, amb = result.matches, result.ambig
+        if !isempty(RESIDENT_OVERLAYS)
+            if mt === nothing
+                ms, amb = resident_matches(sig, ms, amb)
+            else
+                # (the installed ones: in the native table; an ambiguity with them is not this table's)
+                n = length(ms)
+                ms = filter(m -> !is_resident_overlay((m::Core.MethodMatch).method), ms)
+                amb &= length(ms) == n
             end
+        end
+        earlier = length(matches)
+        for match in ms
+            dominated = any(i -> (match::Core.MethodMatch).method.sig <: (matches[i]::Core.MethodMatch).method.sig,
+                            1:earlier)
+            dominated || push!(matches, match)
         end
         min_world = max(min_world, result.valid_worlds.min_world)
         max_world = min(max_world, result.valid_worlds.max_world)
-        ambig |= result.ambig
-        nr = length(result)
-        nr ≥ 1 && result[nr].fully_covers || continue
-        is_resident_overlay(result[nr].method) || break
-        resident = true
+        ambig |= amb
+        nr = length(ms)
+        nr ≥ 1 && (ms[nr]::Core.MethodMatch).fully_covers && break
     end
-    if resident
-        # (the matches after one that covers `sig` are not called; and as many as `limit`)
-        k = findfirst(m -> (m::Core.MethodMatch).fully_covers, matches)
-        k === nothing || resize!(matches, k)
-        limit ≥ 0 && length(matches) > limit && return nothing
-    end
+    limit ≥ 0 && length(matches) > limit && return nothing
     return CC.MethodLookupResult(matches, CC.WorldRange(min_world, max_world), ambig)
 end
 
-# (the match of the first table that has one; for a patch installed as an overlay, the native
-# match if it is more specific, as in `findall`)
+# (the match of the first table that has one; of the patches installed as overlays, as in `findall`)
 function CC.findsup(@nospecialize(sig::Type), t::WasmMethodTable)
     min_world, max_world = typemin(UInt), typemax(UInt)
     for mt in Union{Nothing,Core.MethodTable}[t.tables; nothing]
         match, valid_worlds = CC._findsup(sig, mt, t.world)
         min_world = max(min_world, valid_worlds.min_world)
         max_world = min(max_world, valid_worlds.max_world)
-        match === nothing && continue
-        if mt !== nothing && is_resident_overlay(match.method)
-            native, valid_worlds = CC._findsup(sig, nothing, t.world)
-            min_world = max(min_world, valid_worlds.min_world)
-            max_world = min(max_world, valid_worlds.max_world)
-            if native !== nothing && native.method.sig <: match.method.sig &&
-                    !(match.method.sig <: native.method.sig)
-                match = native
+        if !isempty(RESIDENT_OVERLAYS)
+            if mt === nothing
+                match = resident_sup(sig, match)
+            elseif match !== nothing && is_resident_overlay(match.method)
+                match = nothing
             end
         end
-        return match, CC.WorldRange(min_world, max_world)
+        match === nothing || return match, CC.WorldRange(min_world, max_world)
     end
     return nothing, CC.WorldRange(min_world, max_world)
+end
+
+# The native matches of `sig`, with the patches installed as overlays as the methods a session
+# defines: an overlay in place of the native method of its signature, which that method would
+# replace (so in its place in Julia's specificity order, and with its ambiguities); one that
+# replaces none (a function the process lacks natively), placed by Julia's specificity.
+function resident_matches(@nospecialize(sig), natives::Vector{Any}, ambig::Bool)
+    ms = Any[]
+    for match in natives
+        o = get(RESIDENT_REPLACED, (match::Core.MethodMatch).method, nothing)
+        push!(ms, o === nothing ? match : overlay_match(sig, o, match.fully_covers))
+    end
+    for o in RESIDENT_ADDED
+        typeintersect(sig, o.sig) === Union{} && continue
+        k = findfirst(m -> Base.morespecific(o, (m::Core.MethodMatch).method), ms)
+        k = something(k, length(ms) + 1)
+        # (ambiguous with a match it is not ordered with)
+        ambig |= any(m -> !Base.morespecific((m::Core.MethodMatch).method, o) &&
+                          typeintersect(m.spec_types, o.sig) !== Union{}, ms[1:k-1])
+        insert!(ms, k, overlay_match(sig, o, sig <: o.sig))
+        # (the matches after one that covers `sig` are not called)
+        c = findfirst(m -> (m::Core.MethodMatch).fully_covers, ms)
+        c === nothing || resize!(ms, c)
+    end
+    return ms, ambig
+end
+
+# (`findsup`'s, as `resident_matches`)
+function resident_sup(@nospecialize(sig), match::Union{Nothing,Core.MethodMatch})
+    if match !== nothing
+        o = get(RESIDENT_REPLACED, match.method, nothing)
+        o === nothing || (match = overlay_match(sig, o, match.fully_covers))
+    end
+    for o in RESIDENT_ADDED
+        sig <: o.sig && (match === nothing || Base.morespecific(o, match.method)) || continue
+        match = overlay_match(sig, o, true)
+    end
+    return match
+end
+
+function overlay_match(@nospecialize(sig), o::Method, fully_covers::Bool)
+    ti, env = ccall(:jl_type_intersection_with_env, Any, (Any, Any), sig, o.sig)::Core.SimpleVector
+    return Core.MethodMatch(ti, env, o, fully_covers)
 end
 CC.isoverlayed(::WasmMethodTable) = false
 
@@ -207,9 +243,9 @@ CC.get_max_methods(interp::WasmInterpreter, sv::CC.AbsIntState) =
 # A resident session (`install_trim_patches!`) leaves `Base.invokelatest` the builtin
 # `Core.invokelatest`, which the process itself needs, where juliac's patches rebind it to
 # `invokelatest_trimmed`, a direct call (a trimmed program's world does not advance). So the
-# builtin called (directly, or applied to splatted arguments) is inferred as
-# `invokelatest_trimmed`, and is replaced by it before the optimizer: the code a session
-# compiles.
+# builtin read from its binding, or called (directly, or applied to splatted arguments), is
+# inferred as `invokelatest_trimmed`, and is replaced by it before the optimizer: the code a
+# session compiles.
 function CC.optimize(interp::WasmInterpreter, opt::CC.OptimizationState, caller::CC.InferenceResult)
     direct = DIRECT_INVOKELATEST[]
     direct === nothing || direct_invokelatest!(opt, direct)
@@ -220,13 +256,42 @@ end
 function direct_invokelatest!(opt::CC.OptimizationState, @nospecialize(direct))
     src = opt.src
     isconst(x, f) = CC.singleton_type(CC.argextype(x, src, opt.sptypes)) === f
-    for stmt in src.code
+    # (a binding of the builtin, read as a value: `(c ? Base.invokelatest : f)(x)`, inferred as
+    # `invokelatest_trimmed`, see `abstract_eval_globalref` and `invokelatest_binding`)
+    builtin(x) = x isa GlobalRef && invokelatest_binding(x.mod, x.name)
+    function binding_read(x)
+        Meta.isexpr(x, :call) && length(x.args) == 3 || return false
+        f = CC.singleton_type(CC.argextype(x.args[1], src, opt.sptypes))
+        (f === getglobal || f === getproperty) || return false
+        m, s = (CC.argextype(a, src, opt.sptypes) for a in x.args[2:3])
+        return m isa CC.Const && m.val isa Module && s isa CC.Const && s.val isa Symbol &&
+               invokelatest_binding(m.val, s.val)
+    end
+    for (i, stmt) in enumerate(src.code)
+        (builtin(stmt) || binding_read(stmt)) && (src.code[i] = stmt = direct)
+        Meta.isexpr(stmt, :(=)) && (builtin(stmt.args[2]) || binding_read(stmt.args[2])) && (stmt.args[2] = direct)
         call = Meta.isexpr(stmt, :(=)) ? stmt.args[2] : stmt
         Meta.isexpr(call, :call) && !isempty(call.args) || continue
         k = length(call.args) ≥ 3 && isconst(call.args[1], Core._apply_iterate) ? 3 : 1
         isconst(call.args[k], Core.invokelatest) && (call.args[k] = direct)
+        for j in 1:length(call.args)
+            builtin(call.args[j]) && (call.args[j] = direct)
+        end
     end
     return nothing
+end
+
+# whether the binding `m.s` is the builtin `invokelatest` (`Base.invokelatest`)
+invokelatest_binding(m::Module, s::Symbol) =
+    Base.isdefinedglobal(m, s) && Base.isconst(m, s) && getglobal(m, s) === Core.invokelatest
+
+function CC.abstract_eval_globalref(interp::WasmInterpreter, g::GlobalRef, saw_latestworld::Bool,
+                                    sv::CC.AbsIntState)
+    ret = @invoke CC.abstract_eval_globalref(interp::CC.AbstractInterpreter, g::GlobalRef,
+                                             saw_latestworld::Bool, sv::CC.AbsIntState)
+    direct = DIRECT_INVOKELATEST[]
+    (direct !== nothing && ret.rt isa CC.Const && ret.rt.val === Core.invokelatest) || return ret
+    return CC.RTEffects(CC.Const(direct), ret.exct, ret.effects, ret.refinements)
 end
 
 function CC.abstract_call_known(interp::WasmInterpreter, @nospecialize(f),
@@ -238,6 +303,15 @@ function CC.abstract_call_known(interp::WasmInterpreter, @nospecialize(f),
     if f === Core.invokelatest && direct !== nothing
         argtypes = Any[CC.Const(direct); arginfo.argtypes[2:end]]
         return CC.abstract_call_known(interp, direct, CC.ArgInfo(arginfo.fargs, argtypes), si, sv, max_methods)
+    end
+    # (the binding read by `getproperty`/`getglobal` of the module, as `Base.invokelatest` is
+    # lowered on Julia 1.13: as `abstract_eval_globalref`'s read)
+    if direct !== nothing && (f === getproperty || f === getglobal) && length(arginfo.argtypes) == 3
+        m, s = arginfo.argtypes[2], arginfo.argtypes[3]
+        if m isa CC.Const && m.val isa Module && s isa CC.Const && s.val isa Symbol &&
+                invokelatest_binding(m.val, s.val)
+            return CC.Future{CC.CallMeta}(CC.CallMeta(CC.Const(direct), Union{}, CC.EFFECTS_TOTAL, CC.NoCallInfo()))
+        end
     end
     return @invoke CC.abstract_call_known(interp::CC.AbstractInterpreter, f::Any,
                                           arginfo::CC.ArgInfo, si::CC.StmtInfo,

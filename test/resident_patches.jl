@@ -30,6 +30,26 @@ latest_kw(n::Int) = Base.invokelatest(kw_target, n; k=3) + Base.@invokelatest(kw
 latest_nested(n::Int) = Base.invokelatest(Base.invokelatest, latest_target, n)
 const SINK = Ref{Any}(1)
 dynamic(n::Int) = SINK[] + n
+# a method of the program's more specific than the one a patch replaces (`show(::IO, ::Enum)`),
+# by Julia's specificity though not by subtyping (varargs)
+@enum Mood calm
+Base.show(io::IO, xs::Mood...) = 17
+mood_shown(n::Int) = show(IOBuffer(), calm) === 17 ? n : -n
+# a call ambiguous between a method of the program's and the one a patch replaces: natively
+# a MethodError (here, a call the module does not compile, as in a session)
+@enum Hue red
+struct HueSink <: IO end
+Base.show(::HueSink, x) = nothing
+hue_ambiguous(n::Int) = try
+        show(HueSink(), red)
+        n
+    catch e
+        e isa MethodError ? 2n : 3n
+    end
+# `Base.invokelatest` as a value, one of the callees of a call
+latest_helper(f, x) = f(x) + 1
+latest_union(n::Int) = (n > 0 ? Base.invokelatest : latest_helper)(latest_target, n) +
+                       (n < 0 ? Base.invokelatest : latest_helper)(latest_target, n)
 end
 
 session_worlds(compiler_world, program_world) = (compiler_world, program_world)
@@ -62,7 +82,8 @@ end
                 (R.fruit_named, 2, Tuple{Int,UInt}), (R.bottom_named, 1, Tuple{Int,UInt}),
                 (R.shade_shown, 1, Tuple{Int,UInt}), (R.shade_invoked, 2, Tuple{Int,UInt}),
                 (R.tone_returned, 1, Int), (R.latest_called, 4, Int), (R.latest_splat, 4, Int),
-                (R.latest_kw, 4, Int), (R.latest_nested, 4, Int), (R.dynamic, 5, Int)]
+                (R.latest_kw, 4, Int), (R.latest_nested, 4, Int), (R.mood_shown, 2, Int),
+                (R.hue_ambiguous, 1, Int), (R.latest_union, 4, Int), (R.dynamic, 5, Int)]
     config = test_config(trim=:unsafe)
     compiled(f) = WasmCodegen.compile(f, (Int,); config)
     diagnostics(c) = [(sprint(show, mi), sprint(showerror, e)) for (mi, e) in c.cgm.diagnostics]
@@ -117,9 +138,15 @@ end
         # (and what native Julia computes, but for the names of types and enums, which juliac's
         # patches print their own way)
         for ((f, n, rettype), s) in zip(programs, stock)
-            f in (R.type_named, R.fruit_named, R.bottom_named, R.dynamic) && continue
+            f in (R.type_named, R.fruit_named, R.bottom_named, R.hue_ambiguous, R.dynamic) && continue
             @test result(s, f, n, rettype) == f(n)
         end
+        # (the ambiguity, as natively with the method the patch replaces: no method matches)
+        sig = Tuple{typeof(show), R.HueSink, R.Hue}
+        w = Base.get_world_counter()
+        found = Core.Compiler.findall(sig, WasmCodegen.WasmMethodTable(w))
+        @test isempty(Base._methods_by_ftype(sig, -1, w)) && found !== nothing && isempty(found.matches)
+        @test (try show(R.HueSink(), R.red); 1 catch e; e isa MethodError ? 2 : 3 end) == 2
     end
 
     @testset "the process keeps Base's behavior" begin
@@ -149,7 +176,9 @@ end
     # (the patches as a new process installs them: where a function an overlay attaches to is
     # not native, not left behind by a session that deleted its method)
     @testset "installing in a new process" begin
-        code = "using WasmCodegen; install_trim_patches!(); install_trim_patches!(); " *
+        # (again with the same bindings, by identity: a NaN is one)
+        code = "using WasmCodegen; install_trim_patches!(bindings=Pair{Symbol,Any}[:s => NaN]); " *
+               "install_trim_patches!(bindings=Pair{Symbol,Any}[:s => NaN]); " *
                "print(repr(Base.PkgId(Base.UUID(1), \"X\") => 1), ' ', sprint(show, Vector{Union{}}))"
         cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $code`
         @test read(cmd, String) == string(repr(Base.PkgId(Base.UUID(1), "X") => 1), ' ', sprint(show, Vector{Union{}}))

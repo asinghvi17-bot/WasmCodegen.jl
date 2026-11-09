@@ -68,8 +68,7 @@ function with_trim_patches(f; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}[])
     key = (String[abspath(p) for p in patches], Pair{Symbol,Any}[bindings...])
     open_session = PATCH_SESSION[]
     if open_session !== nothing
-        open_session[1] == key[1] && length(open_session[2]) == length(key[2]) &&
-            all(((a, b),) -> a.first === b.first && a.second === b.second, zip(open_session[2], key[2])) ||
+        same_session(open_session, key) ||
             error("with_trim_patches: a session of patches is open with other patches or bindings " *
                   "(nested sessions must have the same ones)")
         return f(COMPILER_WORLD[], Base.get_world_counter())
@@ -190,6 +189,11 @@ function resident_trim_expr(ex)
     return Expr(ex.head, map(resident_trim_expr, ex.args)...)
 end
 
+# whether a session's patches and bindings (by identity) are those of `key`
+same_session(session, key) =
+    session[1] == key[1] && length(session[2]) == length(key[2]) &&
+    all(((a, b),) -> a.first === b.first && a.second === b.second, zip(session[2], key[2]))
+
 """
     install_trim_patches!(; patches=TRIM_PATCHES, bindings=[])
 
@@ -219,7 +223,7 @@ function install_trim_patches!(; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}
     any(p -> p in abspath.(TASK_PATCHES), key[1]) &&
         error("install_trim_patches!: TASK_PATCHES require a transient session")
     if PATCH_SESSION[] !== nothing
-        PATCH_SESSION[] == key || error("install_trim_patches!: another patch session is open")
+        same_session(PATCH_SESSION[], key) || error("install_trim_patches!: another patch session is open")
         RESIDENT_PATCH_MODULE[] !== nothing ||
             error("install_trim_patches!: cannot make a transient session permanent")
         return nothing
@@ -236,6 +240,16 @@ function install_trim_patches!(; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}
         Base.include(resident_trim_expr, sandbox, file)
     end
     Base.visit(m -> m.primary_world > w0 && push!(RESIDENT_OVERLAYS, m), Runtime.WASM_METHODS)
+    # (each, of those of the world now, in place of the native method of its signature, which a
+    # session's patch replaces; or one the process lacks natively)
+    w = Base.get_world_counter()
+    for o in RESIDENT_OVERLAYS
+        current = CC._findall(o.sig, Runtime.WASM_METHODS, w, -1)
+        current !== nothing && any(m -> m.method === o, current.matches) || continue
+        natives = CC._findall(o.sig, nothing, w, -1)
+        k = natives === nothing ? nothing : findfirst(m -> m.method.sig == o.sig, natives.matches)
+        k === nothing ? push!(RESIDENT_ADDED, o) : (RESIDENT_REPLACED[natives.matches[k].method] = o)
+    end
     if Base.invoke_in_world(Base.get_world_counter(), isdefined, Base, :invokelatest_trimmed)
         DIRECT_INVOKELATEST[] = latest_global(Base, :invokelatest_trimmed)
     end
@@ -247,8 +261,11 @@ end
 # Keep the patch module reachable for system-image serialization.
 const RESIDENT_PATCH_MODULE = Ref{Union{Nothing,Module}}(nothing)
 
-# the patches installed as methods of `WASM_METHODS` (see `CC.findall(::WasmMethodTable)`)
+# the patches installed as methods of `WASM_METHODS` (see `CC.findall(::WasmMethodTable)`): the
+# native methods they replace, and those that replace none
 const RESIDENT_OVERLAYS = Method[]
+const RESIDENT_REPLACED = IdDict{Method,Method}()
+const RESIDENT_ADDED = Method[]
 # what a program's `Core.invokelatest` is, juliac's `invokelatest_trimmed` (see `CC.optimize(::WasmInterpreter, ...)`)
 const DIRECT_INVOKELATEST = Ref{Any}(nothing)
 is_resident_overlay(m::Method) = !isempty(RESIDENT_OVERLAYS) && any(r -> r === m, RESIDENT_OVERLAYS)
