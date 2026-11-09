@@ -110,7 +110,8 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         r = emit_intrinsic128!(fc, f, args, typ)
         r === nothing || return r
     end
-    if f !== II.bitcast && !(f in NO_FOLD) && (any(a -> a.typ === Float16, args) || typ === Float16)
+    # (but for a byte swap, of a Float16's bits as of a UInt16's, `emit_bswap!`)
+    if f !== II.bitcast && f !== II.bswap_int && !(f in NO_FOLD) && (any(a -> a.typ === Float16, args) || typ === Float16)
         return emit_float16!(fc, f, args, typ)
     end
     if haskey(INT_BINOPS, f)

@@ -38,13 +38,15 @@ divs(a::Int, b::Int) = (div(a, b), rem(a, b))
     @wtest divs(1, 0)
 end
 
-# byte swaps of floats: `bswap`, `hton` and `ntoh` of a Float64 or Float32 are the intrinsic
+# byte swaps of floats: `bswap`, `hton` and `ntoh` of a Float64, Float32 or Float16 are the intrinsic
 # `bswap_int` of the float, natively a swap of its bits (in and out by their bits, so that NaN
 # payloads are compared too)
 bswap_f64(b::UInt64) = (x = reinterpret(Float64, b);
     (reinterpret(UInt64, bswap(x)), reinterpret(UInt64, hton(x)), reinterpret(UInt64, ntoh(x)), reinterpret(UInt64, ntoh(hton(x)))))
 bswap_f32(b::UInt32) = (x = reinterpret(Float32, b);
     (reinterpret(UInt32, bswap(x)), reinterpret(UInt32, hton(x)), reinterpret(UInt32, ntoh(x)), reinterpret(UInt32, ntoh(hton(x)))))
+bswap_f16(b::UInt16) = (x = reinterpret(Float16, b);
+    (reinterpret(UInt16, bswap(x)), reinterpret(UInt16, hton(x)), reinterpret(UInt16, ntoh(x)), reinterpret(UInt16, ntoh(hton(x)))))
 # (a swapped float used as a float)
 bswap_twice(x::Float64, y::Float32) = (bswap(bswap(x)) + 1.0, bswap(bswap(y)) * 2.0f0)
 
@@ -57,6 +59,9 @@ bswap_twice(x::Float64, y::Float32) = (bswap(bswap(x)) + 1.0, bswap(bswap(y)) * 
     end
     for b in (reinterpret(UInt32, 1.5f0), reinterpret(UInt32, -0.0f0), 0x7fc00001, 0x7f800001, 0x00000001, 0x0000c07f)
         @wtest bswap_f32(b)
+    end
+    for b in (reinterpret(UInt16, Float16(1.5)), reinterpret(UInt16, -zero(Float16)), 0x7e01, 0x7c01, 0x0001, 0x00fe)
+        @wtest bswap_f16(b)
     end
     @wtest bswap_twice(1.5, 2.25f0)
 end
