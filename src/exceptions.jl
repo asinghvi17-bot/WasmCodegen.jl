@@ -160,6 +160,9 @@ error (`Runtime.throw_isa_unknown`: not one the elements' types decide, `tuple_d
 """
 function upsilon_test_type(@nospecialize(T))
     T isa Union && return Union{upsilon_test_type(T.a),upsilon_test_type(T.b)}
+    test(P) = P isa Core.TypeofVararg ?
+        (isdefined(P, :N) ? Vararg{upsilon_test_type(P.T),P.N} : isdefined(P, :T) ? Vararg{upsilon_test_type(P.T)} : P) :
+        P isa Type ? upsilon_test_type(P) : P
     if T isa UnionAll
         has_tuple_members(T) || return T
         U = Base.unwrap_unionall(T)
@@ -167,17 +170,16 @@ function upsilon_test_type(@nospecialize(T))
                                     upsilon_test_type(Base.rewrap_unionall(U.b, T))}
         D = tuple_datatype(T)
         if D === nothing
-            B = tuple_bounds_type(T)
-            C = upsilon_test_type(B)
-            # (decided by its elements' types, as its bounds' tests are)
-            return bound_tuple_shape(T) !== nothing && C == B ? T : C
+            sh = bound_tuple_shape(T)
+            (sh === nothing || !all(v -> upsilon_test_type(v.ub) == v.ub, sh.vars)) &&
+                return upsilon_test_type(tuple_bounds_type(T))
+            # (decided by its elements' types: its variables' elements, by bounds whose tests
+            # are, and its other members, which have none of its variables)
+            return Base.rewrap_unionall(Tuple{Any[test(P) for P in U.parameters]...}, T)
         end
         T = D
     end
     (T isa DataType && T.name === Tuple.name) || return T
-    test(P) = P isa Core.TypeofVararg ?
-        (isdefined(P, :N) ? Vararg{upsilon_test_type(P.T),P.N} : isdefined(P, :T) ? Vararg{upsilon_test_type(P.T)} : P) :
-        P isa Type ? upsilon_test_type(P) : P
     return Tuple{Any[test(P) for P in T.parameters]...}
 end
 

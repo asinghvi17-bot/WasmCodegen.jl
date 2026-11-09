@@ -314,6 +314,35 @@ function catch_sees_pairs_or(i::Int)
     end
     return length(x::Tuple)
 end
+# (and in a type with a variable of its own, whose constraint stays)
+mutable struct NestedPairsHolder
+    x::Tuple{Vararg{Tuple{A,A,Tuple{Vector{B},B} where B} where A}}
+end
+const NESTED_PAIRS_HOLDER = NestedPairsHolder(((42, 42, ([1], 1)),))
+function catch_sees_nested_pairs(i::Int)
+    x = NESTED_PAIRS_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? ((1, 2.0, ([1], 1)),) : ((1, 2, ([1], 1)), (3, 4, ([2], 2))))
+    catch
+    end
+    return length(x::Tuple)
+end
+# (and in a variable's bound: the tuple is of the type)
+mutable struct BoundPairsHolder
+    x::Tuple{A,A} where A<:(Tuple{Tuple{Vararg{Z}},Z} where Z)
+end
+const BOUND_PAIRS_HOLDER = BoundPairsHolder((((42,), 42), ((42,), 42)))
+function catch_sees_bound_pairs(i::Int)
+    x = BOUND_PAIRS_HOLDER.x
+    try
+        coded_work(i)
+        a = Tuple(Any[Tuple(fill(7, i)), 7])
+        x = Tuple(Any[a, a])
+    catch
+    end
+    return length((x[1]::Tuple)[1]::Tuple)
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -362,6 +391,8 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_sees_where_other(i)
         @wtest catch_sees_pairs(i)
         @wtest catch_sees_pairs_or(i)
+        @wtest catch_sees_nested_pairs(i)
+        @wtest catch_sees_bound_pairs(i)
     end
     for i in 1:4
         @wtest catch_parse(i)
