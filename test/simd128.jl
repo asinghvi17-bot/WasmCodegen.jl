@@ -60,7 +60,11 @@ function oob_shuffle(k::Int)
     r8 = try sum(lanes(S.shuffle(a, Val((0.0, 2))))) catch e; caught(e) end
     r9 = try sum(lanes(S.shuffle(a, a, Val((0.0, 4))))) catch e; caught(e) end
     r10 = try sum(lanes(S.shuffle(a, Val((:end, 0))))) catch e; e isa MethodError ? -5.0 : -6.0 end
-    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10
+    # (lanes the native method indexes otherwise than by iterating, or rounding: as natively)
+    r11 = sum(i -> i * lanes(S.shuffle(a, Val(CartesianIndex(1, 0))))[i], 1:2)
+    r12 = sum(i -> i * lanes(S.shuffle(a, Val((0.0, 1e-20))))[i], 1:2)
+    r13 = sum(i -> i * lanes(S.shuffle(a, a, Val((1e-20, 2.0))))[i], 1:2)
+    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13
 end
 # a foreign function of a name like the SIMD calls', of another library: the program's
 simd_named(x::Float64) = ccall((:wasm_simd_scale, "libscale"), Float64, (Float64,), x)

@@ -87,12 +87,12 @@ end
 # index, ...) or is a lane after all (`0.0`)
 # (generated: a throwing indexing is in the body, so that the foreign call after it is not reached)
 @generated function _check_lanes(x::NTuple{N}, ::Val{I}) where {N,I}
-    checks = Any[:(x[$(QuoteNode(i)) + 1]) for i in I if !(i isa Integer && 0 <= i < N)]
+    checks = Any[:(x[$(QuoteNode(I[j])) + 1]) for j in 1:N if !(I[j] isa Integer && 0 <= I[j] < N)]
     return Expr(:block, checks..., nothing)
 end
 @generated function _check_lanes(x::NTuple{N}, y::NTuple{N}, ::Val{I}) where {N,I}
-    checks = Any[:($(QuoteNode(i)) < $N ? x[$(QuoteNode(i)) + 1] : y[$(QuoteNode(i)) - $N + 1])
-                 for i in I if !(i isa Integer && 0 <= i < 2N)]
+    checks = Any[:($(QuoteNode(I[j])) < $N ? x[$(QuoteNode(I[j])) + 1] : y[$(QuoteNode(I[j])) - $N + 1])
+                 for j in 1:N if !(I[j] isa Integer && 0 <= I[j] < 2N)]
     return Expr(:block, checks..., nothing)
 end
 
@@ -109,7 +109,9 @@ for (V, s) in ((F64x2, "f64x2"), (F32x4, "f32x4"), (F32x2, "f32x2"))
     for op in (:neg, :abs, :sqrt)
         @eval Base.Experimental.@overlay WASM_METHODS @inline $op(x::$V) = ccall($(q(op)), $V, ($V,), x)
     end
-    lanes(k) = [:(I[$j]) for j in 1:k]
+    # (the lane the native method's indexing selects: its index converted to an Int, `1e-20` lane 0)
+    lanes(k) = [:(convert(Int, I[$j] + 1) - 1) for j in 1:k]
+    lanes2(k) = [:(I[$j] < $k ? convert(Int, I[$j] + 1) - 1 : $k + convert(Int, I[$j] - $k + 1) - 1) for j in 1:k]
     @eval begin
         Base.Experimental.@overlay WASM_METHODS @inline muladd(a::$V, b::$V, c::$V) =
             ccall($(q(:madd)), $V, ($V, $V, $V), a, b, c)
@@ -122,7 +124,7 @@ for (V, s) in ((F64x2, "f64x2"), (F32x4, "f32x4"), (F32x2, "f32x2"))
              ccall($(q(:shuffle1)), $V, ($V, $(fill(Int, N)...)), x, $(lanes(N)...)))
         Base.Experimental.@overlay WASM_METHODS @inline shuffle(x::$V, y::$V, ::Val{I}) where {I} =
             (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes")); _check_lanes(x, y, Val(I));
-             ccall($(q(:shuffle2)), $V, ($V, $V, $(fill(Int, N)...)), x, y, $(lanes(N)...)))
+             ccall($(q(:shuffle2)), $V, ($V, $V, $(fill(Int, N)...)), x, y, $(lanes2(N)...)))
     end
 end
 
