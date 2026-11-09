@@ -25,9 +25,9 @@
 Operations on SIMD vectors of type `NTuple{2,VecElement{Float64}}`, `NTuple{4,VecElement{Float32}}`
 or `NTuple{2,VecElement{Float32}}` that compile to WebAssembly SIMD128 instructions: `add`, `sub`,
 `mul`, `div`, `neg`, `abs`, `sqrt`, `muladd` (as `relaxed_madd` with `Config(relaxed_simd = true)`,
-fused where the hardware has FMA, as `Base.muladd` may be), `splat`, `shuffle` (lanes known at
-compile time), `vload` and `vstore` through a pointer. Natively each is the same operation lane by
-lane.
+fused where the hardware has FMA, as `Base.muladd` may be), `splat`, `shuffle` (lanes given as
+`Int`s; of lanes of other types, the native method's lane by lane), `vload` and `vstore` through
+a pointer. Natively each is the same operation lane by lane.
 """
 module SIMD128
 
@@ -82,36 +82,6 @@ of `y`. `I` has as many lanes as `x`.
     end
 end
 
-# the lanes of a shuffle, as the native method indexes them, in order and with its operations on
-# the lanes, each as many times (`I[j]` once, of two vectors twice; one addition): first the
-# indexing of each (which throws as natively, a BoundsError, the InexactError of converting the
-# index, ...), then the lanes it selects, as Ints (of constant lanes, folded)
-# (generated: a throwing indexing is in the body, so that the foreign call after it is not reached;
-# `I[j]` in the body, of the compilation's world: a lane container may index by a method of its own.
-# A limitation: a lane that is not an Int is converted to one again after `getindex` converted it)
-_lane_int(k) = :(($k isa Int ? $k : convert(Int, $k)) - 1)
-@generated function _lanes(x::NTuple{N}, ::Val{I}) where {N,I}
-    i = QuoteNode(I)
-    k = [gensym(:lane) for _ in 1:N]
-    body = Any[]
-    for j in 1:N
-        push!(body, :($(k[j]) = $i[$j] + 1), :(x[$(k[j])]))
-    end
-    return Expr(:block, body..., Expr(:tuple, (_lane_int(k[j]) for j in 1:N)...))
-end
-@generated function _lanes(x::NTuple{N}, y::NTuple{N}, ::Val{I}) where {N,I}
-    i = QuoteNode(I)
-    k = [gensym(:lane) for _ in 1:N]
-    first = [gensym(:first) for _ in 1:N]
-    body = Any[]
-    for j in 1:N
-        push!(body, :($(first[j]) = $i[$j] < $N),
-              :($(k[j]) = $(first[j]) ? $i[$j] + 1 : $i[$j] - $N + 1),
-              :($(first[j]) ? x[$(k[j])] : y[$(k[j])]))
-    end
-    return Expr(:block, body..., Expr(:tuple, (:($(first[j]) ? $(_lane_int(k[j])) : $N + $(_lane_int(k[j]))) for j in 1:N)...))
-end
-
 # in Wasm: the foreign calls the code generator lowers (`emit_simd!`), of WasmCodegen's own
 # library name (`julia_*` names cannot be declared, see `foreigncall.jl`)
 const LIBRARY = "julia_simd128"
@@ -125,8 +95,13 @@ for (V, s) in ((F64x2, "f64x2"), (F32x4, "f32x4"), (F32x2, "f32x2"))
     for op in (:neg, :abs, :sqrt)
         @eval Base.Experimental.@overlay WASM_METHODS @inline $op(x::$V) = ccall($(q(op)), $V, ($V,), x)
     end
-    # (the lanes `_lanes` gives: the native method's indexing's, converted to Ints, `1e-20` lane 0)
-    lanes(k) = [:(ls[$j]) for j in 1:k]
+    # a shuffle: the native method's indexing of the lanes, in order (which throws as natively:
+    # a BoundsError, a lane's own error), then the instruction, of lanes that are `Int`s: constants
+    # in range, past that indexing. Of lanes of other types (converted by `getindex`, of a
+    # container indexed by a method of its own), the vector that indexing makes, as natively
+    pick1 = Expr(:tuple, (:(x[I[$j]+1]) for j in 1:N)...)
+    pick2 = Expr(:tuple, (:(I[$j] < $N ? x[I[$j]+1] : y[I[$j]-$N+1]) for j in 1:N)...)
+    lanes = [:(I[$j]) for j in 1:N]
     @eval begin
         Base.Experimental.@overlay WASM_METHODS @inline muladd(a::$V, b::$V, c::$V) =
             ccall($(q(:madd)), $V, ($V, $V, $V), a, b, c)
@@ -134,12 +109,18 @@ for (V, s) in ((F64x2, "f64x2"), (F32x4, "f32x4"), (F32x2, "f32x2"))
         Base.Experimental.@overlay WASM_METHODS @inline vload(::Type{$V}, p::Ptr{$T}) = ccall($(q(:load)), $V, (Ptr{$T},), p)
         Base.Experimental.@overlay WASM_METHODS @inline vstore(x::$V, p::Ptr{$T}) =
             ccall($(q(:store)), Cvoid, ($V, Ptr{$T}), x, p)
-        Base.Experimental.@overlay WASM_METHODS @inline shuffle(x::$V, ::Val{I}) where {I} =
-            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes")); ls = _lanes(x, Val(I));
-             ccall($(q(:shuffle1)), $V, ($V, $(fill(Int, N)...)), x, $(lanes(N)...)))
-        Base.Experimental.@overlay WASM_METHODS @inline shuffle(x::$V, y::$V, ::Val{I}) where {I} =
-            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes")); ls = _lanes(x, y, Val(I));
-             ccall($(q(:shuffle2)), $V, ($V, $V, $(fill(Int, N)...)), x, y, $(lanes(N)...)))
+        Base.Experimental.@overlay WASM_METHODS @inline function shuffle(x::$V, ::Val{I}) where {I}
+            length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes"))
+            r = $pick1
+            I isa NTuple{$N,Int} || return r
+            return ccall($(q(:shuffle1)), $V, ($V, $(fill(Int, N)...)), x, $(lanes...))
+        end
+        Base.Experimental.@overlay WASM_METHODS @inline function shuffle(x::$V, y::$V, ::Val{I}) where {I}
+            length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes"))
+            r = $pick2
+            I isa NTuple{$N,Int} || return r
+            return ccall($(q(:shuffle2)), $V, ($V, $V, $(fill(Int, N)...)), x, y, $(lanes...))
+        end
     end
 end
 
@@ -252,7 +233,7 @@ function emit_simd!(fc::FnCtx, op::String, args::Vector{Any}, @nospecialize(typ)
         bytes = Int[]
         for a in idx, j in 0:sz-1
             s = Int(constant_value(a))
-            # (in range: the overlay throws natively's BoundsError otherwise)
+            # (in range: the overlay's indexing throws natively's BoundsError before it otherwise)
             0 <= s < (two ? 2N : N) || unsupported("a shuffle lane out of range")
             push!(bytes, (s < N ? s : s - N + P) * sz + j)
         end

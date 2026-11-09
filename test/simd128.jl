@@ -92,7 +92,12 @@ function oob_shuffle(k::Int)
     r17 = (try sum(lanes(S.shuffle(a, Val((CountLane(0), 2))))) catch e; caught(e) end) + 1000 * LANE_CONVERTS[]
     LANE_CONVERTS[] = 0
     r18 = (try sum(lanes(S.shuffle(a, a, Val((CountLane(0), 4))))) catch e; caught(e) end) + 1000 * LANE_CONVERTS[]
-    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18
+    # (and each lane of another type converted once, as natively)
+    LANE_CONVERTS[] = 0
+    r19 = sum(lanes(S.shuffle(a, Val((CountLane(1), CountLane(0)))))) + 1000 * LANE_CONVERTS[]
+    LANE_CONVERTS[] = 0
+    r20 = sum(i -> i * lanes(S.shuffle(a, a, Val((CountLane(3), CountLane(0)))))[i], 1:2) + 1000 * LANE_CONVERTS[]
+    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20
 end
 # a foreign function of a name like the SIMD calls', of another library: the program's
 simd_named(x::Float64) = ccall((:wasm_simd_scale, "libscale"), Float64, (Float64,), x)
