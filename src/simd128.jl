@@ -82,18 +82,19 @@ of `y`. `I` has as many lanes as `x`.
     end
 end
 
-# the lanes of a shuffle in range, or the BoundsError of the first that is not, as natively
-# (generated: the throw is the body, so that the foreign call after it is not reached)
+# the lanes of a shuffle in range, or else the native method's indexing of the first lane that
+# is not, which throws as natively (a BoundsError, or the InexactError of converting the index)
+# (generated: that indexing is the body, so that the foreign call after it is not reached)
 @generated function _check_lanes(x::NTuple{N}, ::Val{I}) where {N,I}
     for j in 1:N
-        0 <= I[j] < N || return :(throw(BoundsError(x, $(I[j] + 1))))
+        I[j] isa Integer && 0 <= I[j] < N || return :(x[$(I[j]) + 1]; nothing)
     end
     return nothing
 end
 @generated function _check_lanes(x::NTuple{N}, y::NTuple{N}, ::Val{I}) where {N,I}
     for j in 1:N
-        I[j] < 0 && return :(throw(BoundsError(x, $(I[j] + 1))))
-        I[j] < 2N || return :(throw(BoundsError(y, $(I[j] - N + 1))))
+        I[j] isa Integer && 0 <= I[j] < 2N ||
+            return :($(I[j]) < $N ? x[$(I[j]) + 1] : y[$(I[j]) - $N + 1]; nothing)
     end
     return nothing
 end

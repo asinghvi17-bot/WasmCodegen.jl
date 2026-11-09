@@ -52,7 +52,11 @@ function oob_shuffle(k::Int)
     r2 = try sum(lanes(S.shuffle(a, a, Val((1, 4))))) catch e; caught(e) end
     r3 = try sum(lanes(S.shuffle(a, a, Val((-1, 0))))) catch e; caught(e) end
     r4 = try sum(lanes(S.shuffle(a, a, Val((3, 0))))) catch e; caught(e) end
-    return r1, r2, r3, r4
+    # (unsigned lanes: the index converted to an Int, natively's InexactError past typemax(Int))
+    r5 = try sum(lanes(S.shuffle(a, Val((UInt(0), UInt(2)))))) catch e; caught(e) end
+    r6 = try sum(lanes(S.shuffle(a, Val((UInt(0), UInt(1) << 63))))) catch e; e isa InexactError ? -3.0 : -4.0 end
+    r7 = try sum(lanes(S.shuffle(a, a, Val((UInt8(1), UInt8(3)))))) catch e; caught(e) end
+    return r1, r2, r3, r4, r5, r6, r7
 end
 # a foreign function of a name like the SIMD calls', of another library: the program's
 simd_named(x::Float64) = ccall((:wasm_simd_scale, "libscale"), Float64, (Float64,), x)
