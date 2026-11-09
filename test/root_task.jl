@@ -3,7 +3,8 @@
 # A value of the image may refer to the build process's root task: the key of a per-task cache
 # (a `WeakKeyDict{Task}` keyed by the task that filled it), a `WeakRef`. A native image refers
 # to the loading process's root task there (src/staticdata.c, `TagRef` 0), without serializing
-# the build's task or its task-local storage; so does the module: to its own root task.
+# the build's task, and a system image restores the build's task-local storage into it; so does
+# the module: to its own root task, with the build's task-local storage.
 #
 # A memory of references larger than `MAX_FIXED_ELEMENTS` is filled by the start function: only
 # its non-null slots (a hash table's unused slots are null).
@@ -17,10 +18,12 @@ module RootTaskImage
     const M = Model(2.0, WeakKeyDict{Task,Vector{Int}}())
     M.cache[Base.roottask] = [1, 2, 3]
     # the root task's task-local storage, at build time: a large table, mostly unused, which
-    # the program never reads (natively, a package image does not carry it either)
+    # the program never reads (carried as a system image carries it: its unused slots are not
+    # set one by one), and a value it reads
     let t = Base.roottask
         t.storage === nothing && (t.storage = IdDict{Any,Any}())
         t.storage[:wasmcodegen_test_root_task] = sizehint!(Dict{Symbol,Any}(), 2^17)
+        t.storage[:wasmcodegen_test_root_value] = 123
     end
     const W = WeakRef(Base.roottask)
     # held as a mutable object holds it (an integrator its problem): serialized whole
@@ -40,6 +43,9 @@ module RootTaskImage
     # the root task is sticky, as natively (also the module's current task, its root task)
     sticky(x::Int) = (W.value::Task).sticky ? x : -x
     cur_sticky(x::Float64) = current_task().sticky ? x : -x
+    # the build's task-local storage, through the root task
+    const RT = Ref(Base.roottask)
+    tls(x::Int) = get(RT[].storage::IdDict{Any,Any}, :wasmcodegen_test_root_value, x)::Int
 end
 
 module SparseImage
@@ -89,6 +95,7 @@ const WKD_CONFIGS = VERSION >= v"1.13" ? (test_config(), test_config(; shell_fir
     @wtest RootTaskImage.same(2.0)
     @wtest RootTaskImage.lookup(-1)
     @wtest RootTaskImage.sticky(3)
+    @wtest RootTaskImage.tls(2)
     c = wcompile(RootTaskImage.inroot, (Float64,))
     @test wasm_run(c, "inroot", 2.0; rettype = Float64) == 2.0
     # (natively, in the root task: sticky)
@@ -98,14 +105,16 @@ const WKD_CONFIGS = VERSION >= v"1.13" ? (test_config(), test_config(; shell_fir
         c = WasmCodegen.compile(f, (Float64,); config = cfg)
         @test wasm_run(c, string(nameof(f)), 1.5; rettype = Float64) == f(1.5)
     end
-    # not serialized: the build's task, its task-local storage (2^18 slots at 4 instructions each)
+    # not serialized: the build's task; its task-local storage is, but the large table's unused
+    # slots are not set one by one (2^18 slots at 4 instructions each)
     for (f, cfg) in ((RootTaskImage.run, last(WKD_CONFIGS)), (RootTaskImage.run, first(WKD_CONFIGS)),
                      (RootTaskImage.weak, test_config()),
                      (RootTaskImage.weak, test_config(; shell_first_mutables = true)))
         c = WasmCodegen.compile(f, (Float64,); config = cfg)
         @test image_tasks(c) == 0
         @test start_insts(c) < 10_000
-        @test length(c.bytes) < 200_000
+        # (the table's 2^18 slots, bytes of a data segment; the start function set each, 50 MB)
+        @test length(c.bytes) < 600_000
         @test wasm_run(c, string(nameof(f)), 1.5; rettype = Float64) == f(1.5)
     end
 end
@@ -132,3 +141,4 @@ end
 
 # (the build's root task's storage, as it was)
 delete!(Base.roottask.storage::IdDict{Any,Any}, :wasmcodegen_test_root_task)
+delete!(Base.roottask.storage::IdDict{Any,Any}, :wasmcodegen_test_root_value)

@@ -324,17 +324,41 @@ function singleton_global!(img::Image, @nospecialize(T))
 end
 
 """
+    build_root_task_global!(img) -> Global
+
+The build's root task in the image: the module's own (`root_task_global!`), as a native image
+has it, the loading process's root task, not a copy (src/staticdata.c, `TagRef` 0); with the
+build's task-local storage, as a system image restores it into the loading root task. Its
+other fields are not serialized: a value that refers to it (the key of a per-task cache, a
+WeakRef) brings in only its storage. (A system image restores the storage whether or not
+anything refers to the task; here only then: a program that reaches it only as its current
+task, `task_local_storage()`, finds it empty, as it was before. The build's storage is the
+compiling session's, whatever it holds.)
+"""
+function build_root_task_global!(img::Image)
+    cgm = img.cgm
+    g = root_task_global!(cgm)
+    get!(cgm.helpers, :root_task_storage) do
+        # (set once every global exists, after the start function's `nothing` there)
+        tls = Base.roottask.storage
+        if tls !== nothing
+            l = layout(types(img), Task)
+            k = Base.fieldindex(Task, :storage)
+            push!(img.patches, (g, :struct, l.wtype, first(l.fields[k]) - 1, tls, fieldtype(Task, k), img.owner, false))
+        end
+        true
+    end
+    return g
+end
+
+"""
     object_global!(img, x) -> Global
 
 The global of the object `x` (of a boxed type), serializing it (and the objects it refers
 to) on first use.
 """
 function object_global!(img::Image, @nospecialize(x))
-    # The build's root task is the module's own, as a native image has it: the loading process's
-    # root task, not a copy (src/staticdata.c, `TagRef` 0). Its fields (task-local storage, ...)
-    # are not serialized: a value that refers to it (the key of a per-task cache, a WeakRef) does
-    # not bring them in.
-    x === Base.roottask && return root_task_global!(img.cgm)
+    x === Base.roottask && return build_root_task_global!(img)
     g = get(img.globals, x, nothing)
     if g !== nothing
         note_reach!(img, x)
