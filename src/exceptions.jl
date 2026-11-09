@@ -171,6 +171,22 @@ function bounds_cover(@nospecialize(T))
     return Tuple{Any[cover(P) for P in T.parameters]...}
 end
 
+# whether `isa` of `T` is never the closed world's error: each tuple type with type variables
+# that a tuple's elements are tested against is one the elements' types decide
+# (`tuple_datatype`, `bound_tuple_shape`)
+function isa_decided(@nospecialize(T))
+    T isa Union && return isa_decided(T.a) && isa_decided(T.b)
+    if T isa UnionAll
+        has_tuple_members(T) || return true
+        D = tuple_datatype(T)
+        D === nothing && bound_tuple_shape(T) === nothing && return false
+        T = D === nothing ? tuple_bounds_type(T) : D
+    end
+    (T isa DataType && T.name === Tuple.name) || return true
+    return all(P -> P isa Core.TypeofVararg ? !isdefined(P, :T) || isa_decided(P.T) : !(P isa Type) || isa_decided(P),
+               T.parameters)
+end
+
 """
 An upsilon: its value assigned to the handler argument it feeds, if it is of the argument's
 type. The argument's type is what the handler can see, and a value assigned after the try's
@@ -187,12 +203,13 @@ function emit_upsilon!(fc::FnCtx, idx::Int, u::Core.UpsilonNode)
     if !(S <: T)
         typeintersect(S, T) === Union{} && return
         # (a value tested by its type: an object, a tuple of unknown length, a tuple of unions;
-        # against a tuple type with type variables, by the variables' bounds: its own test of a
-        # tuple of a type the module does not have may be the closed world's error, an exception
-        # the program has not, and a value of the bounds is of the argument's representation)
+        # against a tuple type with type variables whose test of a tuple of a type the module
+        # does not have may be the closed world's error, an exception the program has not, by
+        # the variables' bounds. A limitation: a value of the bounds that is not of such a type
+        # is assigned, and its conversion traps)
         l = layout(fc, S)
         if (v.kind === Boxed && (l.wtype == fc.cgm.types.jlvalue || l.elements !== nothing)) || is_union_tuple(S)
-            t = emit_isa!(fc, v, bounds_cover(T))
+            t = emit_isa!(fc, v, isa_decided(T) ? T : bounds_cover(T))
             if !isconstant(t)
                 push_val!(fc, t)
                 if!(fc.b)

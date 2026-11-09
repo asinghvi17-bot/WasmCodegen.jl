@@ -286,6 +286,20 @@ function catch_sees_where_other(i::Int)
     end
     return x isa String ? 99 : length(x::Tuple)
 end
+# (a tuple of the bounds of a type with type variables, not of it: `(1, 2.0)` for a `Tuple{T,T}`)
+mutable struct PairsHolder
+    x::Tuple{Vararg{Tuple{T,T} where T}}
+end
+const PAIRS_HOLDER = PairsHolder(((42, 42),))
+function catch_sees_pairs(i::Int)
+    x = PAIRS_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? ((1, 2.0),) : ((1, 2), (3, 4)))
+    catch
+    end
+    return length(x::Tuple)
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -332,6 +346,7 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_sees_ref(i)
         @wtest catch_sees_vectors(i)
         @wtest catch_sees_where_other(i)
+        @wtest catch_sees_pairs(i)
     end
     for i in 1:4
         @wtest catch_parse(i)
