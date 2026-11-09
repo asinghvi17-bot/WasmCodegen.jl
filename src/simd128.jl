@@ -82,18 +82,29 @@ of `y`. `I` has as many lanes as `x`.
     end
 end
 
-# the lanes of a shuffle: the native method's indexing of each, in order, which throws as
-# natively (a BoundsError, the InexactError of converting the index, ...); of constant lanes,
-# folded away where they are in range
-# (generated: a throwing indexing is in the body, so that the foreign call after it is not reached)
-# (`I[j]` in the body, of the compilation's world: a lane container may index by a method of its own)
-@generated function _check_lanes(x::NTuple{N}, ::Val{I}) where {N,I}
+# the lanes of a shuffle, as the native method indexes them, each once and in order: its indexing
+# of each (which throws as natively, a BoundsError, the InexactError of converting the index, ...),
+# then the lanes it selects, as Ints (of constant lanes, folded)
+# (generated: a throwing indexing is in the body, so that the foreign call after it is not reached;
+# `I[j]` in the body, of the compilation's world: a lane container may index by a method of its own)
+@generated function _lanes(x::NTuple{N}, ::Val{I}) where {N,I}
     i = QuoteNode(I)
-    return Expr(:block, Any[:(x[$i[$j] + 1]) for j in 1:N]..., nothing)
+    s = [gensym(:lane) for _ in 1:N]
+    body = Any[]
+    for j in 1:N
+        push!(body, :($(s[j]) = $i[$j]), :(x[$(s[j]) + 1]))
+    end
+    return Expr(:block, body..., Expr(:tuple, (:(convert(Int, $(s[j]) + 1) - 1) for j in 1:N)...))
 end
-@generated function _check_lanes(x::NTuple{N}, y::NTuple{N}, ::Val{I}) where {N,I}
+@generated function _lanes(x::NTuple{N}, y::NTuple{N}, ::Val{I}) where {N,I}
     i = QuoteNode(I)
-    return Expr(:block, Any[:($i[$j] < $N ? x[$i[$j] + 1] : y[$i[$j] - $N + 1]) for j in 1:N]..., nothing)
+    s = [gensym(:lane) for _ in 1:N]
+    body = Any[]
+    for j in 1:N
+        push!(body, :($(s[j]) = $i[$j]), :($(s[j]) < $N ? x[$(s[j]) + 1] : y[$(s[j]) - $N + 1]))
+    end
+    lane(j) = :($(s[j]) < $N ? convert(Int, $(s[j]) + 1) - 1 : $N + convert(Int, $(s[j]) - $N + 1) - 1)
+    return Expr(:block, body..., Expr(:tuple, (lane(j) for j in 1:N)...))
 end
 
 # in Wasm: the foreign calls the code generator lowers (`emit_simd!`), of WasmCodegen's own
@@ -109,9 +120,8 @@ for (V, s) in ((F64x2, "f64x2"), (F32x4, "f32x4"), (F32x2, "f32x2"))
     for op in (:neg, :abs, :sqrt)
         @eval Base.Experimental.@overlay WASM_METHODS @inline $op(x::$V) = ccall($(q(op)), $V, ($V,), x)
     end
-    # (the lane the native method's indexing selects: its index converted to an Int, `1e-20` lane 0)
-    lanes(k) = [:(convert(Int, I[$j] + 1) - 1) for j in 1:k]
-    lanes2(k) = [:(I[$j] < $k ? convert(Int, I[$j] + 1) - 1 : $k + convert(Int, I[$j] - $k + 1) - 1) for j in 1:k]
+    # (the lanes `_lanes` gives: the native method's indexing's, converted to Ints, `1e-20` lane 0)
+    lanes(k) = [:(ls[$j]) for j in 1:k]
     @eval begin
         Base.Experimental.@overlay WASM_METHODS @inline muladd(a::$V, b::$V, c::$V) =
             ccall($(q(:madd)), $V, ($V, $V, $V), a, b, c)
@@ -120,11 +130,11 @@ for (V, s) in ((F64x2, "f64x2"), (F32x4, "f32x4"), (F32x2, "f32x2"))
         Base.Experimental.@overlay WASM_METHODS @inline vstore(x::$V, p::Ptr{$T}) =
             ccall($(q(:store)), Cvoid, ($V, Ptr{$T}), x, p)
         Base.Experimental.@overlay WASM_METHODS @inline shuffle(x::$V, ::Val{I}) where {I} =
-            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes")); _check_lanes(x, Val(I));
+            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes")); ls = _lanes(x, Val(I));
              ccall($(q(:shuffle1)), $V, ($V, $(fill(Int, N)...)), x, $(lanes(N)...)))
         Base.Experimental.@overlay WASM_METHODS @inline shuffle(x::$V, y::$V, ::Val{I}) where {I} =
-            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes")); _check_lanes(x, y, Val(I));
-             ccall($(q(:shuffle2)), $V, ($V, $V, $(fill(Int, N)...)), x, y, $(lanes2(N)...)))
+            (length(I) == $N || throw(ArgumentError("a shuffle keeps the number of lanes")); ls = _lanes(x, y, Val(I));
+             ccall($(q(:shuffle2)), $V, ($V, $V, $(fill(Int, N)...)), x, y, $(lanes(N)...)))
     end
 end
 

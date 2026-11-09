@@ -48,6 +48,10 @@ bad_shuffle(k::Int) = lanes(S.shuffle(mkvec(D2, i -> i + k), Val((0, 1, 0, 1))))
 struct LaneOrder end
 Base.length(::LaneOrder) = 2
 Base.getindex(::LaneOrder, j::Int) = 2 - j
+struct CountOrder end
+const LANE_CALLS = Ref(0)
+Base.length(::CountOrder) = 2
+Base.getindex(::CountOrder, j::Int) = (LANE_CALLS[] += 1; 2 - j)
 # a lane out of range: natively's BoundsError, caught
 function oob_shuffle(k::Int)
     a = mkvec(D2, i -> i + k)
@@ -69,7 +73,10 @@ function oob_shuffle(k::Int)
     r12 = sum(i -> i * lanes(S.shuffle(a, Val((0.0, 1e-20))))[i], 1:2)
     r13 = sum(i -> i * lanes(S.shuffle(a, a, Val((1e-20, 2.0))))[i], 1:2)
     r14 = sum(i -> i * lanes(S.shuffle(a, Val(LaneOrder())))[i], 1:2)
-    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14
+    # (each lane indexed once, as natively)
+    LANE_CALLS[] = 0
+    r15 = sum(i -> i * lanes(S.shuffle(a, Val(CountOrder())))[i], 1:2) + 1000 * LANE_CALLS[]
+    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15
 end
 # a foreign function of a name like the SIMD calls', of another library: the program's
 simd_named(x::Float64) = ccall((:wasm_simd_scale, "libscale"), Float64, (Float64,), x)
