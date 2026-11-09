@@ -46,7 +46,23 @@ function pc_from_wider(k::Int)
     return (pc_sum(a), pc_sum(c))
 end
 
+# the owner a copy finds once (`Runtime.owner_bytes`): in Wasm the memory of bytes or the String
+# a pointer is into, natively none (`nothing` by design: the runtime keeps both paths)
+function pc_owner(k::Int)
+    a = zeros(UInt8, 16); s = string("abc", k)
+    ps = Ptr{UInt8}[pointer(a), pointer(s)]
+    GC.@preserve a s begin
+        (oa, ia) = WasmCodegen.Runtime.owner_bytes(ps[1] + 3, 13)
+        (os, is) = WasmCodegen.Runtime.owner_bytes(ps[2] + 1, 3)
+        (on, _) = WasmCodegen.Runtime.owner_bytes(ps[1] + 3, 14)   # (past the owner's end: none)
+        return (oa === a.ref.mem, ia, os === s, is, on === nothing)
+    end
+end
+
 @testset "copies through pointers" begin
+    @test pc_owner(1) == (false, 0, false, 0, true)
+    @test wasm_run(wcompile(pc_owner, (Int,)), "pc_owner", 1; rettype = Tuple{Bool,Int,Bool,Int,Bool}) ==
+          (true, 4, true, 2, true)
     @wtest pc_memmove(0, 0, 0)
     @wtest pc_memmove(100, 0, 50)        # overlapping, destination first
     @wtest pc_memmove(100, 50, 0)        # overlapping, source first
