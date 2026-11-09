@@ -198,10 +198,11 @@ has_inst(f, op) = any(i -> i.op === op, (i for g in wcompile(f, (Int,)).cgm.mod.
         @wtest static_origin(n)
         @wtest dot_d2(n)
     end
-    # the instructions: v128 arithmetic, relaxed_madd (a multiply and an add without relaxed SIMD)
-    @test has_inst(ops_d2, :f64x2_add) && has_inst(ops_d2, :f64x2_relaxed_madd)
+    # the instructions: v128 arithmetic; muladd a multiply and an add, as scalar muladd (with
+    # relaxed SIMD, relaxed_madd: below)
+    @test has_inst(ops_d2, :f64x2_add) && has_inst(ops_d2, :f64x2_mul) && !has_inst(ops_d2, :f64x2_relaxed_madd)
     @test has_inst(ops_f4, :f32x4_mul) && has_inst(shuffles_f4, :i8x16_shuffle)
-    @test has_inst(axpy_d2, :f64x2_relaxed_madd)
+    @test has_inst(axpy_d2, :f64x2_mul) && !has_inst(axpy_d2, :f64x2_relaxed_madd)
     for k in (1, 3, 4, 6)
         @wtest branchy(k)
         @wtest vtry(k)
@@ -211,14 +212,18 @@ has_inst(f, op) = any(i -> i.op === op, (i for g in wcompile(f, (Int,)).cgm.mod.
         @wtest edges_d2(k)
         @wtest edges_f4(k)
     end
-    r = wasm_run(wcompile(madd_rounding, (Int,)), "madd_rounding", 1; rettype=Float64)
+    # a multiply-add whose fused and unfused results differ: unfused by default, as scalar muladd;
+    # with relaxed SIMD, fused where the engine's hardware has FMA (either is a correct muladd)
+    @test wasm_run(wcompile(madd_rounding, (Int,)), "madd_rounding", 1; rettype=Float64) === 0.0
+    relaxed_config = test_config(relaxed_simd=true)
+    r = wasm_run(WasmCodegen.compile(madd_rounding, (Int,); config=relaxed_config), "madd_rounding", 1; rettype=Float64)
     @test r == 0.0 || r == -2.0^-60
-    # without relaxed SIMD: a multiply and an add, for every shape, in the optimized module
+    # relaxed SIMD, in the optimized module only where asked for, for every shape
     relaxed(bytes) = any(i -> bytes[i] == 0xfd && bytes[i+2] == 0x02 && bytes[i+1] in (0x85, 0x87), 1:length(bytes)-2)
-    @test relaxed(wcompile(ops_d2, (Int,)).bytes) && relaxed(wcompile(ops_f4, (Int,)).bytes)
+    @test !relaxed(wcompile(ops_d2, (Int,)).bytes) && !relaxed(wcompile(ops_f4, (Int,)).bytes)
     for (f, name) in ((ops_d2, "ops_d2"), (ops_f4, "ops_f4"), (ops_f2, "ops_f2"), (axpy_d2, "axpy_d2"))
-        c = WasmCodegen.compile(f, (Int,); config=test_config(relaxed_simd=false))
-        @test !relaxed(c.bytes)
+        c = WasmCodegen.compile(f, (Int,); config=relaxed_config)
+        @test relaxed(c.bytes)
         @test isequal(wasm_run(c, name, 5; rettype=Base.return_types(f, (Int,))[1]), f(5))
     end
 end

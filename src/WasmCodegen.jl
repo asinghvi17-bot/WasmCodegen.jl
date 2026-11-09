@@ -79,7 +79,6 @@ include("driver.jl")
 export compile, Entry, Config, UnsupportedConstructs
 
 function __init__()
-    define_simd_instructions!()
     COMPILER_WORLD[] = Base.get_world_counter()
     Runtime.BUILD_JLOPTIONS[] = Runtime.sanitized_jloptions()
 end

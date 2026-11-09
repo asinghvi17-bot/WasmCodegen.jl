@@ -132,43 +132,8 @@ end # module SIMD128
 
 ## the instructions
 
-function leb128(x::Integer)
-    out = UInt8[]
-    while true
-        b = UInt8(x & 0x7f); x >>= 7
-        x == 0 ? (push!(out, b); break) : push!(out, b | 0x80)
-    end
-    return out
-end
-
-# the SIMD instructions used (prefix 0xfd): name =>
-# (opcode, immediates, params, results). A lane index or shuffle lane (< 32) is a `u32`
-# immediate, whose LEB128 encoding is the one byte the format has.
-const SIMD_INSTRUCTIONS = Dict{Symbol,Tuple{Int,Tuple,Tuple,Tuple}}(
-    :i8x16_shuffle => (0x0d, ntuple(_ -> :u32, 16), (V128, V128), (V128,)),
-    :f32x4_splat => (0x13, (), (F32,), (V128,)), :f64x2_splat => (0x14, (), (F64,), (V128,)),
-    :f32x4_extract_lane => (0x1f, (:u32,), (V128,), (F32,)), :f32x4_replace_lane => (0x20, (:u32,), (V128, F32), (V128,)),
-    :f64x2_extract_lane => (0x21, (:u32,), (V128,), (F64,)), :f64x2_replace_lane => (0x22, (:u32,), (V128, F64), (V128,)),
-    :f32x4_abs => (0xe0, (), (V128,), (V128,)), :f32x4_neg => (0xe1, (), (V128,), (V128,)),
-    :f32x4_sqrt => (0xe3, (), (V128,), (V128,)),
-    :f32x4_add => (0xe4, (), (V128, V128), (V128,)), :f32x4_sub => (0xe5, (), (V128, V128), (V128,)),
-    :f32x4_mul => (0xe6, (), (V128, V128), (V128,)), :f32x4_div => (0xe7, (), (V128, V128), (V128,)),
-    :f64x2_abs => (0xec, (), (V128,), (V128,)), :f64x2_neg => (0xed, (), (V128,), (V128,)),
-    :f64x2_sqrt => (0xef, (), (V128,), (V128,)),
-    :f64x2_add => (0xf0, (), (V128, V128), (V128,)), :f64x2_sub => (0xf1, (), (V128, V128), (V128,)),
-    :f64x2_mul => (0xf2, (), (V128, V128), (V128,)), :f64x2_div => (0xf3, (), (V128, V128), (V128,)),
-    :f32x4_relaxed_madd => (0x105, (), (V128, V128, V128), (V128,)),
-    :f64x2_relaxed_madd => (0x107, (), (V128, V128, V128), (V128,)))
-
-# the SIMD instructions, added to WasmBuilder's table when WasmCodegen is loaded (`__init__`),
-# before any compilation (until WasmBuilder has them)
-function define_simd_instructions!()
-    for (name, (code, ik, params, results)) in SIMD_INSTRUCTIONS
-        haskey(WasmBuilder.INSTRUCTIONS, name) && continue
-        WasmBuilder.definst!(name, UInt8[0xfd; leb128(code)], ik;
-                             sig=(ValType[params...], ValType[results...]))
-    end
-end
+# (the instructions are WasmBuilder's: `i8x16_shuffle`, `f64x2_splat`, `f32x4_extract_lane`, ...,
+# `f64x2_relaxed_madd`; a lane index is one byte)
 
 # emit the SIMD instruction `name` with the immediates `imms`
 simd!(fc::FnCtx, name::Symbol, imms...) = emit!(fc.b, name, imms...)

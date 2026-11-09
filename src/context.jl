@@ -66,9 +66,10 @@ Base.@kwdef struct Config
     putting values on the operand stack and the rest to it."
     optimize::Union{Nothing,Cmd} = `-O3`
     "Whether `muladd` of SIMD vectors (`SIMD128.muladd`) is relaxed SIMD's `relaxed_madd`, fused where
-    the hardware has FMA (as `Base.muladd` may be); else a multiply and an add, for hosts without
+    the engine's hardware has FMA (as `Base.muladd` may be natively, so results vary by machine);
+    by default a multiply and an add, as scalar `muladd` is, deterministic and for hosts without
     relaxed SIMD."
-    relaxed_simd::Bool = true
+    relaxed_simd::Bool = false
     "The structured IR of each function is kept for the session (the process) and reused by every
     later compilation that has the same function: keyed by its CodeInstance and the module's
     exception mode. Pays off when compilations share code, e.g. a solver compiled for many models
