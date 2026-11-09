@@ -899,6 +899,7 @@ function tuple_datatype(@nospecialize(T))
     U = Base.unwrap_unionall(T)
     (U isa DataType && U.name === Tuple.name && Base.isvatuple(U)) || return nothing
     D = Tuple{U.parameters[1:end-1]..., Vararg{Base.unwrapva(U.parameters[end])}}
+    Base.has_free_typevars(D) && return nothing
     return D == T ? D : nothing
 end
 
@@ -1038,6 +1039,18 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     # subtypes (known when the module is complete)
     isa_types!() = (push_val!(fc, x); emit!(fc.b, :struct_get, ts.jlvalue, 0);
                     call!(fc.b, isa_predicate!(fc.cgm, T)); pop_val!(fc, Bool))
+    if T isa UnionAll && T <: Tuple && !(Tuple <: T)
+        # (a tuple type with type variables, `Tuple{Vararg{T}} where T<:Real`: by the module's
+        # types, but for a tuple whose concrete type the module does not have, an object of
+        # `Tuple`: natively `<:` of the type its elements make, which is not one of the
+        # module's, the closed world's error, as `typeof` of it)
+        push_val!(fc, x)
+        emit!(fc.b, :struct_get, ts.jlvalue, 0)
+        emit!(fc.b, :i32_const, typeid!(ts, Tuple))
+        emit!(fc.b, :i32_eq)
+        if!(fc.b); call_runtime!(fc, Runtime.throw_isa_unknown, CGVal[]); unreachable!(fc.b); end!(fc.b)
+        return isa_types!()
+    end
     (T isa DataType && T <: Tuple && !(Tuple <: T)) || return isa_types!()
     # (or, of a tuple type, a tuple whose concrete type the module does not have: an object of
     # `Tuple`, see `tuple_canon_func!`, of its elements)
