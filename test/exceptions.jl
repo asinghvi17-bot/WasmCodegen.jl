@@ -300,6 +300,20 @@ function catch_sees_pairs(i::Int)
     end
     return length(x::Tuple)
 end
+# (and beside a type whose test the elements' types do not decide, in a union)
+mutable struct PairsOrHolder
+    x::Tuple{Vararg{Union{Tuple{T,T} where T,Tuple{Vector{T},T} where T}}}
+end
+const PAIRS_OR_HOLDER = PairsOrHolder(((42, 42),))
+function catch_sees_pairs_or(i::Int)
+    x = PAIRS_OR_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? ((1, 2.0),) : ((1, 2), (3, 4)))
+    catch
+    end
+    return length(x::Tuple)
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -347,6 +361,7 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_sees_vectors(i)
         @wtest catch_sees_where_other(i)
         @wtest catch_sees_pairs(i)
+        @wtest catch_sees_pairs_or(i)
     end
     for i in 1:4
         @wtest catch_parse(i)

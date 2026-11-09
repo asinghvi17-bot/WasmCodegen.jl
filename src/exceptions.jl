@@ -149,42 +149,36 @@ function bind_handler_args!(fc::FnCtx, block)
 end
 
 """
-    bounds_cover(T)
+    upsilon_test_type(T)
 
-`T` with each tuple type with type variables that `isa` tests a tuple's elements against (`T`, a
-member of a union, an element of a tuple type, a `Vararg`'s) replaced by the tuple type its
-variables' bounds make (`tuple_bounds_type`). Every value of `T` is of it, and its test is never
-the closed world's error (`Runtime.throw_isa_unknown`).
+The type an upsilon's value is tested against for a handler argument of type `T`: `T`, but each
+tuple type with type variables in it that `isa` tests a tuple's elements against (`T`, a member
+of a union, an element of a tuple type, a `Vararg`'s) and whose test may be the closed world's
+error (`Runtime.throw_isa_unknown`: not one the elements' types decide, `tuple_datatype`,
+`bound_tuple_shape`) replaced by the tuple type its variables' bounds make
+(`tuple_bounds_type`). Every value of `T` is of it, and its test is never that error.
 """
-function bounds_cover(@nospecialize(T))
-    T isa Union && return Union{bounds_cover(T.a),bounds_cover(T.b)}
+function upsilon_test_type(@nospecialize(T))
+    T isa Union && return Union{upsilon_test_type(T.a),upsilon_test_type(T.b)}
     if T isa UnionAll
         has_tuple_members(T) || return T
         U = Base.unwrap_unionall(T)
-        U isa Union && return Union{bounds_cover(Base.rewrap_unionall(U.a, T)),bounds_cover(Base.rewrap_unionall(U.b, T))}
-        T = tuple_bounds_type(T)
+        U isa Union && return Union{upsilon_test_type(Base.rewrap_unionall(U.a, T)),
+                                    upsilon_test_type(Base.rewrap_unionall(U.b, T))}
+        D = tuple_datatype(T)
+        if D === nothing
+            B = tuple_bounds_type(T)
+            C = upsilon_test_type(B)
+            # (decided by its elements' types, as its bounds' tests are)
+            return bound_tuple_shape(T) !== nothing && C == B ? T : C
+        end
+        T = D
     end
     (T isa DataType && T.name === Tuple.name) || return T
-    cover(P) = P isa Core.TypeofVararg ?
-        (isdefined(P, :N) ? Vararg{bounds_cover(P.T),P.N} : isdefined(P, :T) ? Vararg{bounds_cover(P.T)} : P) :
-        P isa Type ? bounds_cover(P) : P
-    return Tuple{Any[cover(P) for P in T.parameters]...}
-end
-
-# whether `isa` of `T` is never the closed world's error: each tuple type with type variables
-# that a tuple's elements are tested against is one the elements' types decide
-# (`tuple_datatype`, `bound_tuple_shape`)
-function isa_decided(@nospecialize(T))
-    T isa Union && return isa_decided(T.a) && isa_decided(T.b)
-    if T isa UnionAll
-        has_tuple_members(T) || return true
-        D = tuple_datatype(T)
-        D === nothing && bound_tuple_shape(T) === nothing && return false
-        T = D === nothing ? tuple_bounds_type(T) : D
-    end
-    (T isa DataType && T.name === Tuple.name) || return true
-    return all(P -> P isa Core.TypeofVararg ? !isdefined(P, :T) || isa_decided(P.T) : !(P isa Type) || isa_decided(P),
-               T.parameters)
+    test(P) = P isa Core.TypeofVararg ?
+        (isdefined(P, :N) ? Vararg{upsilon_test_type(P.T),P.N} : isdefined(P, :T) ? Vararg{upsilon_test_type(P.T)} : P) :
+        P isa Type ? upsilon_test_type(P) : P
+    return Tuple{Any[test(P) for P in T.parameters]...}
 end
 
 """
@@ -209,7 +203,7 @@ function emit_upsilon!(fc::FnCtx, idx::Int, u::Core.UpsilonNode)
         # is assigned, and its conversion traps)
         l = layout(fc, S)
         if (v.kind === Boxed && (l.wtype == fc.cgm.types.jlvalue || l.elements !== nothing)) || is_union_tuple(S)
-            t = emit_isa!(fc, v, isa_decided(T) ? T : bounds_cover(T))
+            t = emit_isa!(fc, v, upsilon_test_type(T))
             if !isconstant(t)
                 push_val!(fc, t)
                 if!(fc.b)
