@@ -279,12 +279,18 @@ byte through two run-time helpers, `jl_ptr_load_byte(address, owner)` and
 `jl_ptr_store_byte(address, owner, byte)`, generated once the module's types are known:
 they find the byte from the owner's type id: of a memory whose elements are stored as
 laid out, of a memory of widened or padded isbits elements (by the leaves of an element),
-of a string, or of the isbits fields of a mutable object. `memmove` and `memset` without
-origins are byte loops in the runtime (`Runtime.ptr_memmove`/`ptr_memset`), but for copies
-between memories of bytes or from a string: the runtime reads the pointer's owner once
-(`Runtime.ptr_owner`, a primitive of the code generator) and copies with `array.copy` or a loop
-over the string's bytes, as IOStream reads and writes through such pointers do. An owner whose
-bytes are not addressable (a memory of references) traps.
+of a string, or of the isbits fields of a mutable object. A load or store of 4 or 8 bytes
+goes through `jl_ptr_load_bits4/8(address, owner)` and `jl_ptr_store_bits4/8(address,
+owner, bits)` instead, one call: one array access when the bytes are a whole element of a
+memory whose elements are stored in 4 or 8 bytes (aligned to it), or a whole 4- or 8-byte leaf
+of a memory of inline structs; the bytes of the byte array of an owner of bytes; otherwise the
+byte helpers (misaligned, across elements or leaves, the fields of objects). `memmove`,
+`memset` and `memcmp` without origins are loops in the runtime (`Runtime.ptr_memmove`,
+`ptr_memset`, `ptr_memcmp`), by 8-byte words when both addresses are aligned to 8, else by
+bytes; but copies between memories of bytes or from a string: the runtime reads the pointer's
+owner once (`Runtime.ptr_owner`, a primitive of the code generator) and copies with
+`array.copy` or a loop over the string's bytes, as IOStream reads and writes through such
+pointers do. An owner whose bytes are not addressable (a memory of references) traps.
 
 ## 6. The image: serializing objects
 
