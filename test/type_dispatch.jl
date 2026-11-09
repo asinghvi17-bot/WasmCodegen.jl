@@ -59,17 +59,19 @@ end
 # more types than a part of the table (`TYPE_TABLE_PART`): a tuple type per value, each with
 # its case, whose ids are spread over several parts
 const TD_MANY = Any[(Val{i}(), i, isodd(i) ? "o" : nothing) for i in 1:600]
-# (the same values as other objects: `===` of two objects of one type, by its case)
-const TD_MANY2 = Any[(Val{i}(), i, isodd(i) ? "o" * "" : nothing) for i in 1:600]
+# (the same value as another object, made at run time: the image holds one object per value)
+@noinline td_copy(x) = (t = x::Tuple{Any,Any,Any}; Base.inferencebarrier(tuple(t[1], t[2], t[3])))
 function td_many(i::Int, j::Int, step::Int)
     a, b = TD_MANY[i], TD_MANY[j]
     acc = UInt(0)
     for k in 1:step:length(TD_MANY)
         x = TD_MANY[k]
+        y = td_copy(x)
         acc = acc * 0x1f + objectid(x) + UInt(x === TD_MANY[k]) + UInt(x === TD_MANY[mod1(k + 1, end)]) +
-              2 * UInt(x === TD_MANY2[k]) + 4 * UInt(objectid(x) == objectid(TD_MANY2[k]))
+              2 * UInt(x === y) + 4 * UInt(objectid(x) == objectid(y))
     end
-    return (a === b, a === TD_MANY[i], a === TD_MANY2[i], b === TD_MANY2[i], objectid(a), objectid(a) == objectid(b), acc)
+    c = td_copy(a)
+    return (a === b, a === TD_MANY[i], a === c, b === c, objectid(a), objectid(a) == objectid(c), acc)
 end
 
 @testset "type dispatch" begin
