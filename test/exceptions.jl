@@ -224,6 +224,20 @@ function catch_sees_other_elements(i::Int)
     end
     return 100 * length(x) + (isempty(x) ? 0 : Int(2 * x[1]))
 end
+# (where it sees a tuple of a type with type variables)
+mutable struct WhereHolder
+    x::Tuple{Tuple{Vararg{T}},T} where T
+end
+const WHERE_HOLDER = WhereHolder(((42,), 42))
+function catch_sees_where_type(i::Int)
+    x = WHERE_HOLDER.x
+    try
+        coded_work(i)
+        x = Tuple(Any[Tuple(fill(7, i - 1)), 7])
+    catch
+    end
+    return length(x[1]::Tuple)
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -265,6 +279,7 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_sees_nested_lengths(i)
         @wtest catch_sees_union_element(i)
         @wtest catch_sees_other_elements(i)
+        @wtest catch_sees_where_type(i)
     end
     for i in 1:4
         @wtest catch_parse(i)

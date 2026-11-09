@@ -148,6 +148,11 @@ function bind_handler_args!(fc::FnCtx, block)
     end
 end
 
+# whether the type `T` is or has a `UnionAll` (as a member of a union or a parameter)
+has_unionall(@nospecialize(T)) = T isa UnionAll ||
+    (T isa Union && (has_unionall(T.a) || has_unionall(T.b))) ||
+    (T isa DataType && any(P -> P isa Type && has_unionall(P), T.parameters))
+
 """
 An upsilon: its value assigned to the handler argument it feeds, if it is of the argument's
 type. The argument's type is what the handler can see, and a value assigned after the try's
@@ -163,9 +168,12 @@ function emit_upsilon!(fc::FnCtx, idx::Int, u::Core.UpsilonNode)
     S, T = v.typ, dst.typ
     if !(S <: T)
         typeintersect(S, T) === Union{} && return
-        # (a value tested by its type: an object, a tuple of unknown length, a tuple of unions)
+        # (a value tested by its type: an object, a tuple of unknown length, a tuple of unions;
+        # not against a type with type variables, whose test of a tuple of a type the module
+        # does not have may be the closed world's error, an exception the program has not)
         l = layout(fc, S)
-        if (v.kind === Boxed && (l.wtype == fc.cgm.types.jlvalue || l.elements !== nothing)) || is_union_tuple(S)
+        if ((v.kind === Boxed && (l.wtype == fc.cgm.types.jlvalue || l.elements !== nothing)) || is_union_tuple(S)) &&
+           !has_unionall(T)
             t = emit_isa!(fc, v, T)
             if !isconstant(t)
                 push_val!(fc, t)
