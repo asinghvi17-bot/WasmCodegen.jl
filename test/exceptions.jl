@@ -262,6 +262,30 @@ function catch_sees_ref(i::Int)
     end
     return x isa String ? 99 : length((x::Base.RefValue{Vector})[]::Vector{Int})
 end
+# (a value that is no tuple, against tuple types with `UnionAll` elements and with type variables:
+# not assigned)
+mutable struct VectorsHolder
+    x::Tuple{Vararg{Vector}}
+end
+const VECTORS_HOLDER = VectorsHolder(([42],))
+function catch_sees_vectors(i::Int)
+    x = VECTORS_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? "z" : x)
+    catch
+    end
+    return x isa String ? 99 : length(x::Tuple)
+end
+function catch_sees_where_other(i::Int)
+    x = WHERE_VARARG_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? "z" : x)
+    catch
+    end
+    return x isa String ? 99 : length(x::Tuple)
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -306,6 +330,8 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_sees_where_type(i)
         @wtest catch_sees_where_vararg(i)
         @wtest catch_sees_ref(i)
+        @wtest catch_sees_vectors(i)
+        @wtest catch_sees_where_other(i)
     end
     for i in 1:4
         @wtest catch_parse(i)

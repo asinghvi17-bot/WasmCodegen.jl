@@ -148,12 +148,28 @@ function bind_handler_args!(fc::FnCtx, block)
     end
 end
 
-# whether the tuple type `T` is or has a `UnionAll` where `isa` tests a tuple's elements against
-# it (a member of a union, an element of a tuple type, a `Vararg`'s)
-has_unionall(@nospecialize(T)) = T isa UnionAll ||
-    (T isa Union && (has_unionall(T.a) || has_unionall(T.b))) ||
-    (T isa DataType && T.name === Tuple.name &&
-     any(P -> P isa Core.TypeofVararg ? isdefined(P, :T) && has_unionall(P.T) : P isa Type && has_unionall(P), T.parameters))
+"""
+    bounds_cover(T)
+
+`T` with each tuple type with type variables that `isa` tests a tuple's elements against (`T`, a
+member of a union, an element of a tuple type, a `Vararg`'s) replaced by the tuple type its
+variables' bounds make (`tuple_bounds_type`). Every value of `T` is of it, and its test is never
+the closed world's error (`Runtime.throw_isa_unknown`).
+"""
+function bounds_cover(@nospecialize(T))
+    T isa Union && return Union{bounds_cover(T.a),bounds_cover(T.b)}
+    if T isa UnionAll
+        has_tuple_members(T) || return T
+        U = Base.unwrap_unionall(T)
+        U isa Union && return Union{bounds_cover(Base.rewrap_unionall(U.a, T)),bounds_cover(Base.rewrap_unionall(U.b, T))}
+        T = tuple_bounds_type(T)
+    end
+    (T isa DataType && T.name === Tuple.name) || return T
+    cover(P) = P isa Core.TypeofVararg ?
+        (isdefined(P, :N) ? Vararg{bounds_cover(P.T),P.N} : isdefined(P, :T) ? Vararg{bounds_cover(P.T)} : P) :
+        P isa Type ? bounds_cover(P) : P
+    return Tuple{Any[cover(P) for P in T.parameters]...}
+end
 
 """
 An upsilon: its value assigned to the handler argument it feeds, if it is of the argument's
@@ -171,12 +187,12 @@ function emit_upsilon!(fc::FnCtx, idx::Int, u::Core.UpsilonNode)
     if !(S <: T)
         typeintersect(S, T) === Union{} && return
         # (a value tested by its type: an object, a tuple of unknown length, a tuple of unions;
-        # not against a type with type variables, whose test of a tuple of a type the module
-        # does not have may be the closed world's error, an exception the program has not)
+        # against a tuple type with type variables, by the variables' bounds: its own test of a
+        # tuple of a type the module does not have may be the closed world's error, an exception
+        # the program has not, and a value of the bounds is of the argument's representation)
         l = layout(fc, S)
-        if ((v.kind === Boxed && (l.wtype == fc.cgm.types.jlvalue || l.elements !== nothing)) || is_union_tuple(S)) &&
-           !has_unionall(T)
-            t = emit_isa!(fc, v, T)
+        if (v.kind === Boxed && (l.wtype == fc.cgm.types.jlvalue || l.elements !== nothing)) || is_union_tuple(S)
+            t = emit_isa!(fc, v, bounds_cover(T))
             if !isconstant(t)
                 push_val!(fc, t)
                 if!(fc.b)
