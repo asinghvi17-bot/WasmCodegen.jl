@@ -293,6 +293,60 @@ function finish_type_isa!(cgm::CGModule)
     end
 end
 
+## calls by a type id: through a table of functions, a function per case
+
+"The type ids of a part of a table of `type_table_call!` (a part is an array built by `array.new_fixed`)."
+const TYPE_TABLE_PART = 256
+
+"""
+    type_table_call!(cgm, b, name, params, results, tid, cases)
+
+Emits, at the end of the function being built by `b` (of parameters `params` and results
+`results`), the call of the case of the type id in the local `tid`, `cases[id]` (a function of
+the same parameters and results), and returns its results: a table of the cases by type id
+(the global `name_table`: arrays of function references, `TYPE_TABLE_PART` ids each, as the
+module's `cfunction`s are kept), read and called by `call_ref`. A type id without a case traps
+(a null reference), as one beyond the table does (out of bounds).
+
+Constant time, where a comparison per type is linear in the number of types; and each case
+stays a function of its own, called through a reference, which an engine compiles (and
+optimizes) when it runs, not one function of every type compiled whole.
+"""
+function type_table_call!(cgm::CGModule, b::Builder, name::AbstractString, params::Vector{ValType},
+                          results::Vector{ValType}, tid::Int, cases::Dict{Int,Func})
+    np = length(params)
+    if isempty(cases)
+        return unreachable!(b)
+    end
+    sig = WasmBuilder.functype!(cgm.mod, params, results)
+    part = add_type!(cgm.mod, ArrayType(FieldType(RefType(sig, true), false)))
+    table = add_type!(cgm.mod, ArrayType(FieldType(RefType(part, false), false)))
+    P = TYPE_TABLE_PART
+    n = maximum(keys(cases))           # ids from 1: the slot of id is id - 1
+    parts = Inst[]
+    for k in 0:((n - 1) ÷ P)
+        elems = Inst[(f = get(cases, k * P + j + 1, nothing); f === nothing ? Inst(:ref_null, sig) : Inst(:ref_func, f))
+                     for j in 0:min(P, n - k * P)-1]
+        g = add_global!(cgm.mod, string(name, "_table_", k), RefType(part, false), false,
+                        Inst[elems..., Inst(:array_new_fixed, part, length(elems))])
+        push!(parts, Inst(:global_get, g))
+    end
+    tg = add_global!(cgm.mod, string(name, "_table"), RefType(table, false), false,
+                     Inst[parts..., Inst(:array_new_fixed, table, length(parts))])
+    for i in 0:np-1
+        emit!(b, :local_get, i)
+    end
+    emit!(b, :local_get, tid); emit!(b, :i32_const, 1); emit!(b, :i32_sub); emit!(b, :local_set, tid)
+    emit!(b, :global_get, tg)
+    emit!(b, :local_get, tid); emit!(b, :i32_const, trailing_zeros(P)); emit!(b, :i32_shr_u)
+    emit!(b, :array_get, table)
+    emit!(b, :local_get, tid); emit!(b, :i32_const, P - 1); emit!(b, :i32_and)
+    emit!(b, :array_get, part)
+    emit!(b, :call_ref, sig)
+    return!(b)
+    return nothing
+end
+
 ## === of values whose types are known only at run time
 
 """
@@ -324,10 +378,10 @@ function finish_egal!(cgm::CGModule)
     emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_tee, tid)
     emit!(b, :local_get, 1); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :i32_ne)
     if!(b); emit!(b, :i32_const, 0); return!(b); end!(b)
-    casts = Dict{TypeRef,Tuple{Int,Int}}()
-    cast_locals(st) = get!(casts, st) do
-        (add_local!(f, RefType(st, true)), add_local!(f, RefType(st, true)))
-    end
+    # each type's comparison in a function of its own (types compared by identity share one:
+    # different objects), called by the type id
+    cases = Dict{Int,Func}()
+    byid = nothing
     for (id, T) in enumerate(copy(ts.typelist))
         # (and tuples of a type of unknown length, their concrete one not in the module)
         (T isa DataType && (isconcretetype(T) || is_vararg_tuple(T))) || continue
@@ -353,31 +407,39 @@ function finish_egal!(cgm::CGModule)
             nothing, :none
         end
         how === :none && continue
-        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-        if!(b)
         if how === :identity
-            emit!(b, :i32_const, 0); return!(b)
-        else
-            ca, cb = cast_locals(st)
-            emit!(b, :local_get, 0); emit!(b, :ref_cast, st); emit!(b, :local_set, ca)
-            emit!(b, :local_get, 1); emit!(b, :ref_cast, st); emit!(b, :local_set, cb)
-            if how === :bytes
-                emit!(b, :local_get, ca); emit!(b, :struct_get, st, DATA_FIELD)
-                emit!(b, :local_get, cb); emit!(b, :struct_get, st, DATA_FIELD)
-                call!(b, bytes_egal_func!(cgm))
-                return!(b)
-            elseif how === :elements
-                egal_array_elements!(cgm, b, f, st, l.elements::MemoryLayout, ca, cb)
-            else
-                # (fields from the header's end, as `egal_leaves`)
-                emit_fields_egal!(cgm, b, f, st, ca, cb, egal_leaves(ts, T))
-                emit!(b, :i32_const, 1); return!(b)
+            if byid === nothing
+                byid = add_func!(cgm.mod, "jl_egal_identity", ValType[jl, jl], ValType[I32])
+                ib = Builder(cgm.mod, byid)
+                emit!(ib, :i32_const, 0)
+                finish!(ib)
             end
+            cases[id] = byid
+            continue
         end
-        end!(b)
+        cf = add_func!(cgm.mod, string("jl_egal_case_", id), ValType[jl, jl], ValType[I32])
+        cb = Builder(cgm.mod, cf)
+        ca, cb2 = add_local!(cf, RefType(st, true)), add_local!(cf, RefType(st, true))
+        emit!(cb, :local_get, 0); emit!(cb, :ref_cast, st); emit!(cb, :local_set, ca)
+        emit!(cb, :local_get, 1); emit!(cb, :ref_cast, st); emit!(cb, :local_set, cb2)
+        if how === :bytes
+            emit!(cb, :local_get, ca); emit!(cb, :struct_get, st, DATA_FIELD)
+            emit!(cb, :local_get, cb2); emit!(cb, :struct_get, st, DATA_FIELD)
+            call!(cb, bytes_egal_func!(cgm))
+            return!(cb)
+        elseif how === :elements
+            egal_array_elements!(cgm, cb, cf, st, l.elements::MemoryLayout, ca, cb2; egal = f)
+        else
+            # (fields from the header's end, as `egal_leaves`)
+            emit_fields_egal!(cgm, cb, cf, st, ca, cb2, egal_leaves(ts, T); egal = f)
+            emit!(cb, :i32_const, 1); return!(cb)
+        end
+        is_unreachable(cb) || unreachable!(cb)
+        finish!(cb)
+        cases[id] = cf
     end
-    # a type it cannot compare
-    unreachable!(b)
+    # (a type it cannot compare: a trap)
+    type_table_call!(cgm, b, "jl_egal", ValType[jl, jl], ValType[I32], tid, cases)
     finish!(b)
 end
 
@@ -668,20 +730,17 @@ function finish_objectid_any!(cgm::CGModule)
     b = Builder(cgm.mod, f)
     tid = add_local!(f, I32)
     emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+    targets = Dict{Int,Func}()
     for (id, T) in enumerate(ts.typelist)
         info = get(cases, id, nothing)
         if info === nothing
             # mutable objects and type objects: by identity
             ((T isa DataType && ismutabletype(T)) || is_type_object_type(T)) || continue
         end
-        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-        if!(b)
-        emit!(b, :local_get, 0)
-        call!(b, info === nothing ? objectid_mutable_func!(cgm) : info.func)
-        return!(b)
-        end!(b)
+        targets[id] = info === nothing ? objectid_mutable_func!(cgm) : info.func
     end
-    unreachable!(b)
+    # (a type it has no case for: a trap)
+    type_table_call!(cgm, b, "jl_object_id", ValType[jlvalue_ref(ts)], ValType[I64], tid, targets)
     finish!(b)
 end
 
@@ -842,7 +901,7 @@ function finish_tuples!(cgm::CGModule)
 end
 
 function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::Int, cb::Int,
-                           how::Vector{Any})
+                           how::Vector{Any}; egal::Func=f)
     fields = (typedef(cgm.mod, st).comp::StructType).fields
     for w in HEADER_FIELDS+1:length(fields)
         k = w - HEADER_FIELDS
@@ -864,10 +923,10 @@ function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::
             # (the array of a memory, in a reference to its element: the same memory)
             emit!(b, :ref_eq); emit!(b, :i32_eqz)
         elseif stg isa RefType && h !== nothing
-            call!(b, tuple_egal_func!(cgm, h, f)); emit!(b, :i32_eqz)
+            call!(b, tuple_egal_func!(cgm, h, egal)); emit!(b, :i32_eqz)
         elseif stg isa RefType
             # (a reference to some object: compared with jl_egal)
-            call!(b, f); emit!(b, :i32_eqz)
+            call!(b, egal); emit!(b, :i32_eqz)
         else
             emit!(b, :i32_ne)
         end
