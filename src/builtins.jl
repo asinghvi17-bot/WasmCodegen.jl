@@ -1109,8 +1109,9 @@ function tuple_bounds_type(@nospecialize(T))
         push!(vars, W.var); W = W.body
     end
     # (a variable whose bounds are not ordered, `Int<:T<:Float64`, bounds nothing: natively its
-    # upper bound is not one of its elements')
-    bound(P) = Base.rewrap_unionall(P isa TypeVar && any(v -> v === P, vars) ? (P.lb <: P.ub ? P.ub : Any) : P, T)
+    # upper bound is not one of its elements'; one of bounds of other variables, as ordered)
+    ordered(v::TypeVar) = !(v.lb isa Type && v.ub isa Type) || v.lb <: v.ub
+    bound(P) = Base.rewrap_unionall(P isa TypeVar && any(v -> v === P, vars) ? (ordered(P) ? P.ub : Any) : P, T)
     ps = Any[]
     for P in U.parameters
         if P isa Core.TypeofVararg

@@ -265,6 +265,11 @@ at_shape_false(i::Int) = (opaque((unnamed(i), "s")) isa AT_TVEC, opaque((opaque(
                           tuple(Any[unnamed(i), "s"]...) isa AT_TVEC)
 # (where they are: the closed world's error; natively true)
 at_shape_error(i::Int) = opaque((unnamed(i), [i])) isa AT_TVEC
+# (variables of bounds of other variables: the bounds test, without comparing them)
+const AT_DEP_DIRECT = Tuple{S} where {T<:Real,S<:T}
+const AT_DEP_NESTED = Tuple{Vector{S}} where {T<:Real,S<:T}
+at_dependent(i::Int) = (opaque(("s",)) isa AT_DEP_DIRECT, opaque((opaque(i),)) isa AT_DEP_NESTED,
+                        opaque((opaque("s"),)) isa AT_DEP_NESTED)
 # (a tuple of a concrete type the module has, named here: by the module's types, as natively,
 # whatever the bounds: `Real<:T`, no diagonal rule; `Int<:T<:Float64`, not ordered)
 const AT_LOW = Tuple{Vararg{T}} where Real<:T<:Number
@@ -348,6 +353,7 @@ end
         @test got isa Tuple && got[1] === :trap
         @test occursin("isa of a tuple whose concrete type the module does not have", LAST_OUTPUT[])
     end
+    @wtest at_dependent(1)
     for i in 0:2
         @wtest at_bounds(i)
     end
