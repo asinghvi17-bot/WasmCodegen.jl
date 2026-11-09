@@ -1330,7 +1330,9 @@ function finish_new!(cgm::CGModule)
         # the native error of a type that is not concrete)
         bounds = cgm.helpers[(:new_rt_bounds, n)]::Vector{Any}
         for (id, C) in enumerate(ts.typelist)
-            (C isa DataType && isconcretetype(C) && !haskey(cases, id) && !(id in bad) &&
+            # (of an opaque layout, `String`, natively the TypeError of a type that is not a
+            # struct's: below)
+            (C isa DataType && isconcretetype(C) && !opaque_layout(C) && !haskey(cases, id) && !(id in bad) &&
              any(B -> C isa B, bounds)) || continue
             emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
             if!(b); call!(b, (cgm.helpers[:new_closed_world]::FuncInfo).func); unreachable!(b); end!(b)

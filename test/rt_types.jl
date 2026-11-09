@@ -99,6 +99,10 @@ function tail_of(h)
     end
     return (h.a, d, v)
 end
+# `new` of a type of an opaque layout (`String`, `Symbol`): natively a TypeError
+@noinline opaquetype(i::Int) = Base.inferencebarrier(i == 1 ? String : Symbol)::Union{Type{String},Type{Symbol}}
+@generated newopaque(i::Int) = Expr(:new, :(opaquetype(i)))
+newopaque_caught(i::Int) = try (newopaque(i); 0) catch e; e isa TypeError ? 1 : e isa ErrorException ? 2 : 3 end
 @noinline holdertype(i::Int) = i == 1 ? Holder{Leaf} : i == 2 ? Holder{Int} : ImmHolder{Leaf}
 @generated newpartial(i::Int, a::Int) = Expr(:new, :(holdertype(i)), :a)
 partial_rt(i::Int, a::Int) = tail_of(newpartial(i, a))
@@ -214,6 +218,7 @@ end
     # a case that always throws
     for i in 1:3
         @wtest RT.newbottom_caught(i, 5)
+        i <= 2 && @wtest RT.newopaque_caught(i)
     end
     @test has_new(wcompile(RT.newbottom_caught, (Int, Int)), 1)
 
