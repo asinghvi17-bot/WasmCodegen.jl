@@ -68,6 +68,9 @@ end
     @wtest pc_memmove(100, 50, 0)        # overlapping, source first
     @wtest pc_memmove(64, 0, 1000)       # apart
     @wtest pc_memmove(200_000, 10, 99_000)
+    # (between memories of bytes: one `array.copy`, not a byte loop)
+    insts(f, at) = (i.op for g in wcompile(f, at).cgm.mod.funcs for i in g.body)
+    @test :array_copy in insts(pc_memmove, (Int, Int, Int))
     @wtest pc_from_string(3)
     @wtest pc_from_string(17)
     @wtest pc_from_wider(1)
