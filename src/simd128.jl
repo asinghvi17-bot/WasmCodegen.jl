@@ -82,29 +82,34 @@ of `y`. `I` has as many lanes as `x`.
     end
 end
 
-# the lanes of a shuffle, as the native method indexes them, each once and in order: its indexing
-# of each (which throws as natively, a BoundsError, the InexactError of converting the index, ...),
-# then the lanes it selects, as Ints (of constant lanes, folded)
+# the lanes of a shuffle, as the native method indexes them, in order and with its operations on
+# the lanes, each as many times (`I[j]` once, of two vectors twice; one addition): first the
+# indexing of each (which throws as natively, a BoundsError, the InexactError of converting the
+# index, ...), then the lanes it selects, as Ints (of constant lanes, folded)
 # (generated: a throwing indexing is in the body, so that the foreign call after it is not reached;
-# `I[j]` in the body, of the compilation's world: a lane container may index by a method of its own)
+# `I[j]` in the body, of the compilation's world: a lane container may index by a method of its own.
+# A limitation: a lane that is not an Int is converted to one again after `getindex` converted it)
+_lane_int(k) = :(($k isa Int ? $k : convert(Int, $k)) - 1)
 @generated function _lanes(x::NTuple{N}, ::Val{I}) where {N,I}
     i = QuoteNode(I)
-    s = [gensym(:lane) for _ in 1:N]
+    k = [gensym(:lane) for _ in 1:N]
     body = Any[]
     for j in 1:N
-        push!(body, :($(s[j]) = $i[$j]), :(x[$(s[j]) + 1]))
+        push!(body, :($(k[j]) = $i[$j] + 1), :(x[$(k[j])]))
     end
-    return Expr(:block, body..., Expr(:tuple, (:(convert(Int, $(s[j]) + 1) - 1) for j in 1:N)...))
+    return Expr(:block, body..., Expr(:tuple, (_lane_int(k[j]) for j in 1:N)...))
 end
 @generated function _lanes(x::NTuple{N}, y::NTuple{N}, ::Val{I}) where {N,I}
     i = QuoteNode(I)
-    s = [gensym(:lane) for _ in 1:N]
+    k = [gensym(:lane) for _ in 1:N]
+    first = [gensym(:first) for _ in 1:N]
     body = Any[]
     for j in 1:N
-        push!(body, :($(s[j]) = $i[$j]), :($(s[j]) < $N ? x[$(s[j]) + 1] : y[$(s[j]) - $N + 1]))
+        push!(body, :($(first[j]) = $i[$j] < $N),
+              :($(k[j]) = $(first[j]) ? $i[$j] + 1 : $i[$j] - $N + 1),
+              :($(first[j]) ? x[$(k[j])] : y[$(k[j])]))
     end
-    lane(j) = :($(s[j]) < $N ? convert(Int, $(s[j]) + 1) - 1 : $N + convert(Int, $(s[j]) - $N + 1) - 1)
-    return Expr(:block, body..., Expr(:tuple, (lane(j) for j in 1:N)...))
+    return Expr(:block, body..., Expr(:tuple, (:($(first[j]) ? $(_lane_int(k[j])) : $N + $(_lane_int(k[j]))) for j in 1:N)...))
 end
 
 # in Wasm: the foreign calls the code generator lowers (`emit_simd!`), of WasmCodegen's own

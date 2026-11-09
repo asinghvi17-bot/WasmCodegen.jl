@@ -52,6 +52,14 @@ struct CountOrder end
 const LANE_CALLS = Ref(0)
 Base.length(::CountOrder) = 2
 Base.getindex(::CountOrder, j::Int) = (LANE_CALLS[] += 1; 2 - j)
+struct CountLane <: Integer
+    i::Int
+end
+const LANE_CONVERTS = Ref(0)
+Base.:+(j::CountLane, k::Int) = CountLane(j.i + k)
+Base.:-(j::CountLane, k::Int) = CountLane(j.i - k)
+Base.:<(j::CountLane, k::Int) = j.i < k
+Base.convert(::Type{Int}, j::CountLane) = (LANE_CONVERTS[] += 1; j.i)
 # a lane out of range: natively's BoundsError, caught
 function oob_shuffle(k::Int)
     a = mkvec(D2, i -> i + k)
@@ -76,7 +84,15 @@ function oob_shuffle(k::Int)
     # (each lane indexed once, as natively)
     LANE_CALLS[] = 0
     r15 = sum(i -> i * lanes(S.shuffle(a, Val(CountOrder())))[i], 1:2) + 1000 * LANE_CALLS[]
-    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15
+    # (of two vectors twice, as natively)
+    LANE_CALLS[] = 0
+    r16 = sum(i -> i * lanes(S.shuffle(a, a, Val(CountOrder())))[i], 1:2) + 1000 * LANE_CALLS[]
+    # (every lane indexed before any is made an Int: a lane out of range after one of another type)
+    LANE_CONVERTS[] = 0
+    r17 = (try sum(lanes(S.shuffle(a, Val((CountLane(0), 2))))) catch e; caught(e) end) + 1000 * LANE_CONVERTS[]
+    LANE_CONVERTS[] = 0
+    r18 = (try sum(lanes(S.shuffle(a, a, Val((CountLane(0), 4))))) catch e; caught(e) end) + 1000 * LANE_CONVERTS[]
+    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18
 end
 # a foreign function of a name like the SIMD calls', of another library: the program's
 simd_named(x::Float64) = ccall((:wasm_simd_scale, "libscale"), Float64, (Float64,), x)
