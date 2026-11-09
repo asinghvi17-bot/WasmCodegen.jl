@@ -61,17 +61,25 @@ function make_tuple(fc::FnCtx, @nospecialize(T), vals::Vector{CGVal})
     l.kind === Boxed && l.elements !== nothing && return new_tuple_array!(fc, T, vals)
     if !isconcretetype(T) && !is_inline_tuple(T)
         # the concrete tuple type of the values (of a constant, its type: a type object's kind)
-        T = Tuple{(isconstant(v) && !isconcretetype(v.typ) ? typeof(constant_value(v)) : v.typ for v in vals)...}
-        isconcretetype(T) || unsupported("a tuple of abstract type ", T)
+        S = Tuple{(isconstant(v) && !isconcretetype(v.typ) ? typeof(constant_value(v)) : v.typ for v in vals)...}
+        isconcretetype(S) && return emit_new!(fc, S, vals)
+        Base.has_free_typevars(S) && unsupported("a tuple of abstract type ", S)
+        # of values whose types are known only at run time: natively `jl_f_tuple` makes the
+        # tuple's type of theirs; here the module's concrete tuple type of them, found at run
+        # time as for any tuple of unknown length as an object (`tuple_canon_func!`), else an
+        # object of `Tuple` (`typeof` of it the closed world's error)
+        return convert_repr(fc, new_tuple_array!(fc, Tuple, vals), T)
     end
     return emit_new!(fc, T, vals)
 end
 
-"The elements of the tuple value `t`."
+"The elements of the tuple value `t` (of a tuple type of element types not concrete: by its type)."
 function tuple_elements(fc::FnCtx, t::CGVal)
     T = t.typ
-    (T isa DataType && T <: Tuple && isconcretetype(T)) ||
+    (T isa DataType && T <: Tuple && !Base.isvatuple(T) && !Base.has_free_typevars(T)) ||
         unsupported("the elements of a tuple of type ", T)
+    getfield_by_type(T) && return CGVal[get_field_any!(fc, t, i, fieldtype(T, i)) for i in 1:fieldcount(T)]
+    isconcretetype(T) || is_inline_tuple(T) || unsupported("the elements of a tuple of type ", T)
     return CGVal[get_field(fc, t, i) for i in 1:fieldcount(T)]
 end
 
@@ -912,8 +920,10 @@ function tuple_array_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     E = ml.elem.T
     va = Base.isvatuple(T)
     k = va ? length(T.parameters) - 1 : fieldcount(T)
+    # (a `Vararg` of a length that is a free type variable: none, natively)
+    va && (V = T.parameters[end]; isdefined(V, :N) && !(V.N isa Int)) && return const_value(fc, false)
     B = va ? Base.unwrapva(T.parameters[end]) : Union{}
-    all(i -> eltype_intersects(E, T.parameters[i]), 1:k) || return const_value(fc, false)
+    all(i -> elem_may_be(E, T.parameters[i]), 1:k) || return const_value(fc, false)
     arr = new_local!(fc, RefType(ml.array, true))
     n = new_local!(fc, I32)
     push_val!(fc, x)
@@ -923,19 +933,19 @@ function tuple_array_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     emit!(fc.b, :local_tee, n)
     emit!(fc.b, :i32_const, k)
     emit!(fc.b, va ? :i32_ge_u : :i32_eq)
-    tests = filter(i -> !(E <: T.parameters[i]), 1:k)
-    rest = va && !(E <: B)
+    tests = filter(i -> !elem_is(E, T.parameters[i]), 1:k)
+    rest = va && !elem_is(E, B)
     (isempty(tests) && !rest) && return pop_val!(fc, Bool)
     r = new_local!(fc, I32)
     emit!(fc.b, :local_set, r)
     emit!(fc.b, :local_get, r)
     if!(fc.b)
     for i in tests
-        push_val!(fc, emit_isa!(fc, array_element_get!(fc, arr, ml, const_value(fc, i)), T.parameters[i]))
+        push_val!(fc, elem_type_isa!(fc, array_element_get!(fc, arr, ml, const_value(fc, i)), T.parameters[i]))
         emit!(fc.b, :local_get, r); emit!(fc.b, :i32_and); emit!(fc.b, :local_set, r)
     end
     if rest
-        if eltype_intersects(E, B)
+        if elem_may_be(E, B)
             # (the elements after the k-th, while they are)
             i = new_local!(fc, I64)
             emit!(fc.b, :i64_const, k + 1); emit!(fc.b, :local_set, i)
@@ -945,7 +955,7 @@ function tuple_array_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
             emit!(fc.b, :i64_gt_s)
             emit!(fc.b, :local_get, r); emit!(fc.b, :i32_eqz); emit!(fc.b, :i32_or)
             br_if!(fc.b, 1)
-            push_val!(fc, emit_isa!(fc, array_element_get!(fc, arr, ml, CGVal(Int, Inline, LeafVal[i])), B))
+            push_val!(fc, elem_type_isa!(fc, array_element_get!(fc, arr, ml, CGVal(Int, Inline, LeafVal[i])), B))
             emit!(fc.b, :local_set, r)
             emit!(fc.b, :local_get, i); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_add); emit!(fc.b, :local_set, i)
             br!(fc.b, 0)
@@ -958,6 +968,289 @@ function tuple_array_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
         end
     end
     end!(fc.b)
+    emit!(fc.b, :local_get, r)
+    return pop_val!(fc, Bool)
+end
+
+# An element `e` of a tuple, of the tuple type's parameter `P`: whether `typeof(e) <: P`, as
+# natively the tuple's type is `Tuple{typeof.(elements)...}`. That is `e isa P`, but of a type
+# object (`(Int,)` is a `Tuple{DataType}`, not a `Tuple{Type{Int}}`), and of a `P` of free type
+# variables (opaque, natively: `Int <: T` is false): by the element's type id then, and a tuple
+# whose concrete type the module does not have by its elements.
+function elem_type_isa!(fc::FnCtx, e::CGVal, @nospecialize(P))
+    E = e.typ
+    P isa Type && !Base.has_free_typevars(P) && (!tests_type_objects(P) || typeintersect(E, Type) === Union{}) &&
+        return emit_isa!(fc, e, P)
+    elem_is(E, P) && return const_value(fc, true)
+    elem_may_be(E, P) || return const_value(fc, false)
+    E isa DataType && isconcretetype(E) && return const_value(fc, Tuple{E} <: Tuple{P})
+    ts = fc.cgm.types
+    v = convert_repr(fc, e, Any)
+    by_id!() = (push_val!(fc, v); emit!(fc.b, :struct_get, ts.jlvalue, 0);
+                call!(fc.b, elem_isa_predicate!(fc.cgm, P)); pop_val!(fc, Bool))
+    may_be_tuple_object(P) || return by_id!()
+    res = new_val!(fc, Bool)
+    push_val!(fc, v)
+    emit!(fc.b, :struct_get, ts.jlvalue, 0)
+    emit!(fc.b, :i32_const, typeid!(ts, Tuple))
+    emit!(fc.b, :i32_eq)
+    if!(fc.b); open_label!(fc)
+    assign!(fc, res, tuple_type_isa!(fc, unbox!(fc, v, Tuple), P; object=true))
+    else!(fc.b)
+    assign!(fc, res, by_id!())
+    end!(fc.b); close_label!(fc)
+    return res
+end
+
+# whether every element of static type `E` is of the parameter `P` (`typeof(e) <: P`), and
+# whether one may be (a parameter that is a free type variable, or has one: may)
+elem_is(@nospecialize(E), @nospecialize(P)) =
+    P isa Type && !Base.has_free_typevars(P) && E <: P && !tests_type_objects(E)
+elem_may_be(@nospecialize(E), @nospecialize(P)) =
+    !(P isa Type) || Base.has_free_typevars(P) || typeintersect(E, P) !== Union{} ||
+    (typeintersect(E, Type) !== Union{} && any(K -> K <: P, (DataType, UnionAll, Union, Core.TypeofBottom)))
+
+# whether `L` is a leaf bound (`is_leaf_bound`, src/subtype.c): `Union{}`, a concrete type or a
+# `Type{X}`. A variable of such a lower bound at more than one element is of one concrete type
+# (the diagonal rule); of another (`Real<:T`), it is not
+leaf_bound(@nospecialize(L)) =
+    L === Union{} || (L isa DataType && (isabstracttype(L) ? L.name === Type.body.name : isconcretetype(L)))
+
+# whether a value of `T` may be a tuple whose concrete type the module does not have (an object
+# of `Tuple`, see `tuple_canon_func!`), which is tested by its elements: of a type that may
+# hold tuples, but not every tuple (a free type variable: as natively, by its lower bound)
+may_be_tuple_object(@nospecialize(T)) = T isa TypeVar ? may_be_tuple_object(T.lb) : !(Tuple <: T) && has_tuple_members(T)
+function has_tuple_members(@nospecialize(T))
+    T isa TypeVar && return has_tuple_members(T.lb)
+    T isa Union && return any(has_tuple_members, Base.uniontypes(T))
+    T isa UnionAll && return has_tuple_members(Base.unwrap_unionall(T))
+    return T isa DataType && T.name === Tuple.name
+end
+
+"""
+    tuple_type_isa!(fc, t, T; object=false) -> CGVal
+
+`isa(t, T)` of the tuple `t` held as an array (a tuple of unknown length, or an object of
+`Tuple` unboxed, `object`): natively `<:` of its type, the type its elements make. Of a union,
+of each member (in turn: one that is a type with type variables may be the closed world's
+error); of a tuple type, by its length and the types of its elements (`tuple_array_isa!`); of a
+free type variable, of its lower bound (as native subtyping); of a tuple type with type
+variables, `Tuple{T,Vararg{T}} where T`: of a tuple of unknown length, as an object, by the
+module's types, and of a tuple whose concrete type the module does not have, first by its
+elements against the variables' bounds (`tuple_bounds_type`), then of the common shape by the
+variables at more than one element (`diagonal_vars_isa!`), of another shape the closed world's
+error, as `typeof` of it (`Runtime.throw_isa_unknown`).
+"""
+function tuple_type_isa!(fc::FnCtx, t::CGVal, @nospecialize(T); object::Bool=false)
+    T isa TypeVar && return tuple_type_isa!(fc, t, T.lb; object)
+    Tuple <: T && return const_value(fc, true)
+    if T isa Union
+        # (the members that are tuple types first)
+        us = sort!(Any[U for U in Base.uniontypes(T) if has_tuple_members(U)]; by=U -> !(U isa DataType))
+        res = const_value(fc, false)
+        for U in us
+            if isconstant(res)
+                constant_value(res) && return res
+                res = tuple_type_isa!(fc, t, U; object)
+            else
+                r = new_val!(fc, Bool)
+                assign!(fc, r, res)
+                push_val!(fc, r); emit!(fc.b, :i32_eqz)
+                if!(fc.b); open_label!(fc)
+                assign!(fc, r, tuple_type_isa!(fc, t, U; object))
+                end!(fc.b); close_label!(fc)
+                res = r
+            end
+        end
+        return res
+    end
+    T isa UnionAll && (D = tuple_datatype(T)) !== nothing && (T = D)
+    if T isa DataType
+        T.name === Tuple.name || return const_value(fc, false)
+        return tuple_array_isa!(fc, t, T)
+    end
+    has_tuple_members(T) || return const_value(fc, false)
+    # (a tuple type with type variables: of a tuple of unknown length, as an object, by the
+    # module's types where it has the tuple's concrete type, natively `<:`; else by its elements)
+    object || return emit_isa!(fc, convert_repr(fc, t, Any), T)
+    B = tuple_bounds_type(T)
+    need = B === nothing ? const_value(fc, true) : tuple_array_isa!(fc, t, B)
+    isconstant(need) && !constant_value(need) && return need
+    shape = bound_tuple_shape(T)
+    res = new_val!(fc, Bool)
+    assign!(fc, res, need)
+    push_val!(fc, res)
+    if!(fc.b); open_label!(fc)
+    if shape !== nothing
+        assign!(fc, res, diagonal_vars_isa!(fc, t, shape))
+    else
+        call_runtime!(fc, Runtime.throw_isa_unknown, CGVal[])
+        unreachable!(fc.b)
+    end
+    end!(fc.b); close_label!(fc)
+    return res
+end
+
+"""
+    tuple_bounds_type(T) -> Union{Nothing,DataType}
+
+Of the tuple type with type variables `T`, the tuple type its variables' bounds make: each
+parameter that is a variable its upper bound, each other one with the variables it mentions
+(`Vector{T}`: `Vector{T} where T<:Real`), a `Vararg` of any length. Every type `T` has is one of
+it; of the common shape (`bound_tuple_shape`) a tuple of it is of `T` unless a variable at more
+than one element breaks the diagonal rule. (`nothing` but of a tuple type: a union.)
+"""
+function tuple_bounds_type(@nospecialize(T))
+    U = Base.unwrap_unionall(T)
+    (U isa DataType && U.name === Tuple.name) || return nothing
+    vars = TypeVar[]
+    W = T
+    while W isa UnionAll
+        push!(vars, W.var); W = W.body
+    end
+    # (a variable whose bounds are not ordered, `Int<:T<:Float64`, bounds nothing: natively its
+    # upper bound is not one of its elements'; one of bounds of other variables, as ordered)
+    ordered(v::TypeVar) = !(v.lb isa Type && v.ub isa Type) || v.lb <: v.ub
+    bound(P) = Base.rewrap_unionall(P isa TypeVar && any(v -> v === P, vars) ? (ordered(P) ? P.ub : Any) : P, T)
+    ps = Any[]
+    for P in U.parameters
+        if P isa Core.TypeofVararg
+            push!(ps, Vararg{isdefined(P, :T) ? bound(P.T) : Any})
+        else
+            push!(ps, bound(P))
+        end
+    end
+    return Tuple{ps...}
+end
+
+"""
+    bound_tuple_shape(T) -> Union{Nothing,NamedTuple}
+
+The parts of a tuple type with type variables of the common shape, whose `isa` the types of a
+tuple's elements decide (`diagonal_vars_isa!`): `Tuple{P1, …, Pk[, Vararg{Pv}]} where V1, …, Vm`,
+each parameter a variable or of none of them, each variable's bounds types of none (no variable,
+of these or free) and ordered (`lb <: ub`), a `Vararg` of no variable length. Else `nothing`.
+"""
+function bound_tuple_shape(@nospecialize(T))
+    vars = TypeVar[]
+    W = T
+    while W isa UnionAll
+        push!(vars, W.var); W = W.body
+    end
+    (W isa DataType && W.name === Tuple.name) || return nothing
+    any(v -> any(w -> Base.has_typevar(v.lb, w) || Base.has_typevar(v.ub, w), vars), vars) && return nothing
+    all(v -> v.lb isa Type && v.ub isa Type && v.lb <: v.ub, vars) || return nothing
+    ps = collect(Any, W.parameters)
+    va = !isempty(ps) && ps[end] isa Core.TypeofVararg
+    if va
+        V = ps[end]
+        isdefined(V, :N) && return nothing
+        ps[end] = isdefined(V, :T) ? V.T : Any
+    end
+    for P in ps
+        P isa TypeVar && any(v -> v === P, vars) && continue
+        any(v -> Base.has_typevar(P, v), vars) && return nothing
+    end
+    return (; vars, ps, va)
+end
+
+"""
+    diagonal_vars_isa!(fc, t, shape) -> CGVal
+
+Of the tuple `t` (as an array) whose elements are of `bound_tuple_shape`'s type's bounds
+(`tuple_bounds_type`), whether it is of that type: natively (the diagonal rule), a variable at two
+elements or more, of a lower bound `leaf_bound`, is of one concrete type, the elements', which is
+above its lower bound (`subtype_unionall`, src/subtype.c; of another lower bound, as at one
+element: any type within its bounds). By the elements' type ids; of tuples whose concrete types
+the module does not have (objects of `Tuple`), by their elements' (`Runtime.same_tuple_type`).
+"""
+function diagonal_vars_isa!(fc::FnCtx, t::CGVal, shape)
+    (; vars, ps, va) = shape
+    k = va ? length(ps) - 1 : length(ps)
+    diag = Any[]
+    for V in vars
+        pos = Int[i for i in 1:k if ps[i] === V]
+        inva = va && ps[end] === V
+        (length(pos) >= 2 || inva) && leaf_bound(V.lb) && push!(diag, (V, pos, inva))
+    end
+    isempty(diag) && return const_value(fc, true)
+    lx = layout(fc, t.typ)
+    ml = lx.elements::MemoryLayout
+    E = ml.elem.T
+    ts = fc.cgm.types
+    arr = new_local!(fc, RefType(ml.array, true))
+    n = new_local!(fc, I32)
+    push_val!(fc, t)
+    emit!(fc.b, :struct_get, lx.wtype, DATA_FIELD)
+    emit!(fc.b, :local_tee, arr)
+    emit_memory_length!(fc, ml)
+    emit!(fc.b, :local_set, n)
+    r = new_local!(fc, I32)
+    emit!(fc.b, :i32_const, 1); emit!(fc.b, :local_set, r)
+    for (V, pos, inva) in diag
+        # (with a `Vararg`: where two elements or more are at its positions)
+        if inva
+            emit!(fc.b, :local_get, n); emit!(fc.b, :i32_const, k - length(pos) + 2); emit!(fc.b, :i32_ge_s)
+            if!(fc.b); open_label!(fc)
+        end
+        if E isa DataType && isconcretetype(E)
+            # (every element of the type `E`)
+            if !(V.lb <: E)
+                emit!(fc.b, :i32_const, 0); emit!(fc.b, :local_set, r)
+            end
+        else
+            i1 = isempty(pos) ? k + 1 : pos[1]
+            e1 = convert_repr(fc, array_element_get!(fc, arr, ml, const_value(fc, i1)), Any)
+            t1, g1 = new_local!(fc, I32), new_local!(fc, I32)
+            push_val!(fc, e1); emit!(fc.b, :struct_get, ts.jlvalue, 0); emit!(fc.b, :local_tee, t1)
+            # (a tuple whose concrete type the module does not have: of the elements' types)
+            emit!(fc.b, :i32_const, typeid!(ts, Tuple)); emit!(fc.b, :i32_eq); emit!(fc.b, :local_set, g1)
+            # (of the type of the first: by type id, and of objects of `Tuple`, by their elements)
+            same!(i::CGVal) = begin
+                v = convert_repr(fc, array_element_get!(fc, arr, ml, i), Any)
+                eq = new_local!(fc, I32)
+                push_val!(fc, v); emit!(fc.b, :struct_get, ts.jlvalue, 0); emit!(fc.b, :local_get, t1)
+                emit!(fc.b, :i32_eq); emit!(fc.b, :local_tee, eq)
+                emit!(fc.b, :local_get, g1); emit!(fc.b, :i32_and)
+                if!(fc.b); open_label!(fc)
+                push_val!(fc, call_runtime!(fc, Runtime.same_tuple_type, CGVal[e1, v])); emit!(fc.b, :local_set, eq)
+                end!(fc.b); close_label!(fc)
+                emit!(fc.b, :local_get, eq); emit!(fc.b, :local_get, r); emit!(fc.b, :i32_and); emit!(fc.b, :local_set, r)
+            end
+            for p in pos
+                p == i1 || same!(const_value(fc, p))
+            end
+            if inva
+                # (the elements after the k-th)
+                i = new_local!(fc, I64)
+                emit!(fc.b, :i64_const, i1 == k + 1 ? k + 2 : k + 1); emit!(fc.b, :local_set, i)
+                block!(fc.b); open_label!(fc)
+                loop!(fc.b); open_label!(fc)
+                emit!(fc.b, :local_get, i); emit!(fc.b, :local_get, n); emit!(fc.b, :i64_extend_i32_u)
+                emit!(fc.b, :i64_gt_s)
+                br_if!(fc.b, 1)
+                same!(CGVal(Int, Inline, LeafVal[i]))
+                emit!(fc.b, :local_get, i); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_add); emit!(fc.b, :local_set, i)
+                br!(fc.b, 0)
+                end!(fc.b); close_label!(fc)
+                end!(fc.b); close_label!(fc)
+            end
+            # (its lower bound: of its upper bound, its elements are, `tuple_bounds_type`; a
+            # concrete one, of a type the module does not have, is it, `isa` of it)
+            if V.lb !== Union{}
+                above = new_val!(fc, Bool)
+                emit!(fc.b, :local_get, g1)
+                if!(fc.b); open_label!(fc)
+                assign!(fc, above, tuple_type_isa!(fc, unbox!(fc, e1, Tuple), V.lb; object=true))
+                else!(fc.b)
+                emit!(fc.b, :local_get, t1); call!(fc.b, above_predicate!(fc.cgm, V.lb))
+                assign!(fc, above, pop_val!(fc, Bool))
+                end!(fc.b); close_label!(fc)
+                push_val!(fc, above); emit!(fc.b, :local_get, r); emit!(fc.b, :i32_and); emit!(fc.b, :local_set, r)
+            end
+        end
+        inva && (end!(fc.b); close_label!(fc))
+    end
     emit!(fc.b, :local_get, r)
     return pop_val!(fc, Bool)
 end
@@ -985,10 +1278,8 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     typeintersect(S, T) === Union{} && return const_value(fc, false)
     lx = layout(fc, S)
     ts = fc.cgm.types
-    T isa UnionAll && (D = tuple_datatype(T)) !== nothing && (T = D)
-    if lx.kind === Boxed && lx.elements !== nothing && S <: Tuple && T isa DataType && T <: Tuple
-        return tuple_array_isa!(fc, x, T)
-    end
+    # (a tuple of unknown length, an array object: by the type its elements make)
+    lx.kind === Boxed && lx.elements !== nothing && S <: Tuple && return tuple_type_isa!(fc, x, T)
     if is_union_tuple(S)
         # of the concrete types of its union elements
         res = const_value(fc, false)
@@ -1001,6 +1292,27 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     end
     (lx.kind === Boxed && lx.wtype == fc.cgm.types.jlvalue) ||
         unsupported("isa(::", S, ", ", T, ")")
+    may_be_tuple_object(T) || return object_isa!(fc, x, T)
+    # (or a tuple whose concrete type the module does not have: an object of `Tuple`, see
+    # `tuple_canon_func!`, by its elements)
+    res = new_val!(fc, Bool)
+    push_val!(fc, x)
+    emit!(fc.b, :struct_get, ts.jlvalue, 0)
+    emit!(fc.b, :i32_const, typeid!(ts, Tuple))
+    emit!(fc.b, :i32_eq)
+    if!(fc.b); open_label!(fc)
+    assign!(fc, res, tuple_type_isa!(fc, unbox!(fc, x, Tuple), T; object=true))
+    else!(fc.b)
+    assign!(fc, res, object_isa!(fc, x, T))
+    end!(fc.b); close_label!(fc)
+    return res
+end
+
+# `isa(x, T)` of the object `x` (not of `Tuple`, a tuple whose concrete type the module does not
+# have): by its type id
+function object_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
+    ts = fc.cgm.types
+    T isa UnionAll && (D = tuple_datatype(T)) !== nothing && (T = D)
     if (X = type_singleton(T)) !== nothing
         # `Type{X}`: the type object of X itself
         push_val!(fc, x)
@@ -1011,7 +1323,8 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
         # a union with some: of each member
         res = nothing
         for U in Base.uniontypes(T)
-            r = emit_isa!(fc, x, U)
+            r = x.typ <: U ? const_value(fc, true) : typeintersect(x.typ, U) === Union{} ? const_value(fc, false) :
+                object_isa!(fc, x, U)
             if res === nothing
                 res = r
             else
@@ -1039,32 +1352,7 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     # subtypes (known when the module is complete)
     isa_types!() = (push_val!(fc, x); emit!(fc.b, :struct_get, ts.jlvalue, 0);
                     call!(fc.b, isa_predicate!(fc.cgm, T)); pop_val!(fc, Bool))
-    if T isa UnionAll && T <: Tuple && !(Tuple <: T)
-        # (a tuple type with type variables, `Tuple{Vararg{T}} where T<:Real`: by the module's
-        # types, but for a tuple whose concrete type the module does not have, an object of
-        # `Tuple`: natively `<:` of the type its elements make, which is not one of the
-        # module's, the closed world's error, as `typeof` of it)
-        push_val!(fc, x)
-        emit!(fc.b, :struct_get, ts.jlvalue, 0)
-        emit!(fc.b, :i32_const, typeid!(ts, Tuple))
-        emit!(fc.b, :i32_eq)
-        if!(fc.b); call_runtime!(fc, Runtime.throw_isa_unknown, CGVal[]); unreachable!(fc.b); end!(fc.b)
-        return isa_types!()
-    end
-    (T isa DataType && T <: Tuple && !(Tuple <: T)) || return isa_types!()
-    # (or, of a tuple type, a tuple whose concrete type the module does not have: an object of
-    # `Tuple`, see `tuple_canon_func!`, of its elements)
-    res = new_val!(fc, Bool)
-    push_val!(fc, x)
-    emit!(fc.b, :struct_get, ts.jlvalue, 0)
-    emit!(fc.b, :i32_const, typeid!(ts, Tuple))
-    emit!(fc.b, :i32_eq)
-    if!(fc.b); open_label!(fc)
-    assign!(fc, res, tuple_array_isa!(fc, unbox!(fc, x, Tuple), T))
-    else!(fc.b)
-    assign!(fc, res, isa_types!())
-    end!(fc.b); close_label!(fc)
-    return res
+    return isa_types!()
 end
 
 # whether `x isa T` of a type `x` depends on more than the kind of type it is
@@ -1096,8 +1384,6 @@ function emit_ifelse!(fc::FnCtx, c::CGVal, a::CGVal, b::CGVal, @nospecialize(typ
 end
 
 memory_type(@nospecialize(R)) = GenericMemory{R.parameters[1],R.parameters[2],R.parameters[3]}
-
-eltype_intersects(@nospecialize(A), @nospecialize(B)) = typeintersect(A, B) !== Union{}
 
 """
     new_expr!(fc, args) -> CGVal

@@ -305,7 +305,7 @@ end
 
 function const_global(world::UInt, m::Module, s::Symbol)
     Base.invoke_in_world(world, isconst, m, s) || return nothing
-    return Some(Base.invoke_in_world(world, getglobal, m, s))
+    return Some{Any}(Base.invoke_in_world(world, getglobal, m, s))
 end
 
 "The result `res` of the statement `stmt` in the representation of its type `typ`."
@@ -1009,8 +1009,10 @@ function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return emit_new!(fc, constant_value(T), args)
     elseif head === :splatnew
         T = operand(fc, ex.args[1])
-        isconstant(T) || unsupported("`splatnew` of a type that is not known at compile time")
         tup = operand(fc, ex.args[2])
+        # (of a type known only at run time, as `new` of it: `NamedTuple{names}(t)` of a tuple
+        # whose element types are, `splatnew(NamedTuple{names, typeof(t)}, t)`)
+        isconstant(T) || return emit_splatnew_rt!(fc, T, tuple_elements(fc, tup), typ)
         return emit_new!(fc, constant_value(T), tuple_elements(fc, tup))
     elseif head === :boundscheck
         cb = Base.JLOptions().check_bounds

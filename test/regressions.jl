@@ -113,9 +113,14 @@ const RG_TV_A = Tuple{T,Vararg{T}} where T
 const RG_TV_B = Tuple{Vararg{T}} where T<:Real
 const RG_TV_VALUES = Any[(1.0, 2.0), (1, 2.5), (1, 2), ("a", "b"), ()]
 rg_vt_typevar(i::Int) = (x = RG_TV_VALUES[i]; (x isa RG_TV_A, x isa RG_TV_B))
-# (of a tuple whose concrete type the module does not have, an object of `Tuple`: natively
-# `true`, the closed world's error here, as `typeof` of it)
+# (of tuples whose concrete types the module does not have, objects of `Tuple`: by the types of
+# their elements, natively `<:`: the variables of the common shape at more than one element of
+# one type; other shapes, a variable in a parameter, the closed world's error)
 rg_vt_typevar_unknown(n::Int) = (x = rg_id(Any[tuple(collect(1:n)...)])[1]; (x isa RG_TV_A) + 2 * (x isa RG_TV_B))
+rg_vt_typevar_mixed(n::Int) = (x = rg_id(Any[tuple(Any[1, 2.5, "s"][1:n]...)])[1]; (x isa RG_TV_A) + 2 * (x isa RG_TV_B))
+const RG_TV_NESTED = Tuple{Vector{T}, Vararg{Any}} where T
+struct RGTvItem; n::Int; end
+rg_vt_typevar_nested(n::Int) = (x = rg_id(Any[tuple(Any[[n], RGTvItem(n)][1:n]...)])[1]; x isa RG_TV_NESTED)
 
 # singular values and symmetric eigenvalues of extreme magnitudes (scaled, as LAPACK does)
 rg_svd(x::Float64) = (s = svdvals([x 2x; 3x 4x]); (s[1] / x, s[2] / x, svdvals(fill(x, 1, 1))[1] / x))
@@ -394,8 +399,14 @@ const RG_HOLES = Vector{Any}(undef, 2)
     for i in 1:5
         @wtest rg_vt_typevar(i)
     end
-    @test rg_vt_typevar_unknown(17) == 3
-    let r = wasm_run(wcompile(rg_vt_typevar_unknown, (Int,)), "rg_vt_typevar_unknown", 17; rettype=Int)
+    for n in (0, 1, 2, 17)
+        @wtest rg_vt_typevar_unknown(n)
+    end
+    for n in 0:3
+        @wtest rg_vt_typevar_mixed(n)
+    end
+    @test rg_vt_typevar_nested(2)
+    let r = wasm_run(wcompile(rg_vt_typevar_nested, (Int,)), "rg_vt_typevar_nested", 2; rettype=Bool)
         @test r isa Tuple && r[1] === :trap
         @test occursin("isa of a tuple whose concrete type the module does not have", LAST_OUTPUT[])
     end

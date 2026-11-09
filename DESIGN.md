@@ -457,8 +457,13 @@ as other pointers of the build process are.
   module, a test of the elements and the conversion, compiled with the code. A tuple whose
   concrete type the module does not have (no code names it) is an object of `Tuple`, its
   elements as objects: one such object of its elements whatever type it came from,
-  compared (`===`) and hashed (`objectid`, not the native one) by its elements, and tested
-  by them for tuple types; `typeof` of it is `Tuple`. These cases are compiled until
+  compared (`===`) by its elements, its `objectid` the native one (of its concrete type's
+  hash and layout, computed from its elements' types: `Runtime.tuple_objectid`), and `isa`
+  of it `<:` of the type its elements make, tested by them (against a tuple type with type
+  variables, `Tuple{T,Vararg{T}} where T`, by its elements against the variables' bounds and,
+  of a variable at more than one element, of one type, the diagonal rule; of another shape, a
+  variable in a parameter, the closed world's error where they are within the bounds);
+  `typeof` of it is the closed world's error. These cases are compiled until
   they, and the values of the type maps, add no types, and the tables are built after
   them and the image. `Core.apply_type` and `new` of types known only at run time
   (a closure capturing a variable of a small union is `new(apply_type(#f, typeof(v)), v)`)
