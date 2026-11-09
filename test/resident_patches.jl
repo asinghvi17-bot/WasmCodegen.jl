@@ -215,7 +215,8 @@ end
             write(patch, "Target1.wait_forever(x::Int, y) = 10\nTarget2.wait_forever(x, y::Number) = 2\n" *
                          "Target3.wait_forever(x, y::Number) = 2\n" *
                          "Target4.wait_forever(x::T, y::S) where {S<:AbstractString,T<:Number} = T === Int ? 11 : 22\n" *
-                         "Target4.wait_forever(x::Number, y) = 33\nTarget5.wait_forever(x::Number) = 3\n")
+                         "Target4.wait_forever(x::Number, y) = 33\nTarget5.wait_forever(x::Number) = 3\n" *
+                         "Target6.wait_forever(x::Number) = 3\nTarget7.wait_forever(x::Number) = 5\n")
             script = joinpath(dir, "added_run.jl")
             write(script, """
                 include($(repr(joinpath(@__DIR__, "harness.jl"))))
@@ -245,6 +246,16 @@ end
                 wait_forever(x::Integer) = 1
                 end
                 Target5_latest(n::Int) = Target5.wait_forever(n)
+                # (and one more specific than a patch's, defined after code that calls the patch's was
+                # compiled: Target6's patch a method of another signature, Target7's replaces the native one)
+                module Target6
+                wait_forever(x) = 1
+                end
+                Target6_latest(n::Int) = Target6.wait_forever(n)
+                module Target7
+                wait_forever(x::Number) = 1
+                end
+                Target7_latest(n::Int) = Target7.wait_forever(n)
                 mutable struct Box
                     x::Number
                 end
@@ -271,7 +282,8 @@ end
                     end
                 end
                 const BINDINGS = Pair{Symbol,Any}[:Target1 => Target1, :Target2 => Target2, :Target3 => Target3,
-                                                  :Target4 => Target4, :Target5 => Target5]
+                                                  :Target4 => Target4, :Target5 => Target5, :Target6 => Target6,
+                                                  :Target7 => Target7]
                 config = test_config(trim=:unsafe, extra_patches=[$(repr(patch))], patch_bindings=BINDINGS)
                 programs = (:_boxed, :_mixed, :_called, :_invoked, :_param, :_static)
                 fs = [getglobal(Main, Symbol(T, s)) for T in targets for s in programs]
@@ -279,6 +291,7 @@ end
                 run(f; world...) = (c = WasmCodegen.compile(f, (Int,); config, world...);
                           (wasm_run(c, string(nameof(f)), 3; rettype=Int), length(c.cgm.diagnostics)))
                 stock = map(run, fs)
+                wpre = Base.get_world_counter()
                 install_trim_patches!(patches=[WasmCodegen.TRIM_PATCHES; $(repr(patch))], bindings=BINDINGS)
                 resident = map(run, fs)
                 # the lookups, as of the methods defined natively: the matches (by their signatures but
@@ -307,10 +320,17 @@ end
                 @eval Target5 wait_forever(x::Int) = 2
                 worlds = (run(Target5_latest)[1], run(Target5_latest; world=wold)[1],
                           Base.invokelatest(Target5_latest, 3), Base.invoke_in_world(wold, Target5_latest, 3))
-                print(repr((stock, resident, natives, lookups, worlds)))
+                # a world before the installation: none of the patches, as natively in it
+                before = (run(Target6_latest; world=wpre)[1], Base.invoke_in_world(wpre, Target6_latest, 3))
+                # code compiled, then a native method more specific than the patch's it called
+                since = Int[run(Target6_latest)[1], run(Target7_latest)[1]]
+                @eval Target6 wait_forever(x::Int) = 2
+                @eval Target7 wait_forever(x::Int) = 2
+                append!(since, [run(Target6_latest)[1], run(Target7_latest)[1]])
+                print(repr((stock, resident, natives, lookups, worlds, before, since)))
                 """)
             cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $script`
-            stock, resident, natives, lookups, worlds = eval(Meta.parse(read(cmd, String)))
+            stock, resident, natives, lookups, worlds, before, since = eval(Meta.parse(read(cmd, String)))
             @test resident == stock
             @test all(lookups)
             # (and natively with the methods defined, where a session's module computes it: not a
@@ -328,6 +348,11 @@ end
             @test resident[23] == stock[23] && natives[23] == 11
             # (the methods of the world compiled: one defined since only in the latest)
             @test worlds == (2, 1, 2, 1)
+            # (and a world before the installation has no patch)
+            @test before == (1, 1)
+            # (code that called a patch's method is not reused once a native method more specific
+            # than it is defined: as a session's module, compiled then)
+            @test since == [3, 5, 2, 2]
         end
     end
 

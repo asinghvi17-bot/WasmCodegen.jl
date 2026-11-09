@@ -214,7 +214,8 @@ lazy-library stubs, the logger lookup, `invokelatest_gr`, and the simplified pri
 type names, functions and enums (the package loader sends `repr`s of types to precompilation
 processes as code). `Base.invokelatest` keeps Core's binding; a program's calls of it compile
 to direct calls, as juliac's rebinding makes them. `Runtime.original` calls the world before
-the installation.
+the installation. A compilation of a world before the installation has none of the patches, and
+Wasm code inferred in one world is not reused in another (`WasmCacheOwner`).
 
 Calling it again with the same patches and bindings does nothing; with others, or in a session
 of `with_trim_patches`, it throws. `TASK_PATCHES` (`Config(tasks = :jspi)`) need a session of
@@ -256,6 +257,7 @@ function install_trim_patches!(; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}
     if Base.invoke_in_world(Base.get_world_counter(), isdefined, Base, :invokelatest_trimmed)
         DIRECT_INVOKELATEST[] = latest_global(Base, :invokelatest_trimmed)
     end
+    RESIDENT_WORLD[] = w
     RESIDENT_PATCH_MODULE[] = sandbox
     PATCH_SESSION[] = key
     return nothing
@@ -267,6 +269,10 @@ const RESIDENT_PATCH_MODULE = Ref{Union{Nothing,Module}}(nothing)
 # the patches installed as methods of `WASM_METHODS` (see `CC.findall(::WasmMethodTable)`): the
 # native methods they replace, and those that replace none
 const RESIDENT_OVERLAYS = Method[]
+# the world they are installed in: a compilation of an earlier world has none of the patches
+# (in a system image's process, every world: see `__init__`)
+const RESIDENT_WORLD = Ref{UInt}(typemax(UInt))
+resident_at(world::UInt) = !isempty(RESIDENT_OVERLAYS) && world >= RESIDENT_WORLD[]
 const RESIDENT_REPLACED = IdDict{Method,Method}()
 const RESIDENT_ADDED = Method[]
 # For the overlays that replace no native method, Julia's lookup of the methods of their functions
@@ -339,4 +345,5 @@ end
 
 # what a program's `Base.invokelatest` is, juliac's `invokelatest_trimmed` (see `CC.optimize(::WasmInterpreter, ...)`)
 const DIRECT_INVOKELATEST = Ref{Any}(nothing)
+direct_invokelatest(interp) = resident_at(CC.get_inference_world(interp)) ? DIRECT_INVOKELATEST[] : nothing
 is_resident_overlay(m::Method) = !isempty(RESIDENT_OVERLAYS) && any(r -> r === m, RESIDENT_OVERLAYS)

@@ -12,14 +12,20 @@ tables of a module (`Runtime.overlay_tables`: of its host's extensions, and
 defined in them, and how many are in force. Code inferred with other tables, or before a method
 was defined or deleted, is not reused, since that does not invalidate it (a caller that found
 the native method has no backedge to an overlay method table).
+
+Where patches are installed as overlays (`install_trim_patches!`, `resident_at`), also the world:
+those are looked up among the native methods, as the methods a session defines, and a caller that
+found one has no backedge to the native method table either (a native method defined since, more
+specific than the overlay, does not invalidate it). Code inferred in another world is not reused.
 """
 struct WasmCacheOwner
     tables::Tuple{Vararg{Core.MethodTable}}
     defined::Int
     in_force::Int
+    resident_world::UInt
 end
 
-function WasmCacheOwner(extensions=())
+function WasmCacheOwner(extensions=(), world::UInt=Base.get_world_counter())
     tables = Runtime.overlay_tables(extensions)
     defined = in_force = 0
     for mt in tables
@@ -28,7 +34,7 @@ function WasmCacheOwner(extensions=())
             m.dispatch_status == 0 || (in_force += 1)
         end
     end
-    return WasmCacheOwner(Tuple(tables), defined, in_force)
+    return WasmCacheOwner(Tuple(tables), defined, in_force, resident_at(world) ? world : typemin(UInt))
 end
 
 """
@@ -97,7 +103,7 @@ function CC.findall(@nospecialize(sig::Type), t::WasmMethodTable; limit::Int=-1)
         result = CC._findall(sig, mt, t.world, limit)
         result === nothing && return nothing
         ms, amb = result.matches, result.ambig
-        if !isempty(RESIDENT_OVERLAYS)
+        if resident_at(t.world)
             if mt === nothing
                 ms, amb = resident_matches(sig, ms, amb, t.world)
             else
@@ -130,7 +136,7 @@ function CC.findsup(@nospecialize(sig::Type), t::WasmMethodTable)
         match, valid_worlds = CC._findsup(sig, mt, t.world)
         min_world = max(min_world, valid_worlds.min_world)
         max_world = min(max_world, valid_worlds.max_world)
-        if !isempty(RESIDENT_OVERLAYS)
+        if resident_at(t.world)
             if mt === nothing
                 match = resident_sup(sig, match, t.world)
             elseif match !== nothing && is_resident_overlay(match.method)
@@ -209,7 +215,7 @@ function WasmInterpreter(; world::UInt=Base.get_world_counter(), extensions=())
     # `down::Function`): a closed world has no dynamic dispatch to fall back on
     opt_params = CC.OptimizationParams(; compilesig_invokes=false)
     return WasmInterpreter(world, mt, CC.InferenceResult[], inf_params, opt_params,
-                           CodegenSources(WasmCacheOwner(extensions)))
+                           CodegenSources(WasmCacheOwner(extensions, world)))
 end
 
 CC.InferenceParams(interp::WasmInterpreter) = interp.inf_params
@@ -245,7 +251,7 @@ CC.get_max_methods(interp::WasmInterpreter, sv::CC.AbsIntState) =
 # which the patches leave as they are) is inferred as `invokelatest_trimmed`, and is replaced by
 # it before the optimizer: the code a session compiles.
 function CC.optimize(interp::WasmInterpreter, opt::CC.OptimizationState, caller::CC.InferenceResult)
-    direct = DIRECT_INVOKELATEST[]
+    direct = direct_invokelatest(interp)
     direct === nothing || direct_invokelatest!(opt, direct, CC.get_inference_world(interp))
     return @invoke CC.optimize(interp::CC.AbstractInterpreter, opt::CC.OptimizationState,
                                caller::CC.InferenceResult)
@@ -303,7 +309,7 @@ function CC.abstract_eval_globalref(interp::WasmInterpreter, g::GlobalRef, saw_l
                                     sv::CC.AbsIntState)
     ret = @invoke CC.abstract_eval_globalref(interp::CC.AbstractInterpreter, g::GlobalRef,
                                              saw_latestworld::Bool, sv::CC.AbsIntState)
-    direct = DIRECT_INVOKELATEST[]
+    direct = direct_invokelatest(interp)
     (direct !== nothing && ret.rt isa CC.Const && ret.rt.val === Core.invokelatest &&
      invokelatest_binding(g.mod, g.name, CC.get_inference_world(interp))) || return ret
     return CC.RTEffects(CC.Const(direct), ret.exct, ret.effects, ret.refinements)
@@ -314,7 +320,7 @@ function CC.abstract_call_known(interp::WasmInterpreter, @nospecialize(f),
                                 max_methods::Int=CC.get_max_methods(interp, f, sv))
     folded = fold_target_intrinsic(f, arginfo.argtypes)
     folded === nothing || return CC.Future{CC.CallMeta}(folded)
-    direct = DIRECT_INVOKELATEST[]
+    direct = direct_invokelatest(interp)
     # (the binding `Base.invokelatest` read by `getproperty`/`getglobal` of the module, as Julia
     # 1.13 lowers `Base.invokelatest`: as `abstract_eval_globalref`'s read)
     if direct !== nothing && (f === getproperty || f === getglobal) && length(arginfo.argtypes) == 3

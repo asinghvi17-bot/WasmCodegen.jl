@@ -82,6 +82,7 @@ function __init__()
     COMPILER_WORLD[] = Base.get_world_counter()
     # (a system image's: by the worlds of the process that made it)
     empty!(RESIDENT_STANDINS)
+    isempty(RESIDENT_OVERLAYS) || (RESIDENT_WORLD[] = typemin(UInt))
     Runtime.BUILD_JLOPTIONS[] = Runtime.sanitized_jloptions()
 end
 
