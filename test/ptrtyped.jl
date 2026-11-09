@@ -196,8 +196,9 @@ vec_eq(n::Int, k::Int) = (a = collect(1:n); b = collect(1:n); k > 0 && (b[k] = 0
     @test "jl_ptr_load_bits8" in calls_of(f64_rw, :ld) && !("jl_ptr_load_byte" in calls_of(f64_rw, :ld))
     @test "jl_ptr_store_bits8" in calls_of(f64_rw, :st) && !("jl_ptr_store_byte" in calls_of(f64_rw, :st))
     @test "jl_ptr_load_bits4" in calls_of(i32_rw, :ld) && "jl_ptr_store_bits4" in calls_of(i32_rw, :st)
-    # traps (natively undefined: not run natively): a pointer without owner, a memory of
-    # references, an access out of the owner's range
+    # traps (not run natively): a pointer without owner and an access out of the owner's range,
+    # undefined natively; and the bytes of a memory of references, natively the references'
+    # addresses, which are not addressable here (a limitation, DESIGN.md §5)
     trap(f, args...) = (r = wasm_run(wcompile(f, map(typeof, args)), string(nameof(f)), args...; rettype=Float64);
                         r isa Tuple && r[1] === :trap)
     @test trap(no_owner_load, 1)
