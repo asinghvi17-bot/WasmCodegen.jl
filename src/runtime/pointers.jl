@@ -4,6 +4,24 @@
 
 "`memmove(dst, src, n)`: the `n` bytes at `src` copied to `dst`, which may overlap."
 function ptr_memmove(dst::Ptr{UInt8}, src::Ptr{UInt8}, n::UInt)
+    # between memories of bytes (or from a String): one `array.copy` (which may overlap), or
+    # a loop over the String's bytes, without finding the owners at each byte
+    if n <= UInt(typemax(Int32))
+        m = Int(n)
+        od, jd = owner_bytes(dst, m)
+        if od isa Memory{UInt8}
+            os, js = owner_bytes(src, m)
+            if os isa Memory{UInt8}
+                m > 0 && unsafe_copyto!(memoryref(od, jd), memoryref(os, js), m)
+                return dst
+            elseif os isa String
+                for k in 0:m-1
+                    @inbounds od[jd+k] = codeunit(os, js + k)
+                end
+                return dst
+            end
+        end
+    end
     if dst > src
         i = n
         while i > 0

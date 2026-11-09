@@ -120,6 +120,18 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
             emit!(fc.b, :array_set, ml.array)
         end
         return ghost(Nothing, nothing)
+    elseif m.module === Runtime && m.name === :ptr_owner
+        # the pointer's owner leaf, or `nothing` when it has none (null)
+        p = operand(fc, ex.args[3])
+        jl = jlvalue_ref(fc.cgm.types)
+        none = convert_repr(fc, const_value(fc, nothing), Any)
+        push_leaf!(fc, ptr_owner(p)); emit!(fc.b, :ref_is_null)
+        if!(fc.b, jl)
+        push_val!(fc, none)
+        else!(fc.b)
+        push_leaf!(fc, ptr_owner(p))
+        end!(fc.b)
+        return pop_val!(fc, Any)
     elseif m.module === Runtime && m.name === :reinterpret_bits
         Out = mi.specTypes.parameters[2].parameters[1]
         In = mi.specTypes.parameters[3]

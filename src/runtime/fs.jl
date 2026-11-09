@@ -1030,6 +1030,8 @@ copy_out!(dst::Vector{UInt8}, i::Int, off::UInt32, n::Int) =
 copy_out!(dst::MemoryRef{UInt8}, i::Int, off::UInt32, n::Int) =
     Staging.copy_from_linear!(dst.mem, Base.memoryrefoffset(dst) + i, off, n)
 function copy_out!(dst::Ptr{UInt8}, i::Int, off::UInt32, n::Int)
+    o, j = Runtime.owner_bytes(dst + i, n)
+    o isa Memory{UInt8} && return Staging.copy_from_linear!(o, j, off, n)
     for k in 1:n
         unsafe_store!(dst, Staging.load8(off + UInt32(k - 1)), i + k)
     end
@@ -1350,12 +1352,28 @@ memcpy!(dst::Vector{UInt8}, di::Int, src::Vector{UInt8}, si::Int, n::Int) =
 # (one `array.copy`)
 memcpy!(dst::MemoryRef{UInt8}, di::Int, src::Vector{UInt8}, si::Int, n::Int) =
     (unsafe_copyto!(memoryref(dst, di + 1), memoryref(src.ref, si + 1), n); nothing)
+# (through a pointer into a memory of bytes: one `array.copy`; else byte by byte)
 function memcpy!(dst::Ptr{UInt8}, di::Int, src::Vector{UInt8}, si::Int, n::Int)
+    o, j = Runtime.owner_bytes(dst + di, n)
+    if o isa Memory{UInt8} && 0 <= si && n <= length(src) - si
+        n > 0 && unsafe_copyto!(memoryref(o, j), memoryref(src.ref, si + 1), n)
+        return nothing
+    end
     for k in 1:n
         unsafe_store!(dst, src[si+k], di + k)
     end
 end
 function memcpy!(dst::Vector{UInt8}, di::Int, src::Ptr{UInt8}, si::Int, n::Int)
+    o, j = Runtime.owner_bytes(src + si, n)
+    if o isa Memory{UInt8} && 0 <= di && n <= length(dst) - di
+        n > 0 && unsafe_copyto!(memoryref(dst.ref, di + 1), memoryref(o, j), n)
+        return nothing
+    elseif o isa String && 0 <= di && n <= length(dst) - di
+        for k in 0:n-1
+            @inbounds dst[di+1+k] = codeunit(o, j + k)
+        end
+        return nothing
+    end
     for k in 1:n
         dst[di+k] = unsafe_load(src, si + k)
     end
