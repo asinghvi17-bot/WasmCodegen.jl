@@ -163,7 +163,9 @@ function emit_upsilon!(fc::FnCtx, idx::Int, u::Core.UpsilonNode)
     S, T = v.typ, dst.typ
     if !(S <: T)
         typeintersect(S, T) === Union{} && return
-        if (v.kind === Boxed && layout(fc, S).wtype == fc.cgm.types.jlvalue) || is_union_tuple(S)
+        # (a value tested by its type: an object, a tuple of unknown length, a tuple of unions)
+        l = layout(fc, S)
+        if (v.kind === Boxed && (l.wtype == fc.cgm.types.jlvalue || l.elements !== nothing)) || is_union_tuple(S)
             t = emit_isa!(fc, v, T)
             if !isconstant(t)
                 push_val!(fc, t)

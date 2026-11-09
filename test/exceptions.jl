@@ -170,6 +170,16 @@ function catch_sees_narrower_boxed(i::Int)
     end
     return x isa Int ? x : -9
 end
+# (a tuple of unknown length, where the catch sees one of a known length)
+function catch_sees_tuple_length(i::Int)
+    x = (42,)
+    try
+        coded_work(i)
+        x = Tuple(fill(7, i - 1))
+    catch
+    end
+    return 100 * length(x) + (isempty(x) ? 0 : x[1])
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -206,6 +216,7 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_sees_other_type(i)
         @wtest catch_sees_narrower_type(i)
         @wtest catch_sees_narrower_boxed(i)
+        @wtest catch_sees_tuple_length(i)
     end
     for i in 1:4
         @wtest catch_parse(i)
