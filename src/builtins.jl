@@ -251,17 +251,23 @@ maybe_undef_field(@nospecialize(T), i::Int) =
 Of a field of declared type `FT`: the leaf whose null reference is the field undefined, as
 natively its first pointer is (`jl_field_isdefined`, `undefref_check`: the field's own pointer,
 or of an inline type, its first pointer, `first_ptr`); `nothing` where natively the field is
-always defined (no pointers: an isbits value or union).
+always defined (no pointers: an isbits value or union). By the field's layout here: a value
+stored as one reference (an object), or of an inline value, its first leaf that is a reference
+when defined (a tuple with union elements, natively a pointer, is inline here, its union
+elements boxed).
 """
 function undef_leaf(ts::Types, @nospecialize(FT))
-    Base.allocatedinline(FT) || return 1   # a pointer natively: one reference here
-    (FT isa DataType && !Base.datatype_pointerfree(FT)) || return nothing
-    is_memoryref_type(FT) && return 1       # (its memory: the address is an offset)
+    # (no pointers natively, though some are objects here: large isbits tuples)
+    FT isa DataType && isconcretetype(FT) && Base.datatype_pointerfree(FT) && return nothing
     l = layout(ts, FT)
-    l.kind === Boxed && return 1            # (a large one, an object here: null if unset)
-    l.kind === Inline || return nothing
-    for j in 1:fieldcount(FT)
-        k = undef_leaf(ts, fieldtype(FT, j))
+    l.kind === Boxed && return 1            # one reference here (null if unset)
+    l.kind === Inline || return nothing     # (a singleton: no leaves)
+    is_memoryref_type(FT) && return 1       # (its memory: the address is an offset)
+    FT isa DataType || return nothing       # (an isbits union)
+    for j in 1:length(FT.types)
+        P = fieldtype(FT, j)
+        # (a union element of a tuple with union elements: boxed here)
+        k = P isa Union && is_union_tuple(FT) ? 1 : undef_leaf(ts, P)
         k === nothing || return first(l.fields[j]) - 1 + k
     end
     return nothing
@@ -510,6 +516,8 @@ function emit_isdefined!(fc::FnCtx, x::CGVal, i::Int)
     # where its pointer, or an inline value's first pointer, is not null: `undef_leaf`)
     (maybe_undef_field(T, i) && !isempty(l.fields) && l.elements === nothing) ||
         return const_value(fc, true)
+    # (a field of type `Union{}` is never assigned)
+    fieldtype(T, i) === Union{} && return const_value(fc, false)
     k = undef_leaf(fc.cgm.types, fieldtype(T, i))
     k === nothing && return const_value(fc, true)
     if l.kind === Boxed

@@ -146,6 +146,34 @@ bounded_caught(i::Int) = caught(bounded, i)
 valparam_caught(i::Int) = caught(valparam, i)
 tupleparam_caught(i::Int) = caught(tupleparam, i)
 toomany_caught(i::Int) = caught(toomany, i)
+# (too many parameters of a wrapper whose variables have bounds: natively each bound first)
+struct Bounded2{T<:Integer,S<:Integer} end
+toomany2(i::Int) = (x = PARAMS[i]; T = Bounded2{x, Int, Int}; T === Bounded2{Int,Int} ? 1 : 0)
+toomany2_caught(i::Int) = caught(toomany2, i)
+
+# isdefined and reading of fields constructors may leave out, of types laid out otherwise here
+# than natively: a tuple with a union element (natively a pointer, inline here), `Union{}`
+# (never assigned), a large isbits tuple (an object here, natively inline: always defined)
+mutable struct UH{T}
+    a::Int
+    x::T
+    UH{T}(a::Int) where {T} = new{T}(a)
+    UH{T}(a::Int, x) where {T} = new{T}(a, x)
+end
+@noinline uh_isdefined(h::UH) = isdefined(h, :x)
+@noinline uh_read(h::UH) = try
+        h.x
+        1
+    catch e
+        e isa UndefRefError ? 2 : 3
+    end
+const UHU = Tuple{Int,Union{Nothing,String}}
+function uh_union(i::Int)
+    h = i == 1 ? UH{UHU}(1) : i == 2 ? UH{UHU}(1, (2, nothing)) : UH{UHU}(1, (3, "s"))
+    return (uh_isdefined(h), uh_read(h))
+end
+uh_bottom(a::Int) = uh_isdefined(UH{Union{}}(a))
+uh_bits(a::Int) = uh_isdefined(UH{NTuple{70,Int}}(a))
 
 # the closed-world limit: a type the module was not compiled with (natively `Val{4}`)
 valint(n::Int) = (T = Val{n}; T === Val{1} ? 1 : T === Val{2} ? 2 : 0)
@@ -230,6 +258,14 @@ end
         @wtest RT.tupleparam_caught(i)
     end
     @wtest RT.toomany_caught(1)
+    for i in 1:2
+        @wtest RT.toomany2_caught(i)
+    end
+    for i in 1:3
+        @wtest RT.uh_union(i)
+    end
+    @wtest RT.uh_bottom(1)
+    @wtest RT.uh_bits(1)
     @test has_apply_type(wcompile(RT.bounded_caught, (Int,)), RT.Bounded, 1)
     @test has_apply_type(wcompile(RT.valparam_caught, (Int,)), Val, 1)
     @test has_apply_type(wcompile(RT.tupleparam_caught, (Int,)), Tuple, 2)

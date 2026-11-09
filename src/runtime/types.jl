@@ -697,10 +697,9 @@ function apply_type_check_body(@nospecialize(W), ps)
         push!(vars, w.var); w = w.body
     end
     if length(ps) > length(vars)
-        # (natively the loop of `jl_apply_type`: each variable's bound as it instantiates, but a
-        # wrapper's first, left to `check_datatype_parameters`, which is not reached)
+        # (natively the loop of `jl_apply_type`: each variable's bound as it instantiates)
         for (i, f, v) in apply_type_bounds(W, length(vars))
-            (v === vars[i] && !(i == 1 && U isa DataType && W === U.name.wrapper)) || continue
+            v === vars[i] || continue
             p = ps[i]
             push!(body.args, :(within_typevar($p, $(QuoteNode(v.lb)), $(QuoteNode(v.ub))) ||
                                throw(type_error_rt($(QuoteNode(f)), $(String(v.name)), $(QuoteNode(v)), $p))))
