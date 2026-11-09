@@ -303,7 +303,7 @@ function tuple_layout(t::Tuple)
         l = elem_layout(t[i])
         if l & LAYOUT_INLINE != 0
             fsz, al = layout_size(l), layout_align(l)
-            if l & LAYOUT_PRIMITIVE != 0 && fsz % al != 0
+            if l & LAYOUT_PRIMITIVE != 0 && al != 0 && fsz % al != 0
                 # (a primitive type's size aligned, as a field)
                 fsz += al - fsz % al
                 bitsegal, padding = false, true
@@ -315,7 +315,8 @@ function tuple_layout(t::Tuple)
             fsz, al = 8, 8
             pointerfree = false
         end
-        if sz % al != 0
+        # (an alignment of 0: a vector's of 2^16, as a `UInt16` stores it, natively not aligned to)
+        if al != 0 && sz % al != 0
             sz += al - sz % al
             padding = true
         end
@@ -338,7 +339,8 @@ function tuple_layout(t::Tuple)
     pointerfree && (f |= LAYOUT_POINTERFREE)
     bitsegal && (f |= LAYOUT_BITSEGAL)
     padding && (f |= LAYOUT_PADDING)
-    return UInt64(sz) << 32 | UInt64(alignm) << 8 | f
+    # (the alignment as the type's layout stores it, a `UInt16`: a vector's of 2^16 is 0)
+    return UInt64(sz) << 32 | UInt64(alignm % UInt16) << 8 | f
 end
 
 # whether the elements of the tuple `t` are all of the type of its first

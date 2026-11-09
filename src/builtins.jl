@@ -1010,6 +1010,12 @@ elem_may_be(@nospecialize(E), @nospecialize(P)) =
     !(P isa Type) || Base.has_free_typevars(P) || typeintersect(E, P) !== Union{} ||
     (typeintersect(E, Type) !== Union{} && any(K -> K <: P, (DataType, UnionAll, Union, Core.TypeofBottom)))
 
+# whether `L` is a leaf bound (`is_leaf_bound`, src/subtype.c): `Union{}`, a concrete type or a
+# `Type{X}`. A variable of such a lower bound at more than one element is of one concrete type
+# (the diagonal rule); of another (`Real<:T`), it is not
+leaf_bound(@nospecialize(L)) =
+    L === Union{} || (L isa DataType && (isabstracttype(L) ? L.name === Type.body.name : isconcretetype(L)))
+
 # whether a value of `T` may be a tuple whose concrete type the module does not have (an object
 # of `Tuple`, see `tuple_canon_func!`), which is tested by its elements: of a type that may
 # hold tuples, but not every tuple (a free type variable: as natively, by its lower bound)
@@ -1029,11 +1035,11 @@ end
 of each member (in turn: one that is a type with type variables may be the closed world's
 error); of a tuple type, by its length and the types of its elements (`tuple_array_isa!`); of a
 free type variable, of its lower bound (as native subtyping); of a tuple type with type
-variables, `Tuple{T,Vararg{T}} where T`, first by its elements against the variables' bounds
-(`tuple_bounds_type`), then of the common shape by the variables at more than one element
-(`diagonal_vars_isa!`), and of another shape as an object, by the module's types, but of a tuple
-whose concrete type the module does not have, the closed world's error, as `typeof` of it
-(`Runtime.throw_isa_unknown`).
+variables, `Tuple{T,Vararg{T}} where T`: of a tuple of unknown length, as an object, by the
+module's types, and of a tuple whose concrete type the module does not have, first by its
+elements against the variables' bounds (`tuple_bounds_type`), then of the common shape by the
+variables at more than one element (`diagonal_vars_isa!`), of another shape the closed world's
+error, as `typeof` of it (`Runtime.throw_isa_unknown`).
 """
 function tuple_type_isa!(fc::FnCtx, t::CGVal, @nospecialize(T); object::Bool=false)
     T isa TypeVar && return tuple_type_isa!(fc, t, T.lb; object)
@@ -1064,7 +1070,9 @@ function tuple_type_isa!(fc::FnCtx, t::CGVal, @nospecialize(T); object::Bool=fal
         return tuple_array_isa!(fc, t, T)
     end
     has_tuple_members(T) || return const_value(fc, false)
-    # (a tuple type with type variables)
+    # (a tuple type with type variables: of a tuple of unknown length, as an object, by the
+    # module's types where it has the tuple's concrete type, natively `<:`; else by its elements)
+    object || return emit_isa!(fc, convert_repr(fc, t, Any), T)
     B = tuple_bounds_type(T)
     need = B === nothing ? const_value(fc, true) : tuple_array_isa!(fc, t, B)
     isconstant(need) && !constant_value(need) && return need
@@ -1075,11 +1083,9 @@ function tuple_type_isa!(fc::FnCtx, t::CGVal, @nospecialize(T); object::Bool=fal
     if!(fc.b); open_label!(fc)
     if shape !== nothing
         assign!(fc, res, diagonal_vars_isa!(fc, t, shape))
-    elseif object
+    else
         call_runtime!(fc, Runtime.throw_isa_unknown, CGVal[])
         unreachable!(fc.b)
-    else
-        assign!(fc, res, emit_isa!(fc, convert_repr(fc, t, Any), T))
     end
     end!(fc.b); close_label!(fc)
     return res
@@ -1102,7 +1108,9 @@ function tuple_bounds_type(@nospecialize(T))
     while W isa UnionAll
         push!(vars, W.var); W = W.body
     end
-    bound(P) = Base.rewrap_unionall(P isa TypeVar && any(v -> v === P, vars) ? P.ub : P, T)
+    # (a variable whose bounds are not ordered, `Int<:T<:Float64`, bounds nothing: natively its
+    # upper bound is not one of its elements')
+    bound(P) = Base.rewrap_unionall(P isa TypeVar && any(v -> v === P, vars) ? (P.lb <: P.ub ? P.ub : Any) : P, T)
     ps = Any[]
     for P in U.parameters
         if P isa Core.TypeofVararg
@@ -1119,8 +1127,8 @@ end
 
 The parts of a tuple type with type variables of the common shape, whose `isa` the types of a
 tuple's elements decide (`diagonal_vars_isa!`): `Tuple{P1, …, Pk[, Vararg{Pv}]} where V1, …, Vm`,
-each parameter a variable or of none of them, each variable's bounds of none, a `Vararg` of no
-variable length. Else `nothing`.
+each parameter a variable or of none of them, each variable's bounds of none and ordered
+(`lb <: ub`), a `Vararg` of no variable length. Else `nothing`.
 """
 function bound_tuple_shape(@nospecialize(T))
     vars = TypeVar[]
@@ -1130,6 +1138,7 @@ function bound_tuple_shape(@nospecialize(T))
     end
     (W isa DataType && W.name === Tuple.name) || return nothing
     any(v -> any(w -> Base.has_typevar(v.lb, w) || Base.has_typevar(v.ub, w), vars), vars) && return nothing
+    all(v -> v.lb <: v.ub, vars) || return nothing
     ps = collect(Any, W.parameters)
     va = !isempty(ps) && ps[end] isa Core.TypeofVararg
     if va
@@ -1149,9 +1158,10 @@ end
 
 Of the tuple `t` (as an array) whose elements are of `bound_tuple_shape`'s type's bounds
 (`tuple_bounds_type`), whether it is of that type: natively (the diagonal rule), a variable at two
-elements or more is of one concrete type, the elements', which is within its bounds (at one, any
-type within its upper bound; at none, any). By the elements' type ids; of tuples whose concrete
-types the module does not have (objects of `Tuple`), by their elements' (`Runtime.same_tuple_type`).
+elements or more, of a lower bound `leaf_bound`, is of one concrete type, the elements', which is
+above its lower bound (`subtype_unionall`, src/subtype.c; of another lower bound, as at one
+element: any type within its bounds). By the elements' type ids; of tuples whose concrete types
+the module does not have (objects of `Tuple`), by their elements' (`Runtime.same_tuple_type`).
 """
 function diagonal_vars_isa!(fc::FnCtx, t::CGVal, shape)
     (; vars, ps, va) = shape
@@ -1160,7 +1170,7 @@ function diagonal_vars_isa!(fc::FnCtx, t::CGVal, shape)
     for V in vars
         pos = Int[i for i in 1:k if ps[i] === V]
         inva = va && ps[end] === V
-        (length(pos) >= 2 || inva) && push!(diag, (V, pos, inva))
+        (length(pos) >= 2 || inva) && leaf_bound(V.lb) && push!(diag, (V, pos, inva))
     end
     isempty(diag) && return const_value(fc, true)
     lx = layout(fc, t.typ)
@@ -1224,12 +1234,18 @@ function diagonal_vars_isa!(fc::FnCtx, t::CGVal, shape)
                 end!(fc.b); close_label!(fc)
                 end!(fc.b); close_label!(fc)
             end
-            # (its lower bound: of its upper bound, its elements are, `tuple_bounds_type`; a type
-            # the module does not have is not one, a concrete type above another but `Union{}`)
+            # (its lower bound: of its upper bound, its elements are, `tuple_bounds_type`; a
+            # concrete one, of a type the module does not have, is it, `isa` of it)
             if V.lb !== Union{}
+                above = new_val!(fc, Bool)
+                emit!(fc.b, :local_get, g1)
+                if!(fc.b); open_label!(fc)
+                assign!(fc, above, tuple_type_isa!(fc, unbox!(fc, e1, Tuple), V.lb; object=true))
+                else!(fc.b)
                 emit!(fc.b, :local_get, t1); call!(fc.b, above_predicate!(fc.cgm, V.lb))
-                emit!(fc.b, :local_get, g1); emit!(fc.b, :i32_eqz); emit!(fc.b, :i32_and)
-                emit!(fc.b, :local_get, r); emit!(fc.b, :i32_and); emit!(fc.b, :local_set, r)
+                assign!(fc, above, pop_val!(fc, Bool))
+                end!(fc.b); close_label!(fc)
+                push_val!(fc, above); emit!(fc.b, :local_get, r); emit!(fc.b, :i32_and); emit!(fc.b, :local_set, r)
             end
         end
         inva && (end!(fc.b); close_label!(fc))

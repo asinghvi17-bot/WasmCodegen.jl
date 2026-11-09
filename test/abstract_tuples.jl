@@ -211,6 +211,12 @@ function at_objectid(i::Int)
             objectid(opaque((opaque(VecElement(1.0i)), opaque(VecElement(2.0i)), opaque(VecElement(3.0i)), opaque(VecElement(4.0i))))),
             objectid(opaque((opaque(VecElement(Float32(i))), opaque(VecElement(Float32(2i))), opaque(Float32(i))))))
 end
+# (a vector of 2^16 bytes: its alignment stored natively in 16 bits, 0, so not aligned to in a tuple)
+function at_largevec(n::Int)
+    a = Any[VecElement(Float32(i)) for i in 1:n]
+    t = opaque(tuple(a...))
+    return objectid(opaque((opaque(Int32(7)), t)))
+end
 
 # `isa` against tuple types with bound type variables, natively by the types of the elements:
 # the diagonal rule, a variable at two elements or more of one concrete type within its bounds
@@ -258,6 +264,26 @@ at_shape_false(i::Int) = (opaque((unnamed(i), "s")) isa AT_TVEC, opaque((opaque(
                           tuple(Any[unnamed(i), "s"]...) isa AT_TVEC)
 # (where they are: the closed world's error; natively true)
 at_shape_error(i::Int) = opaque((unnamed(i), [i])) isa AT_TVEC
+# (a tuple of a concrete type the module has, named here: by the module's types, as natively,
+# whatever the bounds: `Real<:T`, no diagonal rule; `Int<:T<:Float64`, not ordered)
+const AT_LOW = Tuple{Vararg{T}} where Real<:T<:Number
+const AT_DISJOINT = Tuple{Vararg{T}} where Int<:T<:Float64
+at_named_low(n::Int) = (t = tuple(Any[1, 2.5][1:n]...); (t isa AT_LOW, id(typeof(opaque(t))) === Tuple{Int,Float64}))
+at_named_disjoint(n::Int) = (t = tuple(Any[1, 2][1:n]...); (t isa AT_DISJOINT, id(typeof(opaque(t))) === Tuple{Int,Int}))
+at_named_object(i::Int) = (x = opaque((opaque(i), opaque(2.5))); (x isa AT_LOW, x isa AT_TB, id(typeof(x)) === Tuple{Int,Float64}))
+# (of a type the module does not have: an abstract lower bound, no diagonal rule; a concrete
+# tuple lower bound of a type the module does not have, of the elements' type)
+struct AtReal <: Real
+    x::Int
+end
+const AT_TUPLE_LOW = Tuple{T,T} where Tuple{AtUnnamed}<:T<:Tuple
+function at_lower_bounds(i::Int)
+    a, b = opaque((unnamed(i),)), opaque((unnamed(2i),))
+    return (opaque((opaque(AtReal(i)), opaque(2.5))) isa AT_LOW, opaque((opaque(AtReal(i)), "s")) isa AT_LOW,
+            tuple(Any[AtReal(i), 2.5, 1][1:i]...) isa AT_LOW, opaque((a, b)) isa AT_TUPLE_LOW,
+            opaque((a, opaque((opaque(i),)))) isa AT_TUPLE_LOW, opaque((opaque((opaque(i),)), a)) isa AT_TUPLE_LOW)
+end
+
 # free type variables with a lower bound of tuples: natively `<:` of the lower bound
 @eval function at_free_lower(i::Int)
     F, G = $(let T = TypeVar(:T, Tuple{Number}, Any); (Tuple{T}, Tuple{Union{Int,T}}); end)
@@ -294,13 +320,19 @@ end
     for n in 1:3
         @wtest at_isa_vararg(n)
     end
+    @wtest at_largevec(3)
+    @wtest at_largevec(16384)
     for n in (0, 1, 2, 17)
         @wtest at_tb_strings(n)
         @wtest at_tb_union(n)
         @wtest at_ta_vararg(n)
         @wtest at_tb_ints(n)
     end
+    @wtest at_named_low(2)
+    @wtest at_named_disjoint(2)
     for i in 1:3
+        @wtest at_named_object(i)
+        @wtest at_lower_bounds(i)
         @wtest at_diag(i)
         @wtest at_union_bound(i)
         @wtest at_shape_false(i)
