@@ -1012,7 +1012,7 @@ function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         tup = operand(fc, ex.args[2])
         # (of a type known only at run time, as `new` of it: `NamedTuple{names}(t)` of a tuple
         # whose element types are, `splatnew(NamedTuple{names, typeof(t)}, t)`)
-        isconstant(T) || return emit_new_rt!(fc, T, tuple_elements(fc, tup), typ)
+        isconstant(T) || return emit_splatnew_rt!(fc, T, tuple_elements(fc, tup), typ)
         return emit_new!(fc, constant_value(T), tuple_elements(fc, tup))
     elseif head === :boundscheck
         cb = Base.JLOptions().check_bounds

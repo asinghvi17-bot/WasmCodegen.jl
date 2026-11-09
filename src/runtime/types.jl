@@ -315,6 +315,9 @@ names `W`): types are not made at run time. (An application that is not valid is
     error(msg)
 end
 
+"The error of `splatnew(T, t)` of a tuple `t` of `n` elements and a type `T` of `expected` fields (`jl_new_structt`)."
+@noinline throw_splatnew_arity(n::Int, expected::Int) =
+    throw(ArgumentError(string("new: too ", n < expected ? "few" : "many", " arguments (expected ", expected, ")")))
 "The error of `new(T, …)` of a concrete type `T` with a number of fields it cannot have."
 @noinline throw_invalid_struct_allocation() = error("invalid struct allocation")
 

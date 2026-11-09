@@ -124,6 +124,22 @@ function at_unnamed_ok(i::Int)
     t, u = (unnamed(i), i), (unnamed(i), id(i))
     return (t[1] isa AtUnnamed, (t[1]::AtUnnamed).a, t === u, t[2] === u[2], objectid(t) == objectid(u))
 end
+# `splatnew` of a type known only at run time: exactly its fields (natively an ArgumentError of
+# too few or too many arguments, where `new` may leave fields out)
+struct AtPart{T}
+    a::T
+    b::T
+    AtPart{T}(a) where {T} = new{T}(a)
+    AtPart{T}(a, b) where {T} = new{T}(a, b)
+end
+const AtPartType = Type{<:AtPart}
+@noinline at_ptype(i::Int) = Base.inferencebarrier(i > 0 ? AtPart{Int} : AtPart{Float64})::AtPartType
+@generated at_sn(i, t) = Expr(:splatnew, :(at_ptype(i)), :t)
+at_arity_msg(e) = e isa ArgumentError ? (occursin("too few arguments (expected 2)", e.msg::String) ? -1 :
+                                         occursin("too many arguments (expected 2)", e.msg::String) ? -2 : -3) : -4
+at_splat1(a::Int) = try (at_sn(a, (a,)); 1) catch e; at_arity_msg(e) end
+at_splat2(a::Int) = (p = at_sn(a, (a, a + 1)); p isa AtPart{Int} ? p.a + p.b : -1)
+at_splat3(a::Int) = try (at_sn(a, (a, a, a)); 1) catch e; at_arity_msg(e) end
 # (compared with a type, as `<: Tuple` of it is folded by inference)
 at_unnamed_typeof(i::Int) = id(typeof(id((unnamed(i),)))) === Tuple{Int}
 
@@ -151,6 +167,11 @@ at_unnamed_typeof(i::Int) = id(typeof(id((unnamed(i),)))) === Tuple{Int}
         @wtest at_kwcall(i)
     end
     @wtest at_large(3)
+    for a in (2, -2)
+        @wtest at_splat1(a)
+        @wtest at_splat3(a)
+    end
+    @wtest at_splat2(2)
     # (with trim = :safe: none of them is an unsupported construct)
     for (f, at) in ((at_type, (Int,)), (at_namedtuple, (Int,)), (at_fields, (Int,)), (at_string, (Int,)))
         @test isempty(WasmCodegen.compile(f, at).cgm.diagnostics)
