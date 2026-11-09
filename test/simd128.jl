@@ -44,6 +44,10 @@ function shuffles_f2(k::Int)
 end
 # a shuffle must keep the number of lanes (an ArgumentError natively, a trap here)
 bad_shuffle(k::Int) = lanes(S.shuffle(mkvec(D2, i -> i + k), Val((0, 1, 0, 1))))
+# (lanes of a container of its own indexing)
+struct LaneOrder end
+Base.length(::LaneOrder) = 2
+Base.getindex(::LaneOrder, j::Int) = 2 - j
 # a lane out of range: natively's BoundsError, caught
 function oob_shuffle(k::Int)
     a = mkvec(D2, i -> i + k)
@@ -64,7 +68,8 @@ function oob_shuffle(k::Int)
     r11 = sum(i -> i * lanes(S.shuffle(a, Val(CartesianIndex(1, 0))))[i], 1:2)
     r12 = sum(i -> i * lanes(S.shuffle(a, Val((0.0, 1e-20))))[i], 1:2)
     r13 = sum(i -> i * lanes(S.shuffle(a, a, Val((1e-20, 2.0))))[i], 1:2)
-    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13
+    r14 = sum(i -> i * lanes(S.shuffle(a, Val(LaneOrder())))[i], 1:2)
+    return r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14
 end
 # a foreign function of a name like the SIMD calls', of another library: the program's
 simd_named(x::Float64) = ccall((:wasm_simd_scale, "libscale"), Float64, (Float64,), x)

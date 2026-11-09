@@ -82,18 +82,18 @@ of `y`. `I` has as many lanes as `x`.
     end
 end
 
-# the lanes of a shuffle: of each that is not an integer in range, the native method's indexing
-# of it, in order, which throws as natively (a BoundsError, the InexactError of converting the
-# index, ...) or is a lane after all (`0.0`)
+# the lanes of a shuffle: the native method's indexing of each, in order, which throws as
+# natively (a BoundsError, the InexactError of converting the index, ...); of constant lanes,
+# folded away where they are in range
 # (generated: a throwing indexing is in the body, so that the foreign call after it is not reached)
+# (`I[j]` in the body, of the compilation's world: a lane container may index by a method of its own)
 @generated function _check_lanes(x::NTuple{N}, ::Val{I}) where {N,I}
-    checks = Any[:(x[$(QuoteNode(I[j])) + 1]) for j in 1:N if !(I[j] isa Integer && 0 <= I[j] < N)]
-    return Expr(:block, checks..., nothing)
+    i = QuoteNode(I)
+    return Expr(:block, Any[:(x[$i[$j] + 1]) for j in 1:N]..., nothing)
 end
 @generated function _check_lanes(x::NTuple{N}, y::NTuple{N}, ::Val{I}) where {N,I}
-    checks = Any[:($(QuoteNode(I[j])) < $N ? x[$(QuoteNode(I[j])) + 1] : y[$(QuoteNode(I[j])) - $N + 1])
-                 for j in 1:N if !(I[j] isa Integer && 0 <= I[j] < 2N)]
-    return Expr(:block, checks..., nothing)
+    i = QuoteNode(I)
+    return Expr(:block, Any[:($i[$j] < $N ? x[$i[$j] + 1] : y[$i[$j] - $N + 1]) for j in 1:N]..., nothing)
 end
 
 # in Wasm: the foreign calls the code generator lowers (`emit_simd!`), of WasmCodegen's own
