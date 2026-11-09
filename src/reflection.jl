@@ -1228,8 +1228,9 @@ function finish_new!(cgm::CGModule)
         emit!(b, :local_get, 0); emit!(b, :ref_cast, st); emit!(b, :struct_get, st, 2); emit!(b, :local_set, tid)
         end!(b)
         for (id, C) in enumerate(ts.typelist)
-            (C isa DataType && isconcretetype(C) && fieldcount(C) != n &&
-             any(B -> C isa B && new_case_kind(ts, C, B, fieldcount(C)) === true, bounds)) || continue
+            # (of any concrete type, as `jl_new_structt` checks the number before the type: also
+            # of those `new` builds no case of, `UnionAll`, `String`, ...)
+            (C isa DataType && isconcretetype(C) && fieldcount(C) != n && any(B -> C isa B, bounds)) || continue
             emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
             if!(b)
             emit!(b, :i64_const, n); emit!(b, :i64_const, fieldcount(C))
