@@ -71,8 +71,8 @@ function with_trim_patches(f; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}[])
         same_session(open_session, key) ||
             error("with_trim_patches: a session of patches is open with other patches or bindings " *
                   "(nested sessions must have the same ones)")
-        # (an installed session: the stand-ins of methods defined since, see `resident_standins!`)
-        RESIDENT_PATCH_MODULE[] === nothing || isempty(RESIDENT_ADDED) || resident_standins!()
+        # (an installed session: the stand-ins of this world's methods, see `resident_standins`)
+        RESIDENT_PATCH_MODULE[] === nothing || isempty(RESIDENT_ADDED) || resident_standins(Base.get_world_counter())
         return f(COMPILER_WORLD[], Base.get_world_counter())
     end
     w0 = Base.get_world_counter()
@@ -252,7 +252,7 @@ function install_trim_patches!(; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}
         k = natives === nothing ? nothing : findfirst(m -> m.method.sig == o.sig, natives.matches)
         k === nothing ? push!(RESIDENT_ADDED, o) : (RESIDENT_REPLACED[natives.matches[k].method] = o)
     end
-    isempty(RESIDENT_ADDED) || resident_standins!()
+    isempty(RESIDENT_ADDED) || resident_standins(Base.get_world_counter())
     if Base.invoke_in_world(Base.get_world_counter(), isdefined, Base, :invokelatest_trimmed)
         DIRECT_INVOKELATEST[] = latest_global(Base, :invokelatest_trimmed)
     end
@@ -270,47 +270,53 @@ const RESIDENT_OVERLAYS = Method[]
 const RESIDENT_REPLACED = IdDict{Method,Method}()
 const RESIDENT_ADDED = Method[]
 # For the overlays that replace no native method, Julia's lookup of the methods of their functions
-# with them (see `resident_matches`): a method table of stand-ins of those methods (each of the
-# real one's signature), in its world, the real method of each, and the native methods it has
-# stand-ins of. Made again where the functions' native methods are others (a session in the
-# process after methods were defined).
+# with them (see `resident_matches`), in a world: a method table of stand-ins of those methods
+# (each of the real one's signature, so with its static parameters), the world to look it up in,
+# the real method of each, and the native methods it has stand-ins of. One per set of native
+# methods, by the world looked up (a world before methods were defined has its own).
 struct ResidentStandins
     table::Core.MethodTable
     world::UInt
     real::IdDict{Method,Method}
     mirrored::IdDict{Method,Nothing}
 end
-const RESIDENT_STANDINS = Ref{ResidentStandins}()
+const RESIDENT_STANDINS = Dict{UInt,ResidentStandins}()
+const RESIDENT_STANDINS_LOCK = ReentrantLock()
 
-function resident_standins!()
-    w = Base.get_world_counter()
-    natives = Method[]
-    for o in RESIDENT_ADDED
-        # (the methods of its function, or of its function's keyword method)
-        P = Base.unwrap_unionall(o.sig).parameters
-        F = P[1] === typeof(Core.kwcall) && length(P) >= 3 ? Tuple{P[1], Any, P[3], Vararg{Any}} : Tuple{P[1], Vararg{Any}}
-        ms = Base._methods_by_ftype(Base.rewrap_unionall(F, o.sig), nothing, -1, w, true,
-                                    Ref(typemin(UInt)), Ref(typemax(UInt)), Ref{Int32}(0))
-        ms isa Vector && foreach(m -> any(x -> x === m.method, natives) || push!(natives, m.method), ms)
+function resident_standins(world::UInt)
+    @lock RESIDENT_STANDINS_LOCK begin
+        standins = get(RESIDENT_STANDINS, world, nothing)
+        standins === nothing || return standins
+        natives = Method[]
+        for o in RESIDENT_ADDED
+            # (the methods of its function, or of its function's keyword method)
+            P = Base.unwrap_unionall(o.sig).parameters
+            F = P[1] === typeof(Core.kwcall) && length(P) >= 3 ? Tuple{P[1], Any, P[3], Vararg{Any}} : Tuple{P[1], Vararg{Any}}
+            ms = Base._methods_by_ftype(Base.rewrap_unionall(F, o.sig), nothing, -1, world, true,
+                                        Ref(typemin(UInt)), Ref(typemax(UInt)), Ref{Int32}(0))
+            ms isa Vector && foreach(m -> any(x -> x === m.method, natives) || push!(natives, m.method), ms)
+        end
+        for s in values(RESIDENT_STANDINS)
+            length(s.mirrored) == length(natives) && all(m -> haskey(s.mirrored, m), natives) &&
+                return RESIDENT_STANDINS[world] = s
+        end
+        table = ccall(:jl_new_method_table, Any, (Any, Any), :ResidentStandins, @__MODULE__)::Core.MethodTable
+        # (in the order they were defined, then the overlays, as in a session: the order of the matches
+        # Julia's lookup does not order by specificity)
+        sort!(natives; by=m -> m.primary_world)
+        real, mirrored = IdDict{Method,Method}(), IdDict{Method,Nothing}()
+        for m in natives
+            mirrored[m] = nothing
+            # (one an overlay has the signature of is the overlay's, as it would be replaced)
+            any(o -> o.sig == m.sig, RESIDENT_ADDED) && continue
+            r = get(RESIDENT_REPLACED, m, m)
+            real[standin!(table, r.sig)] = r
+        end
+        for o in sort(RESIDENT_ADDED; by=o -> o.primary_world)
+            real[standin!(table, o.sig)] = o
+        end
+        return RESIDENT_STANDINS[world] = ResidentStandins(table, Base.get_world_counter(), real, mirrored)
     end
-    isassigned(RESIDENT_STANDINS) && length(RESIDENT_STANDINS[].mirrored) == length(natives) &&
-        all(m -> haskey(RESIDENT_STANDINS[].mirrored, m), natives) && return
-    table = ccall(:jl_new_method_table, Any, (Any, Any), :ResidentStandins, @__MODULE__)::Core.MethodTable
-    # (in the order they were defined, then the overlays, as in a session: the order of the matches
-    # Julia's lookup does not order by specificity)
-    sort!(natives; by=m -> m.primary_world)
-    real, mirrored = IdDict{Method,Method}(), IdDict{Method,Nothing}()
-    for m in natives
-        mirrored[m] = nothing
-        # (one an overlay has the signature of is the overlay's, as it would be replaced)
-        any(o -> o.sig == m.sig, RESIDENT_ADDED) && continue
-        real[standin!(table, m.sig)] = get(RESIDENT_REPLACED, m, m)
-    end
-    for o in sort(RESIDENT_ADDED; by=o -> o.primary_world)
-        real[standin!(table, o.sig)] = o
-    end
-    RESIDENT_STANDINS[] = ResidentStandins(table, Base.get_world_counter(), real, mirrored)
-    return nothing
 end
 
 # a method of the signature `sig` in `table`, which is only looked up (its code: `nothing`)

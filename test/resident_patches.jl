@@ -213,59 +213,85 @@ end
         mktempdir() do dir
             patch = joinpath(dir, "added.jl")
             write(patch, "Target1.wait_forever(x::Int, y) = 10\nTarget2.wait_forever(x, y::Number) = 2\n" *
-                         "Target3.wait_forever(x, y::Number) = 2\n")
+                         "Target3.wait_forever(x, y::Number) = 2\n" *
+                         "Target4.wait_forever(x::T, y::S) where {S<:AbstractString,T<:Number} = T === Int ? 11 : 22\n" *
+                         "Target4.wait_forever(x::Number, y) = 33\nTarget5.wait_forever(x::Number) = 3\n")
             script = joinpath(dir, "added_run.jl")
             write(script, """
                 include($(repr(joinpath(@__DIR__, "harness.jl"))))
                 const CC = Core.Compiler
                 # the native methods, and the patch's: in the session, a method of another signature
-                # (Target3: two methods ambiguous over `(Number, Number)`, but of `(Int, Int)` a third)
+                # (Target3: two methods ambiguous over `(Number, Number)`, but of `(Int, Int)` a third;
+                # Target4: the patch also replaces a method, with its static parameters in another order)
                 common = [:(wait_forever(x, y::Int) = 20), :(wait_forever(x::Number, y::String) = 1),
                           :(wait_forever(x::Int, y::Int) = 3)]
-                for (T, N, defs, patched) in ((:Target1, :Native1, common, :(wait_forever(x::Int, y) = 10)),
-                                              (:Target2, :Native2, common, :(wait_forever(x, y::Number) = 2)),
+                for (T, N, defs, patched) in ((:Target1, :Native1, common, [:(wait_forever(x::Int, y) = 10)]),
+                                              (:Target2, :Native2, common, [:(wait_forever(x, y::Number) = 2)]),
                                               (:Target3, :Native3, [:(wait_forever(x::Number, y) = 1), :(wait_forever(x::Int, y::Int) = 3)],
-                                               :(wait_forever(x, y::Number) = 2)))
+                                               [:(wait_forever(x, y::Number) = 2)]),
+                                              (:Target4, :Native4,
+                                               [:(wait_forever(x::T, y::S) where {T<:Number,S<:AbstractString} = T === Int ? 11 : 22)],
+                                               [:(wait_forever(x::T, y::S) where {S<:AbstractString,T<:Number} = T === Int ? 11 : 22),
+                                                :(wait_forever(x::Number, y) = 33)]))
                     @eval module \$T end
                     @eval module \$N end
                     for M in (getglobal(Main, T), getglobal(Main, N)), def in defs
                         Core.eval(M, def)
                     end
-                    Core.eval(getglobal(Main, N), patched)
+                    foreach(def -> Core.eval(getglobal(Main, N), def), patched)
                 end
+                # (and a method defined after the installation: a world before it has not got it)
+                module Target5
+                wait_forever(x::Integer) = 1
+                end
+                Target5_latest(n::Int) = Target5.wait_forever(n)
                 mutable struct Box
                     x::Number
                 end
+                mutable struct IntegerBox
+                    x::Integer
+                end
+                mutable struct TextBox
+                    s::AbstractString
+                end
                 # (a call's value, or -1 for a MethodError: none, or an ambiguous one)
                 caught(f) = try f() catch e; e isa MethodError ? -1 : -2 end
-                for M in (:Target1, :Target2, :Target3, :Native1, :Native2, :Native3)
+                targets, references = (:Target1, :Target2, :Target3, :Target4), (:Native1, :Native2, :Native3, :Native4)
+                for M in (targets..., references...)
                     @eval begin
                         @noinline \$(Symbol(M, :_dispatch))(a::Box, b::Box) = \$M.wait_forever(a.x, b.x)
                         \$(Symbol(M, :_boxed))(n::Int) = caught(() -> \$(Symbol(M, :_dispatch))(Box(n), Box(n)))
                         \$(Symbol(M, :_mixed))(n::Int) = caught(() -> \$M.wait_forever(n, "s")) + 100 * caught(() -> \$M.wait_forever(1.5, n))
                         \$(Symbol(M, :_called))(n::Int) = caught(() -> \$M.wait_forever(n, 2.5))
                         \$(Symbol(M, :_invoked))(n::Int) = caught(() -> invoke(\$M.wait_forever, Tuple{Int,Int}, n, n))
+                        @noinline \$(Symbol(M, :_typed))(a::IntegerBox) = \$M.wait_forever(a.x, "s")
+                        \$(Symbol(M, :_param))(n::Int) = caught(() -> \$(Symbol(M, :_typed))(IntegerBox(n)))
+                        @noinline \$(Symbol(M, :_text))(n::Int, a::TextBox) = \$M.wait_forever(n, a.s)
+                        \$(Symbol(M, :_static))(n::Int) = caught(() -> \$(Symbol(M, :_text))(n, TextBox("s")))
                     end
                 end
-                const BINDINGS = Pair{Symbol,Any}[:Target1 => Target1, :Target2 => Target2, :Target3 => Target3]
+                const BINDINGS = Pair{Symbol,Any}[:Target1 => Target1, :Target2 => Target2, :Target3 => Target3,
+                                                  :Target4 => Target4, :Target5 => Target5]
                 config = test_config(trim=:unsafe, extra_patches=[$(repr(patch))], patch_bindings=BINDINGS)
-                fs = [getglobal(Main, Symbol(T, s)) for T in (:Target1, :Target2, :Target3) for s in (:_boxed, :_mixed, :_called, :_invoked)]
-                natives = [getglobal(Main, Symbol(N, s))(3) for N in (:Native1, :Native2, :Native3) for s in (:_boxed, :_mixed, :_called, :_invoked)]
-                run(f) = (c = WasmCodegen.compile(f, (Int,); config);
+                programs = (:_boxed, :_mixed, :_called, :_invoked, :_param, :_static)
+                fs = [getglobal(Main, Symbol(T, s)) for T in targets for s in programs]
+                natives = [getglobal(Main, Symbol(N, s))(3) for N in references for s in programs]
+                run(f; world...) = (c = WasmCodegen.compile(f, (Int,); config, world...);
                           (wasm_run(c, string(nameof(f)), 3; rettype=Int), length(c.cgm.diagnostics)))
                 stock = map(run, fs)
                 install_trim_patches!(patches=[WasmCodegen.TRIM_PATCHES; $(repr(patch))], bindings=BINDINGS)
                 resident = map(run, fs)
                 # the lookups, as of the methods defined natively: the matches (by their signatures but
-                # the function: as a set, since the order of methods ambiguous with one another is the
-                # table's, and in an order of specificity), whether ambiguous, and `invoke`'s
+                # the function, and their static parameters: as a set, since the order of methods ambiguous
+                # with one another is the table's, and in an order of specificity), whether ambiguous, and
+                # `invoke`'s
                 w = Base.get_world_counter()
                 table = WasmCodegen.WasmMethodTable(w)
-                tail(m) = string(Base.unwrap_unionall(m.method.sig).parameters[2:end])
+                tail(m) = string(Base.unwrap_unionall(m.method.sig).parameters[2:end], m.sparams)
                 lookups = Bool[]
-                for (T, N) in ((Target1, Native1), (Target2, Native2), (Target3, Native3)), args in
+                for (T, N) in ((Target1, Native1), (Target2, Native2), (Target3, Native3), (Target4, Native4)), args in
                         ((Number, Number), (Int, Int), (Float64, Float64), (Int, Float64), (Float64, Int),
-                         (Any, Number), (Int, Any), (Any, Any), (Int, String), (Integer, Integer))
+                         (Any, Number), (Int, Any), (Any, Any), (Int, String), (Integer, Integer), (Number, String))
                     r = CC.findall(Tuple{typeof(T.wait_forever), args...}, table)
                     n = CC._findall(Tuple{typeof(N.wait_forever), args...}, nothing, w, -1)
                     ordered = r !== nothing && all(((i, j),) -> !Base.morespecific(r.matches[j].method, r.matches[i].method),
@@ -276,10 +302,15 @@ end
                     ns, _ = CC._findsup(Tuple{typeof(N.wait_forever), args...}, nothing, w)
                     push!(lookups, (rs === nothing) == (ns === nothing) && (rs === nothing || tail(rs) == tail(ns)))
                 end
-                print(repr((stock, resident, natives, lookups)))
+                # a method defined since, in the latest world and in the one before it, and natively
+                wold = Base.get_world_counter()
+                @eval Target5 wait_forever(x::Int) = 2
+                worlds = (run(Target5_latest)[1], run(Target5_latest; world=wold)[1],
+                          Base.invokelatest(Target5_latest, 3), Base.invoke_in_world(wold, Target5_latest, 3))
+                print(repr((stock, resident, natives, lookups, worlds)))
                 """)
             cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $script`
-            stock, resident, natives, lookups = eval(Meta.parse(read(cmd, String)))
+            stock, resident, natives, lookups, worlds = eval(Meta.parse(read(cmd, String)))
             @test resident == stock
             @test all(lookups)
             # (and natively with the methods defined, where a session's module computes it: not a
@@ -287,9 +318,16 @@ end
             for (k, (r, d)) in enumerate(stock)
                 d == 0 && @test resident[k][1] == natives[k]
             end
-            @test count(((_, d),) -> d == 0, stock) >= 9
+            @test count(((_, d),) -> d == 0, stock) >= 18
             # (the call of two methods ambiguous over its types, of another more specific of its values)
-            @test resident[9][1] == natives[9] == 3
+            @test resident[13][1] == natives[13] == 3
+            # (the static parameters of a method the patch replaces, declared in another order: of a
+            # call of an abstract argument type; of one by dispatch, which a session's module does not
+            # compile either, natively 11)
+            @test resident[24][1] == natives[24] == 11
+            @test resident[23] == stock[23] && natives[23] == 11
+            # (the methods of the world compiled: one defined since only in the latest)
+            @test worlds == (2, 1, 2, 1)
         end
     end
 

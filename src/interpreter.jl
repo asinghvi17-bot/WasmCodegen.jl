@@ -99,7 +99,7 @@ function CC.findall(@nospecialize(sig::Type), t::WasmMethodTable; limit::Int=-1)
         ms, amb = result.matches, result.ambig
         if !isempty(RESIDENT_OVERLAYS)
             if mt === nothing
-                ms, amb = resident_matches(sig, ms, amb)
+                ms, amb = resident_matches(sig, ms, amb, t.world)
             else
                 # (the installed ones: in the native table; an ambiguity with them is not this table's)
                 n = length(ms)
@@ -132,7 +132,7 @@ function CC.findsup(@nospecialize(sig::Type), t::WasmMethodTable)
         max_world = min(max_world, valid_worlds.max_world)
         if !isempty(RESIDENT_OVERLAYS)
             if mt === nothing
-                match = resident_sup(sig, match)
+                match = resident_sup(sig, match, t.world)
             elseif match !== nothing && is_resident_overlay(match.method)
                 match = nothing
             end
@@ -147,29 +147,30 @@ end
 # replace (so in its place in Julia's specificity order, and with its ambiguities); with one
 # that replaces none (a function the process lacks natively, a method of another signature),
 # Julia's own lookup of the methods of its function with it: of a table of stand-ins of them
-# (`RESIDENT_STANDINS`, `resident_standins!`), each the real method's signature.
-function resident_matches(@nospecialize(sig), natives::Vector{Any}, ambig::Bool)
+# (`resident_standins`, of the methods of `world`), each the real method's signature.
+function resident_matches(@nospecialize(sig), natives::Vector{Any}, ambig::Bool, world::UInt)
     swapped(m::Core.MethodMatch) =
         (o = get(RESIDENT_REPLACED, m.method, nothing)) === nothing ? m : overlay_match(sig, o, m.fully_covers)
     any(o -> typeintersect(sig, o.sig) !== Union{}, RESIDENT_ADDED) ||
         return Any[swapped(m::Core.MethodMatch) for m in natives], ambig
-    standins = CC._findall(sig, RESIDENT_STANDINS[].table, RESIDENT_STANDINS[].world, -1)
+    s = resident_standins(world)
+    standins = CC._findall(sig, s.table, s.world, -1)
     standins === nothing && return Any[], true
     # (the native methods it has no stand-ins of, of other functions, and the stand-ins' real ones)
-    rest = Any[swapped(m::Core.MethodMatch) for m in natives if !haskey(RESIDENT_STANDINS[].mirrored, m.method)]
-    ms = Any[rest; Any[Core.MethodMatch(m.spec_types, m.sparams, RESIDENT_STANDINS[].real[m.method], m.fully_covers)
+    rest = Any[swapped(m::Core.MethodMatch) for m in natives if !haskey(s.mirrored, m.method)]
+    ms = Any[rest; Any[Core.MethodMatch(m.spec_types, m.sparams, s.real[m.method], m.fully_covers)
                        for m in standins.matches]]
     return ms, (!isempty(rest) && ambig) || standins.ambig
 end
 
 # (`findsup`'s, as `resident_matches`)
-function resident_sup(@nospecialize(sig), match::Union{Nothing,Core.MethodMatch})
+function resident_sup(@nospecialize(sig), match::Union{Nothing,Core.MethodMatch}, world::UInt)
     if any(o -> typeintersect(sig, o.sig) !== Union{}, RESIDENT_ADDED)
-        standin, _ = CC._findsup(sig, RESIDENT_STANDINS[].table, RESIDENT_STANDINS[].world)
-        if standin !== nothing || match === nothing || haskey(RESIDENT_STANDINS[].mirrored, match.method)
+        s = resident_standins(world)
+        standin, _ = CC._findsup(sig, s.table, s.world)
+        if standin !== nothing || match === nothing || haskey(s.mirrored, match.method)
             standin === nothing && return nothing
-            return Core.MethodMatch(standin.spec_types, standin.sparams, RESIDENT_STANDINS[].real[standin.method],
-                                    standin.fully_covers)
+            return Core.MethodMatch(standin.spec_types, standin.sparams, s.real[standin.method], standin.fully_covers)
         end
     end
     match === nothing && return nothing

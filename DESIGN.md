@@ -118,8 +118,8 @@ and with its ambiguities (native methods more specific than one, Base's
 the ones called, and a call ambiguous with the replaced method still is); one that replaces no
 native method (a method of another signature, a function the process lacks natively) is
 looked up by Julia's own lookup, of a method table of stand-ins of its function's methods and
-of it (each of the real one's signature, made again when a session finds the native methods
-changed): the matches, ambiguities and `invoke`'s method of the methods defined. (An overlay of `WasmMethodTable` otherwise hides
+of it (each of the real one's signature, so with its static parameters; one table per set of
+native methods, by the world looked up): the matches, ambiguities and `invoke`'s method of the methods defined. (An overlay of `WasmMethodTable` otherwise hides
 every method it covers.) The real methods do natively what Base does (IO and the file
 system through the runtime, whose functions call the methods before the installation:
 `Runtime.original`; paths split by bytes; Random's vector operations element by element), or
