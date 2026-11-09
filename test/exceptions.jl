@@ -238,6 +238,30 @@ function catch_sees_where_type(i::Int)
     end
     return length(x[1]::Tuple)
 end
+# (and in a tuple of unknown length; and a value not of the type of a concrete one whose
+# parameter is a `UnionAll`, `Base.RefValue{Vector}`: tested, as an object)
+mutable struct WhereVarargHolder
+    x::Tuple{Vararg{Tuple{Tuple{Vararg{T}},T} where T}}
+end
+const WHERE_VARARG_HOLDER = WhereVarargHolder((((42,), 42),))
+function catch_sees_where_vararg(i::Int)
+    x = WHERE_VARARG_HOLDER.x
+    try
+        coded_work(i)
+        x = Tuple(Any[Tuple(Any[Tuple(fill(7, i - 1)), 7])])
+    catch
+    end
+    return length((x[1]::Tuple)[1]::Tuple)
+end
+function catch_sees_ref(i::Int)
+    x = Ref{Vector}([42])
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? "z" : x)
+    catch
+    end
+    return x isa String ? 99 : length((x::Base.RefValue{Vector})[]::Vector{Int})
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -280,6 +304,8 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_sees_union_element(i)
         @wtest catch_sees_other_elements(i)
         @wtest catch_sees_where_type(i)
+        @wtest catch_sees_where_vararg(i)
+        @wtest catch_sees_ref(i)
     end
     for i in 1:4
         @wtest catch_parse(i)

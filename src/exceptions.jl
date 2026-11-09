@@ -148,10 +148,12 @@ function bind_handler_args!(fc::FnCtx, block)
     end
 end
 
-# whether the type `T` is or has a `UnionAll` (as a member of a union or a parameter)
+# whether the tuple type `T` is or has a `UnionAll` where `isa` tests a tuple's elements against
+# it (a member of a union, an element of a tuple type, a `Vararg`'s)
 has_unionall(@nospecialize(T)) = T isa UnionAll ||
     (T isa Union && (has_unionall(T.a) || has_unionall(T.b))) ||
-    (T isa DataType && any(P -> P isa Type && has_unionall(P), T.parameters))
+    (T isa DataType && T.name === Tuple.name &&
+     any(P -> P isa Core.TypeofVararg ? isdefined(P, :T) && has_unionall(P.T) : P isa Type && has_unionall(P), T.parameters))
 
 """
 An upsilon: its value assigned to the handler argument it feeds, if it is of the argument's
