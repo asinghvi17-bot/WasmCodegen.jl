@@ -71,6 +71,8 @@ function with_trim_patches(f; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}[])
         same_session(open_session, key) ||
             error("with_trim_patches: a session of patches is open with other patches or bindings " *
                   "(nested sessions must have the same ones)")
+        # (an installed session: the stand-ins of methods defined since, see `resident_standins!`)
+        RESIDENT_PATCH_MODULE[] === nothing || isempty(RESIDENT_ADDED) || resident_standins!()
         return f(COMPILER_WORLD[], Base.get_world_counter())
     end
     w0 = Base.get_world_counter()
@@ -250,6 +252,7 @@ function install_trim_patches!(; patches=TRIM_PATCHES, bindings=Pair{Symbol,Any}
         k = natives === nothing ? nothing : findfirst(m -> m.method.sig == o.sig, natives.matches)
         k === nothing ? push!(RESIDENT_ADDED, o) : (RESIDENT_REPLACED[natives.matches[k].method] = o)
     end
+    isempty(RESIDENT_ADDED) || resident_standins!()
     if Base.invoke_in_world(Base.get_world_counter(), isdefined, Base, :invokelatest_trimmed)
         DIRECT_INVOKELATEST[] = latest_global(Base, :invokelatest_trimmed)
     end
@@ -266,6 +269,68 @@ const RESIDENT_PATCH_MODULE = Ref{Union{Nothing,Module}}(nothing)
 const RESIDENT_OVERLAYS = Method[]
 const RESIDENT_REPLACED = IdDict{Method,Method}()
 const RESIDENT_ADDED = Method[]
+# For the overlays that replace no native method, Julia's lookup of the methods of their functions
+# with them (see `resident_matches`): a method table of stand-ins of those methods (each of the
+# real one's signature), in its world, the real method of each, and the native methods it has
+# stand-ins of. Made again where the functions' native methods are others (a session in the
+# process after methods were defined).
+struct ResidentStandins
+    table::Core.MethodTable
+    world::UInt
+    real::IdDict{Method,Method}
+    mirrored::IdDict{Method,Nothing}
+end
+const RESIDENT_STANDINS = Ref{ResidentStandins}()
+
+function resident_standins!()
+    w = Base.get_world_counter()
+    natives = Method[]
+    for o in RESIDENT_ADDED
+        # (the methods of its function, or of its function's keyword method)
+        P = Base.unwrap_unionall(o.sig).parameters
+        F = P[1] === typeof(Core.kwcall) && length(P) >= 3 ? Tuple{P[1], Any, P[3], Vararg{Any}} : Tuple{P[1], Vararg{Any}}
+        ms = Base._methods_by_ftype(Base.rewrap_unionall(F, o.sig), nothing, -1, w, true,
+                                    Ref(typemin(UInt)), Ref(typemax(UInt)), Ref{Int32}(0))
+        ms isa Vector && foreach(m -> any(x -> x === m.method, natives) || push!(natives, m.method), ms)
+    end
+    isassigned(RESIDENT_STANDINS) && length(RESIDENT_STANDINS[].mirrored) == length(natives) &&
+        all(m -> haskey(RESIDENT_STANDINS[].mirrored, m), natives) && return
+    table = ccall(:jl_new_method_table, Any, (Any, Any), :ResidentStandins, @__MODULE__)::Core.MethodTable
+    # (in the order they were defined, then the overlays, as in a session: the order of the matches
+    # Julia's lookup does not order by specificity)
+    sort!(natives; by=m -> m.primary_world)
+    real, mirrored = IdDict{Method,Method}(), IdDict{Method,Nothing}()
+    for m in natives
+        mirrored[m] = nothing
+        # (one an overlay has the signature of is the overlay's, as it would be replaced)
+        any(o -> o.sig == m.sig, RESIDENT_ADDED) && continue
+        real[standin!(table, m.sig)] = get(RESIDENT_REPLACED, m, m)
+    end
+    for o in sort(RESIDENT_ADDED; by=o -> o.primary_world)
+        real[standin!(table, o.sig)] = o
+    end
+    RESIDENT_STANDINS[] = ResidentStandins(table, Base.get_world_counter(), real, mirrored)
+    return nothing
+end
+
+# a method of the signature `sig` in `table`, which is only looked up (its code: `nothing`)
+function standin!(table::Core.MethodTable, @nospecialize(sig))
+    vars = TypeVar[]
+    U = sig
+    while U isa UnionAll
+        push!(vars, U.var)
+        U = U.body
+    end
+    n = length(U.parameters)
+    src = copy(Base.uncompressed_ast(only(methods(identity))))
+    src.slotnames = Symbol[Symbol("#self#"); [Symbol(:x, i) for i in 2:n]]
+    src.slotflags = zeros(UInt8, n)
+    isdefined(src, :nargs) && (src.nargs = n)
+    isdefined(src, :isva) && (src.isva = Base.isvarargtype(U.parameters[end]))
+    argdata = Core.svec(Core.svec(U.parameters...), Core.svec(vars...), LineNumberNode(0, :standin))
+    return ccall(:jl_method_def, Any, (Any, Any, Any, Any), argdata, table, src, @__MODULE__)::Method
+end
+
 # what a program's `Base.invokelatest` is, juliac's `invokelatest_trimmed` (see `CC.optimize(::WasmInterpreter, ...)`)
 const DIRECT_INVOKELATEST = Ref{Any}(nothing)
 is_resident_overlay(m::Method) = !isempty(RESIDENT_OVERLAYS) && any(r -> r === m, RESIDENT_OVERLAYS)

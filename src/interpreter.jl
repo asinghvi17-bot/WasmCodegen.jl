@@ -99,7 +99,7 @@ function CC.findall(@nospecialize(sig::Type), t::WasmMethodTable; limit::Int=-1)
         ms, amb = result.matches, result.ambig
         if !isempty(RESIDENT_OVERLAYS)
             if mt === nothing
-                ms, amb = resident_matches(sig, ms, amb, t.world)
+                ms, amb = resident_matches(sig, ms, amb)
             else
                 # (the installed ones: in the native table; an ambiguity with them is not this table's)
                 n = length(ms)
@@ -132,7 +132,7 @@ function CC.findsup(@nospecialize(sig::Type), t::WasmMethodTable)
         max_world = min(max_world, valid_worlds.max_world)
         if !isempty(RESIDENT_OVERLAYS)
             if mt === nothing
-                match = resident_sup(sig, match, t.world)
+                match = resident_sup(sig, match)
             elseif match !== nothing && is_resident_overlay(match.method)
                 match = nothing
             end
@@ -146,64 +146,35 @@ end
 # defines: an overlay in place of the native method of its signature, which that method would
 # replace (so in its place in Julia's specificity order, and with its ambiguities); with one
 # that replaces none (a function the process lacks natively, a method of another signature),
-# Julia's lookup over the native methods, ambiguous ones included, and it (`specific_matches`).
-function resident_matches(@nospecialize(sig), natives::Vector{Any}, ambig::Bool, world::UInt)
-    replaced(m::Method) = get(RESIDENT_REPLACED, m, m)
-    added = Method[o for o in RESIDENT_ADDED if typeintersect(sig, o.sig) !== Union{}]
-    if isempty(added)
-        ms = Any[(o = replaced((m::Core.MethodMatch).method)) === m.method ? m : overlay_match(sig, o, m.fully_covers)
-                 for m in natives]
-        return ms, ambig
-    end
-    cands = Method[replaced((m::Core.MethodMatch).method) for m in native_candidates(sig, world)]
-    ms, ambig = specific_matches(sig, append!(cands, added))
-    return Any[overlay_match(sig, m, sig <: m.sig) for m in ms], ambig
+# Julia's own lookup of the methods of its function with it: of a table of stand-ins of them
+# (`RESIDENT_STANDINS`, `resident_standins!`), each the real method's signature.
+function resident_matches(@nospecialize(sig), natives::Vector{Any}, ambig::Bool)
+    swapped(m::Core.MethodMatch) =
+        (o = get(RESIDENT_REPLACED, m.method, nothing)) === nothing ? m : overlay_match(sig, o, m.fully_covers)
+    any(o -> typeintersect(sig, o.sig) !== Union{}, RESIDENT_ADDED) ||
+        return Any[swapped(m::Core.MethodMatch) for m in natives], ambig
+    standins = CC._findall(sig, RESIDENT_STANDINS[].table, RESIDENT_STANDINS[].world, -1)
+    standins === nothing && return Any[], true
+    # (the native methods it has no stand-ins of, of other functions, and the stand-ins' real ones)
+    rest = Any[swapped(m::Core.MethodMatch) for m in natives if !haskey(RESIDENT_STANDINS[].mirrored, m.method)]
+    ms = Any[rest; Any[Core.MethodMatch(m.spec_types, m.sparams, RESIDENT_STANDINS[].real[m.method], m.fully_covers)
+                       for m in standins.matches]]
+    return ms, (!isempty(rest) && ambig) || standins.ambig
 end
 
-# (`findsup`'s, as `resident_matches`: the most specific method that covers `sig`, if one is
-# more specific than every other, as `invoke` finds it)
-function resident_sup(@nospecialize(sig), match::Union{Nothing,Core.MethodMatch}, world::UInt)
-    added = Method[o for o in RESIDENT_ADDED if sig <: o.sig]
-    if isempty(added)
-        match === nothing && return nothing
-        o = get(RESIDENT_REPLACED, match.method, nothing)
-        return o === nothing ? match : overlay_match(sig, o, match.fully_covers)
+# (`findsup`'s, as `resident_matches`)
+function resident_sup(@nospecialize(sig), match::Union{Nothing,Core.MethodMatch})
+    if any(o -> typeintersect(sig, o.sig) !== Union{}, RESIDENT_ADDED)
+        standin, _ = CC._findsup(sig, RESIDENT_STANDINS[].table, RESIDENT_STANDINS[].world)
+        if standin !== nothing || match === nothing || haskey(RESIDENT_STANDINS[].mirrored, match.method)
+            standin === nothing && return nothing
+            return Core.MethodMatch(standin.spec_types, standin.sparams, RESIDENT_STANDINS[].real[standin.method],
+                                    standin.fully_covers)
+        end
     end
-    cands = Method[get(RESIDENT_REPLACED, m.method, m.method) for m in native_candidates(sig, world)
-                   if sig <: m.method.sig]
-    append!(cands, added)
-    k = findfirst(m -> all(x -> x === m || Base.morespecific(m, x), cands), cands)
-    return k === nothing ? nothing : overlay_match(sig, cands[k], true)
-end
-
-# the native methods applicable to `sig`, ambiguous ones included
-function native_candidates(@nospecialize(sig), world::UInt)
-    ms = Base._methods_by_ftype(sig, nothing, -1, world, true, Ref(typemin(UInt)), Ref(typemax(UInt)),
-                                Ref{Int32}(0))
-    return ms isa Vector ? ms : Any[]
-end
-
-# The methods of `cands` a call of `sig` may call, most specific first, and whether some are
-# ambiguous, as Julia's lookup has them: not one less specific than a method that covers `sig`;
-# ambiguous, two neither more specific than the other whose intersection within `sig` no method
-# more specific than both covers (over all of `sig`, none is called: no match).
-function specific_matches(@nospecialize(sig), cands::Vector{Method})
-    covers(m) = sig <: m.sig
-    more(a, b) = Base.morespecific(a, b)
-    ms = Method[m for m in cands if !any(c -> c !== m && covers(c) && more(c, m), cands)]
-    function ambiguous(a, b)
-        (a === b || more(a, b) || more(b, a)) && return false
-        I = typeintersect(typeintersect(sig, a.sig), b.sig)
-        return I !== Union{} && !any(c -> more(c, a) && more(c, b) && I <: c.sig, ms)
-    end
-    any(a -> covers(a) && any(b -> covers(b) && ambiguous(a, b), ms), ms) && return Method[], false
-    ambig = any(a -> any(b -> ambiguous(a, b), ms), ms)
-    sorted = Method[]
-    for m in ms
-        k = findfirst(x -> more(m, x), sorted)
-        insert!(sorted, something(k, length(sorted) + 1), m)
-    end
-    return sorted, ambig
+    match === nothing && return nothing
+    o = get(RESIDENT_REPLACED, match.method, nothing)
+    return o === nothing ? match : overlay_match(sig, o, match.fully_covers)
 end
 
 function overlay_match(@nospecialize(sig), o::Method, fully_covers::Bool)
@@ -274,23 +245,23 @@ CC.get_max_methods(interp::WasmInterpreter, sv::CC.AbsIntState) =
 # it before the optimizer: the code a session compiles.
 function CC.optimize(interp::WasmInterpreter, opt::CC.OptimizationState, caller::CC.InferenceResult)
     direct = DIRECT_INVOKELATEST[]
-    direct === nothing || direct_invokelatest!(opt, direct)
+    direct === nothing || direct_invokelatest!(opt, direct, CC.get_inference_world(interp))
     return @invoke CC.optimize(interp::CC.AbstractInterpreter, opt::CC.OptimizationState,
                                caller::CC.InferenceResult)
 end
 
-function direct_invokelatest!(opt::CC.OptimizationState, @nospecialize(direct))
+function direct_invokelatest!(opt::CC.OptimizationState, @nospecialize(direct), world::UInt)
     src = opt.src
     # (the binding read as a GlobalRef, or as `getproperty(Base, :invokelatest)`; inferred as
     # `invokelatest_trimmed`, see `abstract_eval_globalref` and `abstract_call_known`)
-    builtin(x) = x isa GlobalRef && invokelatest_binding(x.mod, x.name)
+    builtin(x) = x isa GlobalRef && invokelatest_binding(x.mod, x.name, world)
     function binding_read(x)
         Meta.isexpr(x, :call) && length(x.args) == 3 || return false
         f = CC.singleton_type(CC.argextype(x.args[1], src, opt.sptypes))
         (f === getglobal || f === getproperty) || return false
         m, s = (CC.argextype(a, src, opt.sptypes) for a in x.args[2:3])
         return m isa CC.Const && m.val isa Module && s isa CC.Const && s.val isa Symbol &&
-               invokelatest_binding(m.val, s.val)
+               invokelatest_binding(m.val, s.val, world)
     end
     for (i, stmt) in enumerate(src.code)
         (builtin(stmt) || binding_read(stmt)) && (src.code[i] = stmt = direct)
@@ -304,17 +275,36 @@ function direct_invokelatest!(opt::CC.OptimizationState, @nospecialize(direct))
     return nothing
 end
 
-# whether `m.s` is the binding `Base.invokelatest` (of Base, or imported from it), the builtin
-invokelatest_binding(m::Module, s::Symbol) =
-    s === :invokelatest && Base.isdefinedglobal(m, s) && Base.binding_module(m, s) === Base &&
-    getglobal(m, s) === Core.invokelatest
+# whether `m.s` is the binding `Base.invokelatest`, the builtin, in the program's world `world`:
+# Base's own, or one that resolves to it, by its identity (imported, renamed or not: `import
+# Base: invokelatest as il`; implicitly, by `using`, of its name), not by its value (`const f =
+# Core.invokelatest` is another binding)
+invokelatest_binding(m::Module, s::Symbol, world::UInt) =
+    Base.invoke_in_world(world, invokelatest_binding_in_world, m, s)
+
+function invokelatest_binding_in_world(m::Module, s::Symbol)
+    (Base.isdefinedglobal(m, s) && getglobal(m, s) === Core.invokelatest) || return false
+    target = convert(Core.Binding, GlobalRef(Base, :invokelatest))
+    b = convert(Core.Binding, GlobalRef(m, s))
+    w = Base.tls_world_age()
+    while b !== target
+        p = Base.lookup_binding_partition(w, b)
+        r = isdefined(p, :restriction) ? p.restriction : nothing
+        r isa Core.Binding || break
+        b = r
+    end
+    b === target && return true
+    g = b.globalref
+    return g.name === :invokelatest && Base.binding_module(g.mod, g.name) === Base
+end
 
 function CC.abstract_eval_globalref(interp::WasmInterpreter, g::GlobalRef, saw_latestworld::Bool,
                                     sv::CC.AbsIntState)
     ret = @invoke CC.abstract_eval_globalref(interp::CC.AbstractInterpreter, g::GlobalRef,
                                              saw_latestworld::Bool, sv::CC.AbsIntState)
     direct = DIRECT_INVOKELATEST[]
-    (direct !== nothing && invokelatest_binding(g.mod, g.name)) || return ret
+    (direct !== nothing && ret.rt isa CC.Const && ret.rt.val === Core.invokelatest &&
+     invokelatest_binding(g.mod, g.name, CC.get_inference_world(interp))) || return ret
     return CC.RTEffects(CC.Const(direct), ret.exct, ret.effects, ret.refinements)
 end
 
@@ -329,7 +319,7 @@ function CC.abstract_call_known(interp::WasmInterpreter, @nospecialize(f),
     if direct !== nothing && (f === getproperty || f === getglobal) && length(arginfo.argtypes) == 3
         m, s = arginfo.argtypes[2], arginfo.argtypes[3]
         if m isa CC.Const && m.val isa Module && s isa CC.Const && s.val isa Symbol &&
-                invokelatest_binding(m.val, s.val)
+                invokelatest_binding(m.val, s.val, CC.get_inference_world(interp))
             return CC.Future{CC.CallMeta}(CC.CallMeta(CC.Const(direct), Union{}, CC.EFFECTS_TOTAL, CC.NoCallInfo()))
         end
     end

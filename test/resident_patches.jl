@@ -56,6 +56,20 @@ const SAVED_LATEST = Core.invokelatest
 const BOXED_LATEST = (Core.invokelatest,)
 latest_alias(n::Int) = SAVED_LATEST === BOXED_LATEST[1] ? n : -n
 core_latest(n::Int) = Core.invokelatest(latest_target, n)
+# the binding imported (renamed, and by `using`): `Base.invokelatest`'s, which the patches
+# rebind; a module's own binding of the builtin of that name is another
+module Imported
+using Base: invokelatest
+import Base: invokelatest as il
+using ..ResidentTarget: latest_target
+latest_imported(n::Int) = invokelatest(latest_target, n) + il(latest_target, n)
+end
+latest_imported(n::Int) = Imported.latest_imported(n)
+module OwnLatest
+const invokelatest = Core.invokelatest
+own_latest(n::Int) = invokelatest === Core.invokelatest ? n : -n
+end
+own_latest(n::Int) = OwnLatest.own_latest(n)
 end
 
 session_worlds(compiler_world, program_world) = (compiler_world, program_world)
@@ -90,7 +104,8 @@ end
                 (R.tone_returned, 1, Int), (R.latest_called, 4, Int), (R.latest_splat, 4, Int),
                 (R.latest_kw, 4, Int), (R.latest_nested, 4, Int), (R.mood_shown, 2, Int),
                 (R.hue_ambiguous, 1, Int), (R.latest_union, 4, Int), (R.latest_alias, 2, Int),
-                (R.core_latest, 4, Int), (R.dynamic, 5, Int)]
+                (R.core_latest, 4, Int), (R.latest_imported, 4, Int), (R.own_latest, 3, Int),
+                (R.dynamic, 5, Int)]
     config = test_config(trim=:unsafe)
     compiled(f) = WasmCodegen.compile(f, (Int,); config)
     diagnostics(c) = [(sprint(show, mi), sprint(showerror, e)) for (mi, e) in c.cgm.diagnostics]
@@ -191,36 +206,90 @@ end
         @test read(cmd, String) == string(repr(Base.PkgId(Base.UUID(1), "X") => 1), ' ', sprint(show, Vector{Union{}}))
     end
 
-    # (an overlay that replaces no native method, a patch of another signature, in a process of
-    # its own: looked up as Julia's lookup does with both defined, a call or an `invoke` of both
-    # ambiguous, as in a session)
-    @testset "an overlay of another signature" begin
+    # (overlays that replace no native method, patches of other signatures, in a process of its
+    # own: looked up as Julia's lookup does with them defined, compared with the same methods
+    # defined natively (`Native1`, `Native2`), and with a session's module)
+    @testset "overlays of other signatures" begin
         mktempdir() do dir
             patch = joinpath(dir, "added.jl")
-            write(patch, "Target.wait_forever(x::Int, y) = 10\n")
+            write(patch, "Target1.wait_forever(x::Int, y) = 10\nTarget2.wait_forever(x, y::Number) = 2\n" *
+                         "Target3.wait_forever(x, y::Number) = 2\n")
             script = joinpath(dir, "added_run.jl")
             write(script, """
                 include($(repr(joinpath(@__DIR__, "harness.jl"))))
-                module Target
-                wait_forever(x, y::Int) = 20
+                const CC = Core.Compiler
+                # the native methods, and the patch's: in the session, a method of another signature
+                # (Target3: two methods ambiguous over `(Number, Number)`, but of `(Int, Int)` a third)
+                common = [:(wait_forever(x, y::Int) = 20), :(wait_forever(x::Number, y::String) = 1),
+                          :(wait_forever(x::Int, y::Int) = 3)]
+                for (T, N, defs, patched) in ((:Target1, :Native1, common, :(wait_forever(x::Int, y) = 10)),
+                                              (:Target2, :Native2, common, :(wait_forever(x, y::Number) = 2)),
+                                              (:Target3, :Native3, [:(wait_forever(x::Number, y) = 1), :(wait_forever(x::Int, y::Int) = 3)],
+                                               :(wait_forever(x, y::Number) = 2)))
+                    @eval module \$T end
+                    @eval module \$N end
+                    for M in (getglobal(Main, T), getglobal(Main, N)), def in defs
+                        Core.eval(M, def)
+                    end
+                    Core.eval(getglobal(Main, N), patched)
                 end
-                const BINDINGS = Pair{Symbol,Any}[:Target => Target]
-                invoked(n::Int) = try invoke(Target.wait_forever, Tuple{Int,Int}, n, n) catch e; e isa MethodError ? -1 : -2 end
-                called(n::Int) = try Target.wait_forever(n, n) catch e; e isa MethodError ? -1 : -2 end
-                patched(n::Int) = Target.wait_forever(n, "s") + Target.wait_forever("s", n)
+                mutable struct Box
+                    x::Number
+                end
+                # (a call's value, or -1 for a MethodError: none, or an ambiguous one)
+                caught(f) = try f() catch e; e isa MethodError ? -1 : -2 end
+                for M in (:Target1, :Target2, :Target3, :Native1, :Native2, :Native3)
+                    @eval begin
+                        @noinline \$(Symbol(M, :_dispatch))(a::Box, b::Box) = \$M.wait_forever(a.x, b.x)
+                        \$(Symbol(M, :_boxed))(n::Int) = caught(() -> \$(Symbol(M, :_dispatch))(Box(n), Box(n)))
+                        \$(Symbol(M, :_mixed))(n::Int) = caught(() -> \$M.wait_forever(n, "s")) + 100 * caught(() -> \$M.wait_forever(1.5, n))
+                        \$(Symbol(M, :_called))(n::Int) = caught(() -> \$M.wait_forever(n, 2.5))
+                        \$(Symbol(M, :_invoked))(n::Int) = caught(() -> invoke(\$M.wait_forever, Tuple{Int,Int}, n, n))
+                    end
+                end
+                const BINDINGS = Pair{Symbol,Any}[:Target1 => Target1, :Target2 => Target2, :Target3 => Target3]
                 config = test_config(trim=:unsafe, extra_patches=[$(repr(patch))], patch_bindings=BINDINGS)
+                fs = [getglobal(Main, Symbol(T, s)) for T in (:Target1, :Target2, :Target3) for s in (:_boxed, :_mixed, :_called, :_invoked)]
+                natives = [getglobal(Main, Symbol(N, s))(3) for N in (:Native1, :Native2, :Native3) for s in (:_boxed, :_mixed, :_called, :_invoked)]
                 run(f) = (c = WasmCodegen.compile(f, (Int,); config);
                           (wasm_run(c, string(nameof(f)), 3; rettype=Int), length(c.cgm.diagnostics)))
-                stock = map(run, (invoked, called, patched))
+                stock = map(run, fs)
                 install_trim_patches!(patches=[WasmCodegen.TRIM_PATCHES; $(repr(patch))], bindings=BINDINGS)
-                resident = map(run, (invoked, called, patched))
-                print(repr((stock, resident)))
+                resident = map(run, fs)
+                # the lookups, as of the methods defined natively: the matches (by their signatures but
+                # the function: as a set, since the order of methods ambiguous with one another is the
+                # table's, and in an order of specificity), whether ambiguous, and `invoke`'s
+                w = Base.get_world_counter()
+                table = WasmCodegen.WasmMethodTable(w)
+                tail(m) = string(Base.unwrap_unionall(m.method.sig).parameters[2:end])
+                lookups = Bool[]
+                for (T, N) in ((Target1, Native1), (Target2, Native2), (Target3, Native3)), args in
+                        ((Number, Number), (Int, Int), (Float64, Float64), (Int, Float64), (Float64, Int),
+                         (Any, Number), (Int, Any), (Any, Any), (Int, String), (Integer, Integer))
+                    r = CC.findall(Tuple{typeof(T.wait_forever), args...}, table)
+                    n = CC._findall(Tuple{typeof(N.wait_forever), args...}, nothing, w, -1)
+                    ordered = r !== nothing && all(((i, j),) -> !Base.morespecific(r.matches[j].method, r.matches[i].method),
+                                                   [(i, j) for i in eachindex(r.matches) for j in i+1:length(r.matches)])
+                    push!(lookups, ordered && n !== nothing && sort(map(tail, r.matches)) == sort(map(tail, n.matches)) &&
+                                   r.ambig == n.ambig)
+                    rs, _ = CC.findsup(Tuple{typeof(T.wait_forever), args...}, table)
+                    ns, _ = CC._findsup(Tuple{typeof(N.wait_forever), args...}, nothing, w)
+                    push!(lookups, (rs === nothing) == (ns === nothing) && (rs === nothing || tail(rs) == tail(ns)))
+                end
+                print(repr((stock, resident, natives, lookups)))
                 """)
             cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $script`
-            stock, resident = eval(Meta.parse(read(cmd, String)))
+            stock, resident, natives, lookups = eval(Meta.parse(read(cmd, String)))
             @test resident == stock
-            # (natively with both methods: only the patch's of `(3, "s")`, only the native one of `("s", 3)`)
-            @test stock[3][1] == 30
+            @test all(lookups)
+            # (and natively with the methods defined, where a session's module computes it: not a
+            # dynamic call, nor `invoke` of an ambiguous one)
+            for (k, (r, d)) in enumerate(stock)
+                d == 0 && @test resident[k][1] == natives[k]
+            end
+            @test count(((_, d),) -> d == 0, stock) >= 9
+            # (the call of two methods ambiguous over its types, of another more specific of its values)
+            @test resident[9][1] == natives[9] == 3
         end
     end
 

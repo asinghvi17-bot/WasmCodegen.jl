@@ -117,14 +117,16 @@ and with its ambiguities (native methods more specific than one, Base's
 `show(::IO, ::Core.TypeofBottom)` or a package's `show` of its enum, varargs included, are still
 the ones called, and a call ambiguous with the replaced method still is); one that replaces no
 native method (a method of another signature, a function the process lacks natively) is
-looked up with the native methods as Julia's lookup would with both defined
-(`specific_matches`: specificity, and ambiguities, also of `invoke`). (An overlay of `WasmMethodTable` otherwise hides
+looked up by Julia's own lookup, of a method table of stand-ins of its function's methods and
+of it (each of the real one's signature, made again when a session finds the native methods
+changed): the matches, ambiguities and `invoke`'s method of the methods defined. (An overlay of `WasmMethodTable` otherwise hides
 every method it covers.) The real methods do natively what Base does (IO and the file
 system through the runtime, whose functions call the methods before the installation:
 `Runtime.original`; paths split by bytes; Random's vector operations element by element), or
 change only messages (assertions, deprecations) and specialization (`max_args`). The one
 constant juliac rebinds is not rebound: the process's `Base.invokelatest` stays the builtin
-`Core.invokelatest`, so where a program reads that binding (as a `GlobalRef`, or as Julia 1.13
+`Core.invokelatest`, so where a program reads that binding (any binding that resolves to it,
+by its identity, renamed imports included; as a `GlobalRef`, or as Julia 1.13
 lowers `Base.invokelatest`, `getproperty(Base, :invokelatest)`; to call it, directly or applied
 to splatted arguments, or as a value, one of the callees of a call), the module's interpreter
 infers the read as juliac's `invokelatest_trimmed` and replaces it with that before optimizing,
