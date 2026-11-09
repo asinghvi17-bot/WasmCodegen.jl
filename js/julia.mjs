@@ -255,11 +255,13 @@ export function createHost({ write, args = [], env = {}, imports = {} } = {}) {
     // the bytes of an argument of a declared import, in the memory (a view: the memory's
     // buffer is another once the module grows it)
     bytes: (offset, length) => new Uint8Array(memory.buffer, offset >>> 0, length >>> 0),
-    string: (offset, length) => new TextDecoder().decode(host.bytes(offset, length)),
+    // (a leading U+FEFF is the string's, not a byte order mark)
+    string: (offset, length) => new TextDecoder('utf-8', { ignoreBOM: true }).decode(host.bytes(offset, length)),
   };
+  // (by own properties: a library may be named as an Object's property, "constructor")
   for (const [lib, funcs] of Object.entries(typeof imports === 'function' ? imports(host) : imports)) {
-    if (lib in host.imports) throw new Error(`imports: "${lib}" is a module of the host's own`);
-    host.imports[lib] = funcs;
+    if (Object.hasOwn(host.imports, lib)) throw new Error(`imports: "${lib}" is a module of the host's own`);
+    Object.defineProperty(host.imports, lib, { value: funcs, enumerable: true, writable: true, configurable: true });
   }
   return host;
 }

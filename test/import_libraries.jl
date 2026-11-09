@@ -75,6 +75,8 @@ function jsb_mixed(n::Int)
     return ccall((:mixed, "jsb_test"), Int64, (Int32, Vector{UInt8}, String, Int64, Memory{UInt8}),
                  Int32(-7), jsb_pattern(n), "x", Int64(n), m)
 end
+# (of a library named as an Object's property; a string that starts with U+FEFF)
+jsb_bom(n::Int) = ccall((:text, "constructor"), Int32, (String,), string('\ufeff', "ab", n))
 jsb_ints(v::Vector{Int}) = ccall((:send, "jsb_test"), Cvoid, (Vector{Int},), v)
 jsb_ptr(v::Vector{UInt8}) = GC.@preserve v ccall((:send, "jsb_test"), Cvoid, (Ptr{UInt8},), pointer(v))
 
@@ -142,6 +144,21 @@ end
         @test jsb_log(line) == ("mixed", [-7, n, base, n, o2, 1, o2 + 8, 3],
                                 [jsb_pattern(n), Vector{UInt8}("x"), UInt8[0x01, 0x02, 0xff]])
     end
+
+    # a library named as an Object's property, and a string that starts with U+FEFF (not a
+    # byte order mark: the string's)
+    c = WasmCodegen.compile(jsb_bom, (Int,); config = WasmCodegen.Config(import_libraries = ["constructor"]))
+    lib = "(host) => ({ constructor: { text: (p, n) => { const s = host.string(p, n); log.push(`text \${p} \${n} ` + s); return s.length; } } })"
+    r, log = run_js_bytes(c, lib, [("jsb_bom", Any[7])])
+    @test r == ["4"] && jsb_log(log[1]) == ("text", [0, 6], "\ufeffab7")
+    # entry points named as WASI's exports, which a host takes for them with the memory: refused
+    for name in ("memory", "_initialize")
+        @test_throws ArgumentError WasmCodegen.compile([Entry(jsb_vector, (Int,); name)];
+                                                       config = WasmCodegen.Config(import_libraries = ["jsb_test"]))
+    end
+    @test WasmCodegen.compile([Entry(identity, (Int,); name = "_initialize")]).bytes isa Vector{UInt8}
+    # (each argument from the next offset, as an i64: past 4 GiB a trap, not an offset that wraps)
+    @test any(i -> i.op === :i64_gt_u, (i for f in c.cgm.mod.funcs for i in f.body))
 
     # other arrays, and pointers, are not bytes for the host
     for (f, at) in ((jsb_ints, (Vector{Int},)), (jsb_ptr, (Vector{UInt8},)))

@@ -134,8 +134,9 @@ function stage_import_bytes!(fc::FnCtx, vals::Vector{CGVal})
     bytes = Dict{Int,Tuple{Int,Int}}()
     any(v -> v.typ in IMPORT_BYTES, vals) || return bytes
     cgm = fc.cgm
-    next = new_local!(fc, I32)
-    emit!(fc.b, :i32_const, reinterpret(Int32, import_bytes_base(cgm))); emit!(fc.b, :local_set, next)
+    # (the next offset as an i64: past 4 GiB, a trap, not an offset that wrapped around)
+    next = new_local!(fc, I64)
+    emit!(fc.b, :i64_const, Int64(import_bytes_base(cgm))); emit!(fc.b, :local_set, next)
     for (k, v) in enumerate(vals)
         v.typ in IMPORT_BYTES || continue
         off, len = new_local!(fc, I32), new_local!(fc, I32)
@@ -157,10 +158,13 @@ function stage_import_bytes!(fc::FnCtx, vals::Vector{CGVal})
             emit!(fc.b, :local_get, arr); emit!(fc.b, :array_len)
         end
         emit!(fc.b, :local_tee, len)
-        emit!(fc.b, :local_get, next); emit!(fc.b, :local_tee, off)
+        emit!(fc.b, :local_get, next); emit!(fc.b, :i64_const, Int64(typemax(UInt32))); emit!(fc.b, :i64_gt_u)
+        if!(fc.b); unreachable!(fc.b); end!(fc.b)
+        emit!(fc.b, :local_get, next); emit!(fc.b, :i32_wrap_i64); emit!(fc.b, :local_tee, off)
         call!(fc.b, import_bytes_func!(cgm))
-        emit!(fc.b, :local_get, off); emit!(fc.b, :local_get, len); emit!(fc.b, :i32_add)
-        emit!(fc.b, :i32_const, 7); emit!(fc.b, :i32_add); emit!(fc.b, :i32_const, -8); emit!(fc.b, :i32_and)
+        emit!(fc.b, :local_get, off); emit!(fc.b, :i64_extend_i32_u)
+        emit!(fc.b, :local_get, len); emit!(fc.b, :i64_extend_i32_u); emit!(fc.b, :i64_add)
+        emit!(fc.b, :i64_const, 7); emit!(fc.b, :i64_add); emit!(fc.b, :i64_const, -8); emit!(fc.b, :i64_and)
         emit!(fc.b, :local_set, next)
         bytes[k] = (off, len)
     end

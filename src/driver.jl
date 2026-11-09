@@ -61,8 +61,11 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     config.host in (:js, :wasi) || throw(ArgumentError("Config: host must be :js or :wasi, got $(repr(config.host))"))
     check_import_libraries(config)
     check_foreign_functions(config)
+    # (and a JavaScript module that may pass bytes to its declared imports exports its memory as
+    # WASI's: a host takes an `_initialize` with it for WASI's, `js/julia.mjs`)
+    reserved = config.host === :wasi || !isempty(config.import_libraries)
     for e in entries
-        config.host === :wasi && e.name in WASI_EXPORTS &&
+        reserved && e.name in WASI_EXPORTS &&
             throw(ArgumentError("the entry point $(e.f) is exported as \"$(e.name)\", a name WASI reserves: give it another (`Entry(f, argtypes; name)`)"))
     end
     if config.abi_version !== nothing
