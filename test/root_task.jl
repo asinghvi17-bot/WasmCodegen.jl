@@ -33,6 +33,13 @@ module RootTaskImage
                          any(i -> isassigned(ks, i) && ks[i].value === Base.roottask, eachindex(ks))) ? x : -x
     # the module's code runs in its root task
     inroot(x::Float64) = (t = current_task(); t === Base.roottask && t === W.value) ? x : -x
+    # hash tables keyed by the root task, built natively: found by its `objectid`
+    const D = Dict{Task,Int}(Base.roottask => 42)
+    const I = IdDict{Any,Int}(Base.roottask => 7)
+    lookup(x::Int) = get(D, Base.roottask, x) + get(I, W.value, x) + (objectid(W.value) == objectid(Base.roottask))
+    # the root task is sticky, as natively (also the module's current task, its root task)
+    sticky(x::Int) = (W.value::Task).sticky ? x : -x
+    cur_sticky(x::Float64) = current_task().sticky ? x : -x
 end
 
 module SparseImage
@@ -80,8 +87,12 @@ const WKD_CONFIGS = VERSION >= v"1.13" ? (test_config(), test_config(; shell_fir
 @testset "the build's root task in the image" begin
     @wtest RootTaskImage.weak(2.0)
     @wtest RootTaskImage.same(2.0)
+    @wtest RootTaskImage.lookup(-1)
+    @wtest RootTaskImage.sticky(3)
     c = wcompile(RootTaskImage.inroot, (Float64,))
     @test wasm_run(c, "inroot", 2.0; rettype = Float64) == 2.0
+    # (natively, in the root task: sticky)
+    @test wasm_run(wcompile(RootTaskImage.cur_sticky, (Float64,)), "cur_sticky", 2.0; rettype = Float64) == 2.0
     # the per-task cache, compared with native
     for f in (RootTaskImage.run, RootTaskImage.keyed), cfg in WKD_CONFIGS
         c = WasmCodegen.compile(f, (Float64,); config = cfg)

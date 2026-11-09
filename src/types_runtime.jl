@@ -130,7 +130,9 @@ function current_task_global!(cgm::CGModule)
     g === nothing || return g::Global
     ts = cgm.types
     l = layout(ts, Task)
-    init = Inst[Inst(:i32_const, typeid!(ts, Task)), Inst(:i32_const, 0)]
+    # (with the build's root task's `objectid`, which it stands for: hash tables built natively
+    # with it as a key find it)
+    init = Inst[Inst(:i32_const, typeid!(ts, Task)), header_hash(cgm.image, Base.roottask)]
     fields = (typedef(cgm.mod, l.wtype).comp::StructType).fields
     for f in fields[HEADER_FIELDS+1:end]
         st = f.storage
@@ -153,11 +155,9 @@ function current_task_global!(cgm::CGModule)
         w = first(l.fields[Base.fieldindex(Task, name)]) - 1
         push!(cgm.image.init, Inst(:global_get, g), Inst(:global_get, nothing_g), Inst(:struct_set, l.wtype, w))
     end
-    if cgm.config.tasks === :jspi
-        # (sticky, as natively: the tasks it schedules run on its thread)
-        w = first(l.fields[Base.fieldindex(Task, :sticky)]) - 1
-        push!(cgm.image.init, Inst(:global_get, g), Inst(:i32_const, 1), Inst(:struct_set, l.wtype, w))
-    end
+    # (sticky, as natively, `jl_init_root_task`: the tasks it schedules run on its thread)
+    w = first(l.fields[Base.fieldindex(Task, :sticky)]) - 1
+    push!(cgm.image.init, Inst(:global_get, g), Inst(:i32_const, 1), Inst(:struct_set, l.wtype, w))
     entropy = host_func!(cgm, :entropy)
     for i in 0:4
         w = first(l.fields[Base.fieldindex(Task, Symbol("rngState", i))]) - 1
