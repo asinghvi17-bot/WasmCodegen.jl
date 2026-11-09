@@ -114,8 +114,9 @@ struct AtUnnamed
     a::Int
 end
 @noinline unnamed(i::Int) = Base.inferencebarrier(AtUnnamed(i))
-# `isa` of a tuple type with free type variables: natively false (`<:` of the value's type),
-# also of a tuple whose concrete type the module does not have (an object of `Tuple`)
+# `isa` of a tuple type with free type variables: natively `<:` of the value's type, element by
+# element (a free variable is opaque: `Int <: T` is false), also of a tuple whose concrete type
+# the module does not have (an object of `Tuple`)
 # (the type a constant of the code, as inference leaves one: not a global's binding)
 @eval at_isa_free(i::Int) = let F = $(let T = TypeVar(:T); Tuple{T,T}; end)
     ((pick(i), pick(i)) isa F, (unnamed(i), i) isa F, (pick(i),) isa Tuple{Any})
@@ -143,6 +144,42 @@ at_splat3(a::Int) = try (at_sn(a, (a, a, a)); 1) catch e; at_arity_msg(e) end
 # (compared with a type, as `<: Tuple` of it is folded by inference)
 at_unnamed_typeof(i::Int) = id(typeof(id((unnamed(i),)))) === Tuple{Int}
 
+# `isa` of tuples, some of concrete types no code names (objects of `Tuple`), against unions with
+# tuple types, tuple types with free type variables or `Type` parameters, nested tuples, and of
+# tuples of unknown length: natively `<:` of the type the elements make
+@noinline opaque(x) = Base.inferencebarrier(x)
+const AT_NUM_OR_PAIR = Union{Tuple{Number}, Tuple{T,T} where T}
+function at_isa_union(i::Int)
+    t = opaque((unnamed(i), opaque(i)))                 # Tuple{AtUnnamed,Int}
+    u = opaque((opaque(i),))                            # Tuple{Int}
+    n = opaque((opaque((unnamed(i), i)), "s"))          # Tuple{Tuple{AtUnnamed,Int},String}
+    return (t isa Union{Nothing,Tuple{AtUnnamed,Int}}, t isa Union{Nothing,Tuple{AtUnnamed,Number}},
+            t isa Union{Int,Tuple{AtUnnamed,String}}, u isa Union{Nothing,Tuple{Number}},
+            u isa AT_NUM_OR_PAIR, n isa Union{Nothing,Tuple{Tuple{AtUnnamed,Int},String}},
+            n isa Union{Nothing,Tuple{Tuple{AtUnnamed,String},String}}, t isa Union{Missing,Tuple{Any,Vararg{Int}}},
+            n isa Union{Missing,Tuple{Tuple,AbstractString}}, t isa Union{Missing,Tuple{AtUnnamed,Vararg{String}}})
+end
+@eval function at_isa_freevars(i::Int)
+    F1, F2, F3, F4, F5 = $(let T = TypeVar(:T), N = TypeVar(:N)
+        (Tuple{Union{Int,T}}, Tuple{Any,Vararg{T}}, Tuple{T,T}, Tuple{Int,Vector{T}}, Tuple{Vararg{Int,N}})
+    end)
+    t, v, w = opaque((opaque(i),)), opaque((opaque(i), opaque(i))), opaque((unnamed(i),))
+    return (t isa F1, t isa F2, v isa F2, v isa F3, t isa F3, w isa F1, w isa F2, opaque((i, Int[])) isa F4,
+            v isa F5, t isa Union{Nothing,F1})
+end
+# a type object's element type is its kind: `(Int, 1)` is a `Tuple{DataType,Int}`
+function at_isa_kinds(i::Int)
+    t = opaque((opaque(i == 1 ? Int : String), unnamed(i)))
+    return (t isa Tuple{Type{Int},AtUnnamed}, t isa Tuple{DataType,Any}, t isa Tuple{Type,AtUnnamed},
+            t isa Union{Nothing,Tuple{Type{Int},AtUnnamed}}, t isa Union{Nothing,Tuple{DataType,AtUnnamed}})
+end
+function at_isa_vararg(n::Int)
+    t = tuple(Any[Int, opaque(n), unnamed(n)][1:n]...)
+    return (t isa Union{Nothing,Tuple{DataType}}, t isa Tuple{Type{Int}}, t isa Tuple{DataType,Int},
+            t isa Union{Tuple{Vararg{Type}},Nothing}, t isa Union{Missing,Tuple{DataType,Int,AtUnnamed}},
+            t isa Tuple{Any,Vararg{Integer}})
+end
+
 @testset "tuples of abstract type" begin
     for i in 1:4
         @wtest at_type(i)
@@ -157,6 +194,12 @@ at_unnamed_typeof(i::Int) = id(typeof(id((unnamed(i),)))) === Tuple{Int}
         @wtest at_error(i)
         @wtest at_unnamed_ok(i)
         @wtest at_isa_free(i)
+        @wtest at_isa_union(i)
+        @wtest at_isa_freevars(i)
+        @wtest at_isa_kinds(i)
+    end
+    for n in 1:3
+        @wtest at_isa_vararg(n)
     end
     for i in 0:2
         @wtest at_bounds(i)
