@@ -250,6 +250,19 @@ handlers around it: the message is also written to `Core.stderr` before the erro
     error(msg)
 end
 
+"""
+The error of `isa` of a tuple whose concrete type is not one of the module's (an object of
+`Tuple`) and a tuple type with type variables (`Tuple{Vararg{T}} where T<:Real`): natively `<:`
+of the type its elements make, which the module does not have. (Written to `Core.stderr` too,
+as `throw_typeof_unknown`'s.)
+"""
+@noinline function throw_isa_unknown()
+    msg = string("WasmCodegen: isa of a tuple whose concrete type the module does not have and a tuple ",
+                 "type with type variables (no types are made at run time)")
+    Core.println(Core.stderr, msg)
+    error(msg)
+end
+
 ## `Core.apply_type` and `new` of types known only at run time (see `reflection.jl`)
 
 """

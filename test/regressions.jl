@@ -113,6 +113,9 @@ const RG_TV_A = Tuple{T,Vararg{T}} where T
 const RG_TV_B = Tuple{Vararg{T}} where T<:Real
 const RG_TV_VALUES = Any[(1.0, 2.0), (1, 2.5), (1, 2), ("a", "b"), ()]
 rg_vt_typevar(i::Int) = (x = RG_TV_VALUES[i]; (x isa RG_TV_A, x isa RG_TV_B))
+# (of a tuple whose concrete type the module does not have, an object of `Tuple`: natively
+# `true`, the closed world's error here, as `typeof` of it)
+rg_vt_typevar_unknown(n::Int) = (x = rg_id(Any[tuple(collect(1:n)...)])[1]; (x isa RG_TV_A) + 2 * (x isa RG_TV_B))
 
 # singular values and symmetric eigenvalues of extreme magnitudes (scaled, as LAPACK does)
 rg_svd(x::Float64) = (s = svdvals([x 2x; 3x 4x]); (s[1] / x, s[2] / x, svdvals(fill(x, 1, 1))[1] / x))
@@ -390,6 +393,11 @@ const RG_HOLES = Vector{Any}(undef, 2)
     @wtest rg_vt_field(3); @wtest rg_vt_field(4)
     for i in 1:5
         @wtest rg_vt_typevar(i)
+    end
+    @test rg_vt_typevar_unknown(17) == 3
+    let r = wasm_run(wcompile(rg_vt_typevar_unknown, (Int,)), "rg_vt_typevar_unknown", 17; rettype=Int)
+        @test r isa Tuple && r[1] === :trap
+        @test occursin("isa of a tuple whose concrete type the module does not have", LAST_OUTPUT[])
     end
     @wtest rg_type_tuple(true); @wtest rg_type_tuple(false)
     @wtest rg_type_tuple_loop(1); @wtest rg_type_tuple_loop(2)
