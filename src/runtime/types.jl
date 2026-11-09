@@ -221,8 +221,9 @@ const LAYOUT_BITSEGAL = UInt64(4)       # `===` of its bits
 const LAYOUT_PADDING = UInt64(8)        # padding
 const LAYOUT_PRIMITIVE = UInt64(16)     # a primitive type (its size aligned, as a field)
 const LAYOUT_TUPLE = UInt64(32)         # an object of `Tuple`: its layout is its elements'
+const LAYOUT_VECELEMENT = UInt64(64)    # a `VecElement` of a primitive type of 2^k bytes
 layout_size(l::UInt64) = Int(l >> 32)
-layout_align(l::UInt64) = Int((l >> 8) & 0xff)
+layout_align(l::UInt64) = Int((l >> 8) & 0xffffff)
 
 "The layout of the type `T` (natively: the module's table of `type_layout`)."
 function layout_info(@nospecialize(T))
@@ -233,6 +234,8 @@ function layout_info(@nospecialize(T))
     Base.datatype_isbitsegal(T) && (f |= LAYOUT_BITSEGAL)
     Base.datatype_haspadding(T) && (f |= LAYOUT_PADDING)
     isprimitivetype(T) && (f |= LAYOUT_PRIMITIVE)
+    T <: VecElement && isprimitivetype(fieldtype(T, 1)) && ispow2(sizeof(fieldtype(T, 1))) &&
+        (f |= LAYOUT_VECELEMENT)
     return UInt64(sizeof(T)) << 32 | UInt64(Base.datatype_alignment(T)) << 8 | f
 end
 
@@ -289,12 +292,14 @@ end
 
 The layout of the concrete type of the tuple `t`, `Tuple{typeof.(t)...}`, as Julia's C runtime
 computes it (`jl_compute_field_offsets`, src/datatype.c): of its elements' layouts, each stored
-inline (aligned) or as a reference. (Not the stronger alignment of a tuple of `VecElement`s.)
+inline (aligned) or as a reference; a tuple of `VecElement`s of one type aligned as a vector
+(`jl_special_vector_alignment`).
 """
 function tuple_layout(t::Tuple)
     sz, alignm, maxfsz, lastoff = 0, 1, 0, 0
     pointerfree, bitsegal, padding = true, true, false
-    for i in 1:length(t)
+    n = length(t)
+    for i in 1:n
         l = elem_layout(t[i])
         if l & LAYOUT_INLINE != 0
             fsz, al = layout_size(l), layout_align(l)
@@ -319,6 +324,10 @@ function tuple_layout(t::Tuple)
         lastoff = sz
         sz += fsz
     end
+    if n > 0 && type_layout(t[1]) & LAYOUT_VECELEMENT != 0 && vector_elements(t)
+        # (the natural alignment of the vector, of its size)
+        alignm = max(alignm, nextpow(2, n * layout_size(type_layout(t[1]))))
+    end
     if sz % alignm != 0
         sz += alignm - sz % alignm
         padding = true
@@ -330,6 +339,16 @@ function tuple_layout(t::Tuple)
     bitsegal && (f |= LAYOUT_BITSEGAL)
     padding && (f |= LAYOUT_PADDING)
     return UInt64(sz) << 32 | UInt64(alignm) << 8 | f
+end
+
+# whether the elements of the tuple `t` are all of the type of its first
+function vector_elements(t::Tuple)
+    T = typeof(t[1])
+    for i in 2:length(t)
+        e = t[i]
+        (type_layout(e) & LAYOUT_TUPLE == 0 && typeof(e) === T) || return false
+    end
+    return true
 end
 
 """
@@ -391,8 +410,11 @@ function tuple_immut_id(t::Tuple, l::UInt64, h::UInt64)
             s = e::Tuple
             sl = tuple_layout(s)
             sl & LAYOUT_INLINE != 0 ? tuple_immut_id(s, sl, UInt64(0)) : objectid(s)
+        elseif el & LAYOUT_INLINE == 0
+            objectid(e)
         else
-            el & LAYOUT_INLINE != 0 ? tuple_elem(e, none, -1) : objectid(e)
+            # (of no size, as `Union{}`: `~0`; else by its type, `tuple_elem_as`)
+            layout_size(el) == 0 ? ~UInt64(0) : tuple_elem(e, none, -1)
         end
         h = bitmix(h, u)
     end
@@ -406,7 +428,7 @@ function tuple_bytes!(buf::Vector{UInt8}, off::Int, t::Tuple)
         l = type_layout(e)
         if l & LAYOUT_TUPLE != 0
             off = tuple_bytes!(buf, off, e::Tuple)
-        else
+        elseif layout_size(l) > 0
             tuple_elem(e, buf, off)
             off += layout_size(l)
         end

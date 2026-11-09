@@ -202,7 +202,14 @@ function at_objectid(i::Int)
             objectid(opaque((opaque(AtPad(Int8(i), i)), opaque(i)))),  # inline, with padding
             objectid(opaque((opaque(1.5), opaque(-0.0)))),
             objectid(opaque((opaque(:sym), opaque(i)))),
-            objectid(tuple(Any[unnamed(i), i, "z", (unnamed(i),)]...)))
+            objectid(tuple(Any[unnamed(i), i, "z", (unnamed(i),)]...)),
+            objectid(opaque((opaque(Union{}), opaque(i)))),            # an element of no size
+            objectid(opaque((opaque(Union{}),))),
+            objectid(opaque((opaque(VecElement(Float32(i))), opaque(VecElement(Float32(2i))),  # a vector: aligned
+                             opaque(VecElement(Float32(3i)))))),
+            objectid(opaque((opaque((opaque(VecElement(Float32(i))), opaque(VecElement(Float32(2i))))), opaque(Int32(i))))),
+            objectid(opaque((opaque(VecElement(1.0i)), opaque(VecElement(2.0i)), opaque(VecElement(3.0i)), opaque(VecElement(4.0i))))),
+            objectid(opaque((opaque(VecElement(Float32(i))), opaque(VecElement(Float32(2i))), opaque(Float32(i))))))
 end
 
 # `isa` against tuple types with bound type variables, natively by the types of the elements:
