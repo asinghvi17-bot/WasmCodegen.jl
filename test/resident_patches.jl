@@ -216,13 +216,16 @@ end
             write(script, """
                 include($(repr(joinpath(@__DIR__, "harness.jl"))))
                 latest(n::Int) = Base.invokelatest(identity, n)
+                build() = WasmCodegen.compile(latest, (Int,); config=test_config(trim_patches=false))
+                # (inferred before the installation, with the builtin: not the code compiled after it)
+                before = try build(); false catch e; e isa WasmCodegen.UnsupportedConstructs end
                 install_trim_patches!(patches=[$(repr(patch))])
-                c = WasmCodegen.compile(latest, (Int,); config=test_config(trim_patches=false))
-                print(repr((length(WasmCodegen.RESIDENT_OVERLAYS), wasm_run(c, "latest", 5; rettype=Int), latest(5),
-                            length(c.cgm.diagnostics))))
+                c = build()
+                print(repr((before, length(WasmCodegen.RESIDENT_OVERLAYS), wasm_run(c, "latest", 5; rettype=Int),
+                            latest(5), length(c.cgm.diagnostics))))
                 """)
             cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $script`
-            @test eval(Meta.parse(read(cmd, String))) == (0, 5, 5, 0)
+            @test eval(Meta.parse(read(cmd, String))) == (true, 0, 5, 5, 0)
         end
     end
 

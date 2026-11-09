@@ -13,10 +13,12 @@ defined in them, and how many are in force. Code inferred with other tables, or 
 was defined or deleted, is not reused, since that does not invalidate it (a caller that found
 the native method has no backedge to an overlay method table).
 
-Where patches are installed as overlays (`install_trim_patches!`, `resident_at`), also the world:
-those are looked up among the native methods, as the methods a session defines, and a caller that
-found one has no backedge to the native method table either (a native method defined since, more
-specific than the overlay, does not invalidate it). Code inferred in another world is not reused.
+In the worlds of an installation of patches (`install_trim_patches!`), also the world: the patches
+that are overlays are looked up among the native methods, as the methods a session defines, and a
+caller that found one has no backedge to the native method table either (a native method defined
+since, more specific than the overlay, does not invalidate it); and `Base.invokelatest` is a direct
+call there, which code inferred before the installation lacks. Code inferred in another world is
+not reused.
 """
 struct WasmCacheOwner
     tables::Tuple{Vararg{Core.MethodTable}}
@@ -34,7 +36,7 @@ function WasmCacheOwner(extensions=(), world::UInt=Base.get_world_counter())
             m.dispatch_status == 0 || (in_force += 1)
         end
     end
-    return WasmCacheOwner(Tuple(tables), defined, in_force, resident_at(world) ? world : typemin(UInt))
+    return WasmCacheOwner(Tuple(tables), defined, in_force, world >= RESIDENT_WORLD[] ? world : typemin(UInt))
 end
 
 """
