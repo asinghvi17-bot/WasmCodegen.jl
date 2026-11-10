@@ -340,6 +340,14 @@ function at_assert_concrete(i::Int)
         return e isa TypeError ? -1 : -2
     end
 end
+# (the types of its elements are types of the module with it, as tested by its elements they
+# would be: `typeof` of a tuple of one, built of unknown length, of a type no other code names)
+@noinline at_ints(n::Int) = opaque(tuple(collect(1:n)...))
+function at_isa_nested(n::Int)
+    x = at_ints(n)
+    return (x isa Tuple{NTuple{5,Int}}, x isa Tuple{Tuple{NTuple{6,Int}},String}, opaque(typeof(x)) <: Tuple)
+end
+at_isa_elements(n::Int) = at_ints(n) isa Tuple{Pair{NTuple{7,Int},Int},Tuple{Tuple{UInt8,Int16},Core.TypeofBottom}}
 # (of a large one, a table: not element by element)
 const AT_TABLE = Ref{Any}(ntuple(identity, 40))
 at_table(i::Int) = (AT_TABLE[]::NTuple{40,Int})[i]
@@ -369,6 +377,17 @@ at_table(i::Int) = (AT_TABLE[]::NTuple{40,Int})[i]
     for i in 1:4
         @wtest at_isa_concrete(i)
         @wtest at_assert_concrete(i)
+    end
+    @wtest at_isa_nested(5)
+    @wtest at_isa_nested(6)
+    @wtest at_isa_elements(2)
+    # (in the order of the test by elements: `Tuple`, each element's type after those of its own
+    # elements, of the type whose only object is a type, `Union{}`, that object)
+    let cgm = wcompile(at_isa_elements, (Int,)).cgm, I = NTuple{7,Int}, U = Tuple{UInt8,Int16}
+        @test filter(T -> T === Tuple || T isa DataType && (T <: Pair || T <: Tuple{Any,Vararg}), cgm.types.typelist) ==
+              [Tuple, Pair{I,Int}, U, Tuple{U,Core.TypeofBottom}, Tuple{Pair{I,Int},Tuple{U,Core.TypeofBottom}}]
+        bottom = haskey(cgm.image.globals, Union{})
+        @test bottom
     end
     @wtest at_table(7)
     let ops = [i.op for (mi, info) in wcompile(at_table, (Int,)).cgm.funcs

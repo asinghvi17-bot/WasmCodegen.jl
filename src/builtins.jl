@@ -1081,6 +1081,20 @@ leaf_bound(@nospecialize(L)) =
 may_be_tuple_object(@nospecialize(T)) = !isconcretetype(T) && may_hold_tuple_objects(T)
 may_hold_tuple_objects(@nospecialize(T)) =
     T isa TypeVar ? may_hold_tuple_objects(T.lb) : !(Tuple <: T) && has_tuple_members(T)
+# What the test of a concrete tuple type by its elements registers is registered where it is
+# tested by its type id alone too, in the same order: `Tuple`, then of each element what
+# `object_isa!` tests it against (the type id of its type, or the type object that is the only
+# object of it, `Union{}`), after its own elements'. So the module's types and objects are the
+# same, which the tables and the cases made of them follow (`typeof` of a tuple of an element's
+# type, built of unknown length).
+function register_tuple_elements!(cgm, @nospecialize(T))
+    T isa DataType && isconcretetype(T) && T.name === Tuple.name || return
+    typeid!(cgm.types, Tuple)
+    for P in T.parameters
+        register_tuple_elements!(cgm, P)
+        (X = type_singleton(P)) !== nothing ? object_global!(cgm.image, something(X)) : typeid!(cgm.types, P)
+    end
+end
 function has_tuple_members(@nospecialize(T))
     T isa TypeVar && return has_tuple_members(T.lb)
     T isa Union && return any(has_tuple_members, Base.uniontypes(T))
@@ -1353,7 +1367,10 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     end
     (lx.kind === Boxed && lx.wtype == fc.cgm.types.jlvalue) ||
         unsupported("isa(::", S, ", ", T, ")")
-    may_be_tuple_object(T) || return object_isa!(fc, x, T)
+    if !may_be_tuple_object(T)
+        register_tuple_elements!(fc.cgm, T)
+        return object_isa!(fc, x, T)
+    end
     # (or a tuple whose concrete type the module does not have: an object of `Tuple`, see
     # `tuple_canon_func!`, by its elements)
     res = new_val!(fc, Bool)
