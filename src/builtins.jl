@@ -1075,8 +1075,12 @@ leaf_bound(@nospecialize(L)) =
 
 # whether a value of `T` may be a tuple whose concrete type the module does not have (an object
 # of `Tuple`, see `tuple_canon_func!`), which is tested by its elements: of a type that may
-# hold tuples, but not every tuple (a free type variable: as natively, by its lower bound)
-may_be_tuple_object(@nospecialize(T)) = T isa TypeVar ? may_be_tuple_object(T.lb) : !(Tuple <: T) && has_tuple_members(T)
+# hold tuples, but not every tuple (a free type variable: as natively, by its lower bound).
+# (Not of a concrete tuple type itself: tested by its type id, `object_isa!`, it is a type of
+# the module, of which a tuple is an object of its own. A lower bound is not so tested.)
+may_be_tuple_object(@nospecialize(T)) = !isconcretetype(T) && may_hold_tuple_objects(T)
+may_hold_tuple_objects(@nospecialize(T)) =
+    T isa TypeVar ? may_hold_tuple_objects(T.lb) : !(Tuple <: T) && has_tuple_members(T)
 function has_tuple_members(@nospecialize(T))
     T isa TypeVar && return has_tuple_members(T.lb)
     T isa Union && return any(has_tuple_members, Base.uniontypes(T))

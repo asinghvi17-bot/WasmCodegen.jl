@@ -302,12 +302,47 @@ end
             opaque((opaque((unnamed(i),)),)) isa G, opaque((opaque((opaque(1.5),)),)) isa G,
             tuple(Any[(opaque(1.5),)]...) isa G, tuple(Any[(unnamed(i),)]...) isa G, opaque((opaque(i),)) isa G)
 end
+# (a concrete lower bound, of a type only the bound names: not one of the module's, so such a
+# tuple is an object of `Tuple`, tested by its elements)
+struct AtBound
+    a::Int
+end
+@noinline bound(i::Int) = Base.inferencebarrier(AtBound(i))
+@eval function at_free_concrete(i::Int)
+    F = $(Tuple{TypeVar(:T, Tuple{AtBound,AtBound}, Any)})
+    x = (bound(i), bound(i + 1))
+    return (tuple(Any[x]...) isa F, opaque((x,)) isa F, opaque((opaque((bound(i),)),)) isa F)
+end
 function at_isa_vararg(n::Int)
     t = tuple(Any[Int, opaque(n), unnamed(n)][1:n]...)
     return (t isa Union{Nothing,Tuple{DataType}}, t isa Tuple{Type{Int}}, t isa Tuple{DataType,Int},
             t isa Union{Tuple{Vararg{Type}},Nothing}, t isa Union{Missing,Tuple{DataType,Int,AtUnnamed}},
             t isa Tuple{Any,Vararg{Integer}})
 end
+# against a concrete tuple type, by the object's type id: a type the module has (the test names
+# it), so a tuple of it is an object of its own whatever built it, of elements of types known
+# only at run time, nested, of unknown length, or tested by a function compiled later
+@noinline at_late_isa(@nospecialize(x)) = x isa Tuple{Float64,Int,UInt8}
+function at_isa_concrete(i::Int)
+    t = opaque((pick(i), opaque(i)))                    # Tuple{Int,Int}, {String,Int}, {Nothing,Int}, {Float64,Int}
+    n = opaque((opaque((pick(i), i)), "s"))
+    v = opaque(tuple(Any[pick(i), i, 0x01][1:min(i, 3)]...))
+    return (t isa Tuple{Int,Int}, t isa Tuple{String,Int}, t isa Tuple{Nothing,Int}, t isa Tuple{Float64,Int},
+            t isa Tuple{Int,String}, n isa Tuple{Tuple{Int,Int},String}, n isa Tuple{Tuple{Float64,Int},String},
+            n isa Tuple{Tuple{Int,Int},Int}, v isa Tuple{Int}, v isa Tuple{String,Int}, v isa Tuple{Nothing,Int,UInt8},
+            v isa Tuple{Int,Int}, at_late_isa(v), at_late_isa(t))
+end
+function at_assert_concrete(i::Int)
+    t = opaque((pick(i), opaque(i)))
+    try
+        return (t::Tuple{Float64,Int})[2] + (opaque((t, t))::Tuple{Tuple{Float64,Int},Tuple{Float64,Int}})[1][2]
+    catch e
+        return e isa TypeError ? -1 : -2
+    end
+end
+# (of a large one, a table: not element by element)
+const AT_TABLE = Ref{Any}(ntuple(identity, 40))
+at_table(i::Int) = (AT_TABLE[]::NTuple{40,Int})[i]
 
 @testset "tuples of abstract type" begin
     for i in 1:4
@@ -331,6 +366,15 @@ end
     for n in 1:3
         @wtest at_isa_vararg(n)
     end
+    for i in 1:4
+        @wtest at_isa_concrete(i)
+        @wtest at_assert_concrete(i)
+    end
+    @wtest at_table(7)
+    let ops = [i.op for (mi, info) in wcompile(at_table, (Int,)).cgm.funcs
+               if mi.def isa Method && mi.def.name === :at_table for i in info.func.body]
+        @test !isempty(ops) && count(==(:array_get), ops) < 40
+    end
     @wtest at_largevec(3)
     @wtest at_largevec(16384)
     for n in (0, 1, 2, 17)
@@ -348,6 +392,7 @@ end
         @wtest at_union_bound(i)
         @wtest at_shape_false(i)
         @wtest at_free_lower(i)
+        @wtest at_free_concrete(i)
     end
     for n in 0:4
         @wtest at_diag_vararg(n)
