@@ -23,12 +23,18 @@ The configuration of the code generator:
   `:julia_io`, the host's events (`sleep` on its timers: `Runtime.Host`) and its file modes
   and symbolic links of any target for the filesystem (`js/julia_io.mjs`; waiting needs
   JavaScript Promise Integration);
-- `import_libraries`: libraries whose functions the host provides, declared by the program
-  (`host = :wasi` only): a `ccall((:name, "lib"), RT, (ArgT...), args...)` of one is a call
-  of the Wasm import `lib.name`, with 32- and 64-bit integer arguments and result (or `Cvoid`
-  for none). The code generator neither specifies nor provides these functions: they are the
-  program's interface with a host of its own. The names WasmCodegen uses for its own
-  imports (`wasi_snapshot_preview1`, `julia` and `julia_*`) cannot be declared;
+- `import_libraries`: libraries whose functions the host provides, declared by the program:
+  a `ccall((:name, "lib"), RT, (ArgT...), args...)` of one is a call of the Wasm import
+  `lib.name`, with 32- and 64-bit integer arguments and result (or `Cvoid` for none). An
+  argument may also be bytes, a `Vector{UInt8}`, `String` or `Memory{UInt8}`: they are copied
+  to the linear memory (exported as `memory`), and the import gets two `i32`s, their offset
+  and length (`host.bytes(offset, length)` of `js/julia.mjs`), valid until it returns: a copy,
+  in one direction (natively a `ccall` passes the array itself, whose bytes a C function may
+  write; what the import writes there, the program does not see). The code generator neither
+  specifies nor provides these functions: they are the program's interface with a host of its
+  own. The names WasmCodegen uses for its own imports (`wasi_snapshot_preview1`, `julia` and
+  `julia_*`) cannot be declared, and with them, as for WASI, entry points cannot be named
+  `memory` or `_initialize`;
 - `foreign_functions`: C functions the program implements in Julia, as `(name, library) => f`:
   a `ccall((name, library), ...)` naming that library (a constant string) is a call of `f` (the
   value given, in the image; also for a library of `import_libraries`) with the call's
