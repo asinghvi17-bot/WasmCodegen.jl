@@ -1143,17 +1143,12 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
                  all(i -> lv.leaves[i].type == lt.leaves[i].type, eachindex(lt.leaves)))
                 # tuples of different representations of their elements (an element of a
                 # union and one of its types): element by element
-                (v.typ <: Tuple && T <: Tuple && !Base.isvatuple(v.typ) && !Base.isvatuple(T) &&
-                 fieldcount(v.typ) == fieldcount(T)) || return no_conversion!(fc, v.typ, T)
-                leaves = LeafVal[]
-                for i in 1:fieldcount(T)
-                    e = convert_repr(fc, get_field(fc, v, i), fieldtype(T, i))
-                    e.kind === Bottom && return e
-                    append!(leaves, e.leaves)
-                end
-                return CGVal(T, Inline, leaves)
+                return convert_tuple_elements(fc, v, T)
             end
             return CGVal(T, Inline, v.leaves, v.constant, v.origin)
+        elseif lv.kind === Ghost
+            # a tuple of singletons as a tuple with elements of unions of them
+            return convert_tuple_elements(fc, v, T)
         elseif lv.kind === Boxed && lv.elements !== nothing
             # a tuple of unknown length (an array) as a tuple of known length: its elements
             leaves = LeafVal[]
@@ -1205,6 +1200,20 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
             return no_conversion!(fc, v.typ, T)
         end
     end
+end
+
+# the tuple `v` as a tuple of type `T`, of another representation of its elements: each element
+# in the representation of `T`'s
+function convert_tuple_elements(fc::FnCtx, v::CGVal, @nospecialize(T))
+    (v.typ <: Tuple && T <: Tuple && !Base.isvatuple(v.typ) && !Base.isvatuple(T) &&
+     fieldcount(v.typ) == fieldcount(T)) || return no_conversion!(fc, v.typ, T)
+    leaves = LeafVal[]
+    for i in 1:fieldcount(T)
+        e = convert_repr(fc, get_field(fc, v, i), fieldtype(T, i))
+        e.kind === Bottom && return e
+        append!(leaves, e.leaves)
+    end
+    return CGVal(T, Inline, leaves)
 end
 
 # the tuple-array object `v` (of a tuple type of unknown length) as an object of the large

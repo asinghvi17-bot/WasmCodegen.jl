@@ -831,14 +831,17 @@ function emit_egal!(fc::FnCtx, a::CGVal, b::CGVal)
         g, o = la.kind === Ghost ? (a, b) : (b, a)
         lo = layout(fc, o.typ)
         if is_vararg_tuple(o.typ) && lo.kind === Boxed && lo.elements !== nothing && g.typ === Tuple{}
-            # a tuple of unknown length (an array object) is `()` iff it is empty (other
-            # singleton tuples, `(nothing,)`, are not compared: unsupported below)
+            # a tuple of unknown length (an array object) is `()` iff it is empty
             push_val!(fc, o)
             emit!(fc.b, :struct_get, lo.wtype, DATA_FIELD)
             emit_memory_length!(fc, lo.elements)
             emit!(fc.b, :i32_eqz)
             return pop_val!(fc, Bool)
         end
+        # a tuple of singletons against a tuple with elements of unions of them: element by
+        # element (of unknown length, an array object: by `jl_egal`)
+        lo.kind === Inline && o.typ <: Tuple && return egal_elements!(fc, a, b)
+        lo.elements !== nothing && return egal_any!(fc, a, b)
         lo.kind === Boxed && lo.wtype == fc.cgm.types.jlvalue ||
             unsupported("=== of ", Ta, " and ", Tb)
         push_val!(fc, o)
@@ -874,6 +877,19 @@ function emit_egal!(fc::FnCtx, a::CGVal, b::CGVal)
     end
     # values whose types are known only at run time: compared by the module's own `jl_egal`
     return egal_any!(fc, a, b)
+end
+
+# `a === b` of tuples of the same length: each of their elements is
+function egal_elements!(fc::FnCtx, a::CGVal, b::CGVal)
+    es = CGVal[emit_egal!(fc, get_field(fc, a, i), get_field(fc, b, i)) for i in 1:fieldcount(a.typ)]
+    any(e -> isconstant(e) && !constant_value(e), es) && return const_value(fc, false)
+    filter!(!isconstant, es)
+    isempty(es) && return const_value(fc, true)
+    for (k, e) in enumerate(es)
+        push_val!(fc, e)
+        k > 1 && emit!(fc.b, :i32_and)
+    end
+    return pop_val!(fc, Bool)
 end
 
 function egal_any!(fc::FnCtx, a::CGVal, b::CGVal)
