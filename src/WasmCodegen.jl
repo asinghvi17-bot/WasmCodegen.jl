@@ -76,10 +76,13 @@ include("types_runtime.jl")
 include("patches.jl")
 include("driver.jl")
 
-export compile, Entry, Config, UnsupportedConstructs
+export compile, Entry, Config, UnsupportedConstructs, install_trim_patches!
 
 function __init__()
     COMPILER_WORLD[] = Base.get_world_counter()
+    # (a system image's: by the worlds of the process that made it)
+    empty!(RESIDENT_STANDINS)
+    RESIDENT_PATCH_MODULE[] === nothing || (RESIDENT_WORLD[] = typemin(UInt))
     Runtime.BUILD_JLOPTIONS[] = Runtime.sanitized_jloptions()
 end
 
