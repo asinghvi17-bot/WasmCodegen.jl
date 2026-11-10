@@ -240,7 +240,7 @@ dropped).
 """
 function emit_cfop!(fc::FnCtx, op::IRStructurizer.TryOp, @nospecialize(typ))
     rtypes = result_types(typ)
-    results = CGVal[result_val!(fc, fc.opidx, i, rtypes[i]) for i in eachindex(rtypes)]
+    results = FlowVal[result_val!(fc, fc.opidx, i, rtypes[i]) for i in eachindex(rtypes)]
     catches = op.handler !== nothing && fc.cgm.exceptions !== :none
     cgm = fc.cgm
     if catches

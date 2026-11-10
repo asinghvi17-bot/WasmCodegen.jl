@@ -244,7 +244,10 @@ As in JuliaCodegen (and Julia's code generator), a value's representation follow
 One exception, for an element at a run-time index of an inline tuple of mixed concrete
 types (`t[k]`, as `string` and `print` read their arguments), which is of a union: where it
 is only tested with `isa` and narrowed, it is *split*, a tag (which member it is) and a value
-of each member, assigned by the field the index selects, and never boxed.
+of each member, assigned by the field the index selects, and never boxed. A loop's carry or
+an `if`'s result that such an element flows into (`for x in t`) is held the same way, where
+it too is only tested, narrowed or passed on to another, and every other value that flows
+into it is of a member type.
 
 Primitives: 8/16/32-bit integers, `Bool`, `Char` (its bits) are `i32`, kept zero-extended
 (masked after arithmetic, sign-extended where signedness matters); 64-bit `i64`; floats
