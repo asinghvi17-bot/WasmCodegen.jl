@@ -1,6 +1,11 @@
 # WasmCodegen.jl
 
 [![CI](https://github.com/gbaraldi/WasmCodegen.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/gbaraldi/WasmCodegen.jl/actions/workflows/CI.yml)
+[![Examples](https://github.com/gbaraldi/WasmCodegen.jl/actions/workflows/Pages.yml/badge.svg)](https://gbaraldi.github.io/WasmCodegen.jl/)
+
+**[Live examples](https://gbaraldi.github.io/WasmCodegen.jl/)**: pages that run compiled Julia in
+the browser (ODE solvers, a ModelingToolkit model, Julia's parser, image filters), built from
+`main`.
 
 A compiler from Julia to WebAssembly with garbage collection (WasmGC), working like
 `juliac --trim`. From entry points, it collects the closed world of code they can run,
