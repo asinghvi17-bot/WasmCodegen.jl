@@ -5,6 +5,13 @@ swaps(a::UInt16, b::UInt32, c::UInt64, d::Int32) = (bswap(a), bswap(b), bswap(c)
 swapf32(x::Float32) = ntoh(x)
 swapf64(x::Float64) = hton(x)
 swapf16(x::Float16) = bswap(x)
+# the same on the bits (integers in and out, so no float crosses the JS boundary, which may canonicalize NaNs)
+swapbits32(u::UInt32) = reinterpret(UInt32, ntoh(reinterpret(Float32, u)))
+swapbits64(u::UInt64) = reinterpret(UInt64, hton(reinterpret(Float64, u)))
+swapbits16(u::UInt16) = reinterpret(UInt16, bswap(reinterpret(Float16, u)))
+roundtrip32(u::UInt32) = reinterpret(UInt32, hton(ntoh(reinterpret(Float32, u))))
+roundtrip64(u::UInt64) = reinterpret(UInt64, ntoh(hton(reinterpret(Float64, u))))
+roundtrip16(u::UInt16) = reinterpret(UInt16, bswap(bswap(reinterpret(Float16, u))))
 # a float read from a message of the big-endian formats, in a Union
 function msg_number(tag::UInt8, payload::UInt64)
     bytes = UInt8[tag]
@@ -62,6 +69,33 @@ divs(a::Int, b::Int) = (div(a, b), rem(a, b))
     end
     @wtest swapf16(Float16(1.5))
     @wtest swapf16(reinterpret(Float16, 0x1234))
+    # bitwise: NaNs (quiet, signalling, with payloads: some swap to NaNs too), ±0, subnormals, the extremes
+    for u in (0x7fc0c07f, 0x7fa0a07f, 0x0000c07f, 0x0000a07f, 0x0000c0ff, 0x7fc00000, 0xffc00001,
+              0x7f800001, 0x7f800000, 0xff800000, 0x00000000, 0x80000000, 0x00000001, 0x80000001,
+              0x007fffff, 0x807fffff, 0x00800000, 0x7f7fffff, 0x3fc00000)
+        @wtest swapbits32(u)
+        @wtest roundtrip32(u)
+        @test roundtrip32(u) === u
+    end
+    for u in (0xfff8f0f0f0f0f8ff, 0x7ff8f0f0f0f0f87f, 0x7ff4f0f0f0f0f47f, 0x7ff8000000000001,
+              0x000000000000f87f, 0x000000000000f47f, 0x000000000000f8ff, 0x7ff0000000000001, 0xfff8000000000000,
+              0x7ff0000000000000, 0xfff0000000000000, 0x0000000000000000, 0x8000000000000000,
+              0x0000000000000001, 0x8000000000000001, 0x000fffffffffffff, 0x800fffffffffffff,
+              0x0010000000000000, 0x7fefffffffffffff, 0x3ff8000000000000)
+        @wtest swapbits64(u)
+        @wtest roundtrip64(u)
+        @test roundtrip64(u) === u
+    end
+    for u in (0x7e00, 0x7d00, 0x007e, 0x007d, 0x00fe, 0x7e7e, 0x7c01, 0xfe00, 0x7c00, 0xfc00,
+              0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x7bff, 0x3e00, 0x3412)
+        @wtest swapbits16(u)
+        @wtest roundtrip16(u)
+        @test roundtrip16(u) === u
+    end
+    # (the swaps that are NaNs themselves, so that a NaN result is checked by its bits)
+    @test isnan(reinterpret(Float32, swapbits32(0x0000c07f))) && isnan(reinterpret(Float32, swapbits32(0x7fc0c07f)))
+    @test isnan(reinterpret(Float64, swapbits64(0x7ff8f0f0f0f0f87f))) && isnan(reinterpret(Float16, swapbits16(0x007e)))
+    @test swapbits32(0x00000000) === 0x00000000 && swapbits32(0x80000000) === 0x00000080
     @wtest msg_number(0xca, 0x3fc0000000000000)
     @wtest msg_number(0xcb, 0x400921fb54442d18)
     @wtest msg_number(0x07, 0x0000000000000000)
