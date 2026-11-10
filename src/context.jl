@@ -166,8 +166,8 @@ the loop itself), and the locals of its carried values and results.
 struct LoopTarget
     exit::Int
     cont::Int
-    carries::Vector{CGVal}
-    results::Vector{CGVal}
+    carries::Vector{FlowVal}
+    results::Vector{FlowVal}
 end
 
 """
@@ -178,7 +178,7 @@ results (which a `LeaveOp` assigns before branching there).
 """
 struct TryTarget
     exit::Int
-    results::Vector{CGVal}
+    results::Vector{FlowVal}
 end
 
 """
@@ -194,12 +194,12 @@ mutable struct FnCtx
     b::Builder
     args::Vector{CGVal}
     ssavals::Dict{Int,Any}
-    blockargs::Dict{Int,CGVal}
+    blockargs::Dict{Int,FlowVal}
     loops::Vector{LoopTarget}
     "The number of labels (blocks, loops, ifs) enclosing the current position."
     depth::Int
     "The results of the enclosing ifs, which `YieldOp`s assign (bottom: not assigned)."
-    yields::Vector{Vector{CGVal}}
+    yields::Vector{Vector{FlowVal}}
     "The types of the SSA values of the structured IR."
     ssatypes::Dict{Int,Any}
     "The block arguments (loop carries) that are read somewhere."
@@ -226,8 +226,8 @@ mutable struct FnCtx
 end
 
 FnCtx(cgm::CGModule, info::FuncInfo, sci, b::Builder, args::Vector{CGVal}=CGVal[]) =
-    FnCtx(cgm, info, sci, b, args, Dict{Int,Any}(), Dict{Int,CGVal}(), LoopTarget[], 0,
-          Vector{CGVal}[], Dict{Int,Any}(), Set{Int}(), Uses(), Bool[], 0, TryTarget[],
+    FnCtx(cgm, info, sci, b, args, Dict{Int,Any}(), Dict{Int,FlowVal}(), LoopTarget[], 0,
+          Vector{FlowVal}[], Dict{Int,Any}(), Set{Int}(), Uses(), Bool[], 0, TryTarget[],
           Dict{Int,CGVal}(), Dict{Int,Int}(), Dict{Int,NTuple{4,Int}}(),
           Dict{Tuple{Int,StorageType},NTuple{4,Int}}(), Dict{Vector{Int},Int}())
 

@@ -687,29 +687,29 @@ function for_field_at!(f, fc::FnCtx, idx::CGVal, n::Int)
 end
 
 """
-    emit_split_field!(fc, ex, typ) -> Union{CGVal,SplitUnion}
+    emit_split_field!(fc, ex, typ, ms) -> Union{CGVal,SplitUnion}
 
 The statement `getfield(x, i)` of `analyze_split_unions!`, of the union of concrete types
-`typ`: for an inline tuple `x` of concrete element types, a `SplitUnion` (each field assigns
-the value of its member and the tag); otherwise the field as `emit_stmt!` has it.
+`typ`, a split union of the members `ms`: of the inline tuple `x` of concrete element types
+(each field assigns the value of its member and the tag); where the index is known, that
+field as a split union.
 """
-function emit_split_field!(fc::FnCtx, ex::Expr, @nospecialize(typ))
+function emit_split_field!(fc::FnCtx, ex::Expr, @nospecialize(typ), ms::Vector{Any})
     x, i = operand(fc, ex.args[2]), operand(fc, ex.args[3])
-    (x isa CGVal && i isa CGVal && !isconstant(i) && i.typ !== Symbol) || return emit_stmt!(fc, ex, typ)
-    T = x.typ
-    ms = Base.uniontypes(typ)
-    (T isa DataType && T <: Tuple && !Base.isvatuple(T) && isconcretetype(T) &&
+    T = x isa CGVal ? x.typ : nothing
+    (i isa CGVal && !isconstant(i) && i.typ !== Symbol &&
+     T isa DataType && T <: Tuple && !Base.isvatuple(T) && isconcretetype(T) &&
      layout(fc, T).kind === Inline && fieldcount(T) > 0 &&
-     all(k -> any(M -> M === fieldtype(T, k), ms), 1:fieldcount(T))) || return emit_stmt!(fc, ex, typ)
+     all(k -> any(M -> M === fieldtype(T, k), ms), 1:fieldcount(T))) ||
+        return as_split!(fc, emit_stmt!(fc, ex, typ), ms)
     idx = checked_field_index!(fc, x, i)
-    tag = new_local!(fc, I32)
-    vals = CGVal[new_val!(fc, M) for M in ms]
+    s = new_split!(fc, typ, ms)
     for_field_at!(fc, idx, fieldcount(T)) do k
         m = findfirst(M -> M === fieldtype(T, k), ms)
-        emit!(fc.b, :i32_const, m); emit!(fc.b, :local_set, tag)
-        assign!(fc, vals[m], get_field(fc, x, k))
+        emit!(fc.b, :i32_const, m); emit!(fc.b, :local_set, s.tag::Int)
+        assign!(fc, s.vals[m], get_field(fc, x, k))
     end
-    return SplitUnion(typ, ms, tag, vals)
+    return s
 end
 
 # the index of the field of `T` named by the symbol `s` (an Int), 0 if there is none
@@ -1323,7 +1323,7 @@ function emit_isa!(fc::FnCtx, x::SplitUnion, @nospecialize(T))
     isempty(hits) && return const_value(fc, false)
     length(hits) == length(possible) && return const_value(fc, true)
     for (j, m) in enumerate(hits)
-        emit!(fc.b, :local_get, x.tag); emit!(fc.b, :i32_const, m); emit!(fc.b, :i32_eq)
+        push_leaf!(fc, x.tag); emit!(fc.b, :i32_const, m); emit!(fc.b, :i32_eq)
         j > 1 && emit!(fc.b, :i32_or)
     end
     return pop_val!(fc, Bool)
