@@ -314,6 +314,52 @@ const RG_HOLES = Vector{Any}(undef, 2)
 @eval @noinline rg_holes_get(x::Float64) = (RG_SINK[] = x; $RG_HOLES)
 @noinline rg_holes_len(t::Tuple{Vector{Any}}) = length(t[1])
 @eval rg_holes(x::Float64) = (v = rg_holes_get(x); (length(v), isassigned(v, 1), rg_holes_len($((RG_HOLES,)))))
+# a tuple of singletons as a tuple with elements of unions of them: a field, an element of an
+# array, an element of another tuple
+struct RGDims
+    inner::Tuple{Union{Nothing,Float32},Union{Nothing,Float32}}
+    n::Int
+end
+const RG_DIMS = Ref(RGDims((1.0f0, 2.0f0), 0))
+function rg_singleton_tuple(n::Int)
+    RG_DIMS[] = RGDims((nothing, nothing), n)
+    d = RG_DIMS[]
+    a = Tuple{Union{Nothing,Float32},Union{Missing,Int}}[(1.0f0, n)]
+    push!(a, (nothing, missing))
+    t = Tuple{Tuple{Union{Nothing,Int},Union{Nothing,Int}},Int}[((n, nothing), 1)]
+    t[1] = ((nothing, nothing), n)
+    return (d.inner[1] === nothing, d.inner[2] === nothing, d.n, d.inner === (nothing, nothing),
+            a[n][1] === nothing, a[n][2] === missing, a[n] === (nothing, missing), a[1][2] === n,
+            t[1][1][1] === nothing, t[1][2])
+end
+# (and compared with a tuple of unknown length, in both orders)
+const RG_SINGLETONS = Ref{Tuple{Vararg{Union{Nothing,Float32}}}}((nothing, nothing))
+function rg_singleton_vararg(n::Int)
+    if n == 1
+        RG_SINGLETONS[] = (nothing, nothing)
+    elseif n == 2
+        RG_SINGLETONS[] = (nothing, 1.0f0)
+    elseif n == 3
+        RG_SINGLETONS[] = (nothing,)
+    else
+        RG_SINGLETONS[] = ()
+    end
+    t = RG_SINGLETONS[]
+    return (t === (nothing, nothing), (nothing, nothing) === t, t === (nothing,), (nothing,) === t, t === ())
+end
+# (and with nested tuples of more types than a tuple of unions is an object of: element by element)
+const RG_NESTED = Ref{NTuple{5,Tuple{Union{Nothing,Int}}}}(ntuple(_ -> (nothing,), 5))
+function rg_singleton_nested(n::Int)
+    s = ((nothing,), (nothing,), (nothing,), (nothing,), (nothing,))
+    if n == 1
+        RG_NESTED[] = s
+    else
+        RG_NESTED[] = ((nothing,), (nothing,), (n,), (nothing,), (nothing,))
+    end
+    t = RG_NESTED[]
+    return (t === s, s === t, t[3] === (nothing,), (nothing,) === t[1])
+end
+
 @testset "regressions" begin
     @wtest rg_unionfield(true, true)
     @wtest rg_unionfield(false, false)
@@ -424,4 +470,9 @@ const RG_HOLES = Vector{Any}(undef, 2)
     end
     @wtest rg_triple(1.5)
     @wtest rg_holes(1.5)
+    @wtest rg_singleton_tuple(1); @wtest rg_singleton_tuple(2)
+    for n in 1:4
+        @wtest rg_singleton_vararg(n)
+    end
+    @wtest rg_singleton_nested(1); @wtest rg_singleton_nested(2)
 end

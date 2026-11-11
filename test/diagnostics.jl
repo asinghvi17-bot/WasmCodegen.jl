@@ -97,13 +97,13 @@ end
     fc = WasmCodegen.FnCtx(c.cgm, info, nothing, WasmBuilder.Builder(c.cgm.mod, info.func))
     stmt = Expr(:invoke, instance(B.id, B.big()), Core.Argument(2))
     err = try
-        WasmCodegen.convert_result(fc, WasmCodegen.ghost(Tuple{Nothing}, (nothing,)), stmt, Tuple{Union{Nothing,Int}})
+        WasmCodegen.convert_result(fc, WasmCodegen.CGVal(Nothing, WasmCodegen.Ghost, WasmCodegen.LeafVal[]), stmt, Any)
     catch e
         e
     end
     @test err isa WasmCodegen.Unsupported
     msg = sprint(showerror, err)
-    @test occursin("a conversion from Tuple{Nothing} to Tuple{Union{Nothing, Int64}}", msg)
+    @test occursin("boxing the ghost Nothing without its value", msg)
     @test occursin("in the result of :(\$(Expr(:invoke, MethodInstance for ", msg) && occursin("id(::", msg)
     @test sizeof(msg) < 3maxlen
 end
