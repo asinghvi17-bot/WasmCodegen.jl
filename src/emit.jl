@@ -154,9 +154,11 @@ function emit_function!(cgm::CGModule, info::FuncInfo)
     analyze_ptr_carries!(fc, sci.entry)
     analyze_split_unions!(fc, sci.entry)
     bind_arguments!(fc)
+    bind_ptr_views!(fc)
     bind_handler_args!(fc, sci.entry)
     emit_block!(fc, sci.entry)
     is_unreachable(b) || unreachable!(b)
+    entry_ptr_views!(fc)
     finish!(b)
     return info
 end
@@ -305,7 +307,7 @@ end
 
 function const_global(world::UInt, m::Module, s::Symbol)
     Base.invoke_in_world(world, isconst, m, s) || return nothing
-    return Some(Base.invoke_in_world(world, getglobal, m, s))
+    return Some{Any}(Base.invoke_in_world(world, getglobal, m, s))
 end
 
 "The result `res` of the statement `stmt` in the representation of its type `typ`."
@@ -384,27 +386,70 @@ function emit_terminator!(fc::FnCtx, @nospecialize(term))
     end
 end
 
-# assign values to locals, evaluating all values before assigning (a value may read a
-# local that is assigned)
-# assign the values `vals` to the destinations `dsts` (as one parallel assignment); an
+# assign the values `vals` to the destinations `dsts` (as one parallel assignment: every
+# value is evaluated before any is assigned, a value may read a local that is assigned); an
 # undefined value leaves its destination as it is (it is not read), and a bottom
 # destination is an aliased result, not assigned
-function assign_all!(fc::FnCtx, dsts::Vector{CGVal}, vals)
+function assign_all!(fc::FnCtx, dsts::Vector{FlowVal}, vals)
     pairs = [(d, v) for (d, v) in zip(dsts, vals)
-             if d.kind !== Bottom && !(v isa IRStructurizer.Undef) && !same_locals(fc, d, v)]
-    srcs = CGVal[convert_repr(fc, operand(fc, v), d.typ) for (d, v) in pairs]
+             if !(d isa CGVal && d.kind === Bottom) && !(v isa IRStructurizer.Undef) && !same_locals(fc, d, v)]
+    srcs = FlowVal[flow_source!(fc, operand(fc, v), d) for (d, v) in pairs]
     for (s, (d, _)) in zip(srcs, pairs)
+        if s isa SplitUnion
+            # the tag, and the value of each member it may be
+            push_leaf!(fc, s.tag)
+            foreach(m -> push_val!(fc, s.vals[m]), possible_members(s))
+            continue
+        end
         s.kind === Bottom && continue
         push_val!(fc, s)
         d.origin === nothing || push_origin_index!(fc, d.origin, s)
     end
     for i in reverse(eachindex(pairs))
-        srcs[i].kind === Bottom && continue
-        d = pairs[i][1]
+        s, d = srcs[i], pairs[i][1]
+        if s isa SplitUnion
+            foreach(m -> pop_to!(fc, d.vals[m]), reverse(possible_members(s)))
+            emit!(fc.b, :local_set, d.tag::Int)
+            continue
+        end
+        s.kind === Bottom && continue
         d.origin === nothing || emit!(fc.b, :local_set, d.origin.index::Int)
         pop_to!(fc, d)
     end
 end
+
+# the value `v` as the destination `d` holds it: in the representation of its type, or as
+# a split union of its members
+function flow_source!(fc::FnCtx, @nospecialize(v), d::FlowVal)
+    d isa SplitUnion && return as_split!(fc, v, d.members)
+    v isa CGVal || unsupported("a split union as a value of type ", d.typ)
+    return convert_repr(fc, v, d.typ)
+end
+
+# the members a split union may be: those of its type
+possible_members(s::SplitUnion) = findall(M -> M <: s.typ, s.members)
+
+# new locals for a split union of type `T`, of the members `ms`
+new_split!(fc::FnCtx, @nospecialize(T), ms::Vector{Any}) =
+    SplitUnion(T, ms, new_local!(fc, I32), CGVal[new_val!(fc, M) for M in ms])
+
+# the value `v` as a split union of the members `ms`: one already, or a value of a member
+# (the tag is a constant, the other members have no value)
+function as_split!(fc::FnCtx, @nospecialize(v), ms::Vector{Any})
+    if v isa SplitUnion
+        v.members == ms || unsupported("a split union of ", v.members, " as one of ", ms)
+        return v
+    end
+    v isa CGVal || unsupported("the results of a control flow operation as a value")
+    v.kind === Bottom && return v
+    m = findfirst(M -> M === v.typ, ms)
+    m === nothing && unsupported("a value of type ", v.typ, " as a split union of ", ms)
+    return SplitUnion(v.typ, ms, Inst(:i32_const, m), CGVal[k == m ? v : undef_val(fc, ms[k]) for k in eachindex(ms)])
+end
+
+# the members of the split union the value `key` is (an SSA value's id, `(:arg, id)` for a
+# block argument, `(:res, op, i)` for a result of a control flow operation), or nothing
+split_members(fc::FnCtx, @nospecialize(key)) = get(fc.uses.split, key, nothing)
 
 # push the byte offset of the pointer `s` into the array of the origin `o` of a carry: that of
 # its own origin into the same array, else the low bits of its address (it points into the same object)
@@ -430,7 +475,8 @@ function emit_stmt_or_trap!(fc::FnCtx, @nospecialize(stmt), @nospecialize(typ), 
     inits = copy(fc.b.inits)
     depth = fc.depth
     try
-        idx in fc.uses.splitunions && return emit_split_field!(fc, stmt, typ)
+        ms = get(fc.uses.splitfields, idx, nothing)
+        ms === nothing || return emit_split_field!(fc, stmt, typ, ms)
         return emit_stmt!(fc, stmt, typ)
     catch err
         err isa Unsupported || rethrow()
@@ -458,12 +504,13 @@ end
 
 function emit_cfop!(fc::FnCtx, op::IRStructurizer.IfOp, @nospecialize(typ))
     rtypes = result_types(typ)
+    opidx = fc.opidx
     # a result that both arms yield as the same value (or one of them as undefined) is
     # that value: no locals, no copies (Wasm locals live in the whole function, and on the
     # undefined arm the result is not read)
-    aliases = Any[if_alias(fc, op, i, rtypes[i]) for i in eachindex(rtypes)]
-    results = CGVal[aliases[i] === nothing ? result_val!(fc, fc.opidx, i, rtypes[i]) : bottom()
-                    for i in eachindex(rtypes)]
+    aliases = Any[if_alias(fc, op, opidx, i, rtypes[i]) for i in eachindex(rtypes)]
+    results = FlowVal[aliases[i] === nothing ? result_val!(fc, opidx, i, rtypes[i]) : bottom()
+                      for i in eachindex(rtypes)]
     c = convert_repr(fc, operand(fc, op.condition), Bool)
     if isconstant(c)
         # a branch on a constant: only one arm
@@ -486,14 +533,23 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.IfOp, @nospecialize(typ))
         a === nothing && continue
         # (defined in an arm that does not complete: no value, the result is not read)
         v = a isa Core.SSAValue && !haskey(fc.ssavals, a.id) ? undef_val(fc, rtypes[i]) : operand(fc, a)
-        results[i] = v isa CGVal && v.kind !== Bottom ? convert_repr(fc, v, rtypes[i]) : undef_val(fc, rtypes[i])
+        ms = split_members(fc, (:res, opidx, i))
+        results[i] = if ms !== nothing
+            # (a split union: the same locals, as the result's type)
+            v isa SplitUnion ? SplitUnion(rtypes[i], v.members, v.tag, v.vals) : new_split!(fc, rtypes[i], ms)
+        elseif v isa CGVal && v.kind !== Bottom
+            convert_repr(fc, v, rtypes[i])
+        else
+            undef_val(fc, rtypes[i])
+        end
     end
     return MultiVal(results)
 end
 
-# the value the result `i` of an if is, when every arm that yields it yields that one
-# value or undefined, and the value has the representation of the result's type
-function if_alias(fc::FnCtx, op::IRStructurizer.IfOp, i::Int, @nospecialize(T))
+# the value the result `i` of the if `opidx` is, when every arm that yields it yields that
+# one value or undefined, and the value has the representation of the result's type (of a
+# result that is a split union: is one too)
+function if_alias(fc::FnCtx, op::IRStructurizer.IfOp, opidx::Int, i::Int, @nospecialize(T))
     # (a yielded value may be `nothing` itself: whether one was found is a flag)
     found = false
     v = nothing
@@ -509,6 +565,10 @@ function if_alias(fc::FnCtx, op::IRStructurizer.IfOp, i::Int, @nospecialize(T))
         end
     end
     found || return nothing
+    if split_members(fc, (:res, opidx, i)) !== nothing
+        k = v isa Core.SSAValue ? v.id : v isa IRStructurizer.BlockArgument ? (:arg, v.id) : nothing
+        return k !== nothing && split_members(fc, k) !== nothing ? v : nothing
+    end
     S = static_type(fc, v)
     S === nothing && return nothing
     return same_repr(fc, S, T) ? v : nothing
@@ -535,6 +595,11 @@ function same_locals(fc::FnCtx, d::CGVal, @nospecialize(v))
     v isa Core.SSAValue && haskey(fc.ssavals, v.id) || return false
     x = fc.ssavals[v.id]
     return x isa CGVal && x.typ === d.typ && x.leaves == d.leaves
+end
+function same_locals(fc::FnCtx, d::SplitUnion, @nospecialize(v))
+    x = v isa Core.SSAValue ? get(fc.ssavals, v.id, nothing) :
+        v isa IRStructurizer.BlockArgument ? get(fc.blockargs, v.id, nothing) : nothing
+    return x isa SplitUnion && x.tag === d.tag
 end
 
 # whether a value of type S is a value of type T without a conversion that emits code
@@ -567,11 +632,16 @@ struct Uses
     projections::Dict{Tuple{Int,Int},Vector{Int}}
     "The pointer loop carries that keep the origin of their initial value (`analyze_ptr_carries!`)."
     ptrcarries::Set{Int}
-    "The fields at run-time indices that are split unions (`analyze_split_unions!`)."
-    splitunions::Set{Int}
+    "The fields at run-time indices that are split unions, with their members (`analyze_split_unions!`)."
+    splitfields::Dict{Int,Vector{Any}}
+    """
+    The values that are split unions, with their members: SSA values (by id), block arguments
+    (`(:arg, id)`) and results of control flow operations (`(:res, op, i)`).
+    """
+    split::Dict{Any,Vector{Any}}
 end
 Uses() = Uses(Dict{Int,Int}(), Dict{Int,Tuple{Any,Int}}(), Dict{Int,Any}(), Dict{Tuple{Int,Int},Vector{Int}}(),
-              Set{Int}(), Set{Int}())
+              Set{Int}(), Dict{Int,Vector{Any}}(), Dict{Any,Vector{Any}}())
 
 """
     analyze_uses!(fc, block)
@@ -624,11 +694,19 @@ const IR_NODES = Union{Core.PiNode,Core.UpsilonNode,Core.PhiNode,Core.PhiCNode,C
 """
     analyze_split_unions!(fc, block)
 
-Find the fields at run-time indices, of a union of concrete types, that are only tested with
-`isa` against a type known at compile time that each member is or is not a subtype of, and
-narrowed, to a member or to a union of some of them that is itself only so used
-(`fc.uses.splitunions`): the union split of an element of a tuple of mixed types (`t[k]`).
-Such a field is a `SplitUnion`, no object (see `emit_split_field!`).
+Find the values of a union of concrete types that are held unboxed, as `SplitUnion`s
+(`fc.uses.split`): the union split of an element of a tuple of mixed types (`t[k]`), also
+where it is carried by a loop or merged by an `if` (`for x in t`).
+
+The values that may be are the fields at run-time indices of inline tuples of concrete
+element types (`fc.uses.splitfields`, see `emit_split_field!`), the block arguments of loops
+(their carries) and the results of `if`s and loops, the projections of those results, and
+the narrowings of any of these to a smaller union. Those that flow into one another (an
+initial or continued value into a carry, a yielded or broken value into a result) are held
+the same way, so they are decided together: a set of them is split when each is only tested
+with `isa` against a type known at compile time that every member is or is not a subtype
+of, narrowed, or flows into another of the set, and every other value that flows into one
+of them is of a member type. (A set that nothing tests or narrows is left as it is.)
 """
 function analyze_split_unions!(fc::FnCtx, block)
     world = fc.cgm.world.world
@@ -636,60 +714,175 @@ function analyze_split_unions!(fc::FnCtx, block)
         x isa GlobalRef ? const_global(world, x.mod, x.name) :
         x isa Union{Core.SSAValue,Core.Argument,IRStructurizer.BlockArgument,Expr} ? nothing : Some{Any}(x)
     iscall(st, f) = st isa Expr && st.head === :call && resolve(st.args[1]) == Some{Any}(f)
+    # the type of an operand: of a constant, its own
+    function optype(@nospecialize(x))
+        c = resolve(x)
+        return c === nothing ? static_type(fc, x) : Core.Typeof(something(c))
+    end
+    key(@nospecialize(x)) = x isa Core.SSAValue ? x.id : x isa IRStructurizer.BlockArgument ? (:arg, x.id) : nothing
+    splittable(@nospecialize(T)) = T isa Union && all(isconcretetype, Base.uniontypes(T))
+    # the values that may be split (by key, with their types), those with a use a split union
+    # does not serve, and the uses it serves: `isa`s (by type), narrowings to a concrete type,
+    # narrowings to a union and projections (`links`: the same value), flows (value, destination)
+    nodes = Dict{Any,Any}()
+    bad = Set{Any}()
+    isas = Dict{Any,Vector{Any}}()
+    narrowed = Dict{Any,Vector{Any}}()
+    links = Tuple{Any,Any}[]
+    flows = Tuple{Any,Any}[]
     fields = Int[]
-    # every use of each value, and those a split union serves: `isa`s (by type) and narrowings
-    uses = Dict{Int,Int}()
-    isas = Dict{Int,Vector{Any}}()
-    narrowed = Dict{Int,Vector{Int}}()
-    function count!(@nospecialize(x))
-        if x isa Core.SSAValue
-            uses[x.id] = get(uses, x.id, 0) + 1
-        elseif x isa IRStructurizer.Block
-            scan!(x)
+    nresults = Dict{Int,Int}()
+    register!(k, @nospecialize(T)) = splittable(T) && (nodes[k] = T; true)
+    function escape!(@nospecialize(x))
+        k = key(x)
+        if k !== nothing
+            push!(bad, k)
         elseif x isa Expr
-            foreach(count!, x.args)
-        elseif x isa IR_NODES || parentmodule(typeof(x)) === IRStructurizer
+            foreach(escape!, x.args)
+        elseif x isa IR_NODES || (parentmodule(typeof(x)) === IRStructurizer && !(x isa IRStructurizer.Block))
             for i in 1:nfields(x)
                 isdefined(x, i) || continue
                 # (a field of operands, as a phi's values; any other is one operand, and an
                 # operand that is a constant, of an array or tuple type too, is a value)
                 y = getfield(x, i)
-                fieldtype(typeof(x), i) <: Vector ? foreach(count!, y) : count!(y)
+                fieldtype(typeof(x), i) <: Vector ? foreach(escape!, y) : escape!(y)
             end
         end
     end
-    function scan!(b)
+    # the values `vals` into the destinations `ks`, as `assign_all!` assigns them
+    function flow!(vals, ks)
+        for (j, v) in enumerate(vals)
+            j <= length(ks) && haskey(nodes, ks[j]) ? push!(flows, (v, ks[j])) : escape!(v)
+        end
+    end
+    argkeys(args) = Any[(register!((:arg, a.id), CC.widenconst(a.type)); (:arg, a.id)) for a in args]
+    function reskeys(id)
+        rtypes = result_types(fc.ssatypes[id])
+        nresults[id] = length(rtypes)
+        return Any[(register!((:res, id, i), R); (:res, id, i)) for (i, R) in enumerate(rtypes)]
+    end
+    # a field at a run-time index of an inline tuple of concrete element types, each a member
+    function isfield(st, @nospecialize(T))
+        (iscall(st, Core.getfield) && length(st.args) in (3, 4) && resolve(st.args[3]) === nothing &&
+         splittable(T) && optype(st.args[3]) === Int) || return false
+        X = optype(st.args[2])
+        ms = Base.uniontypes(T)
+        return X isa DataType && X <: Tuple && !Base.isvatuple(X) && isconcretetype(X) &&
+               layout(fc, X).kind === Inline && fieldcount(X) > 0 &&
+               all(k -> any(M -> M === fieldtype(X, k), ms), 1:fieldcount(X))
+    end
+    # the statements of the block `b` and its terminator, with the destinations the emitter
+    # assigns its values to: `yields` of a yield, `loop` (carries, results) of a `continue` and
+    # a `break`, `conds` (results, arguments of the after region) of a `while`'s condition
+    function scan!(b, yields, loop, conds=nothing)
         for inst in IRStructurizer.instructions(b)
-            st = inst[:stmt]
-            count!(st)
-            if iscall(st, Core.getfield) && length(st.args) in (3, 4) && resolve(st.args[3]) === nothing
-                push!(fields, inst.ssa_idx)
-            elseif iscall(st, Core.isa) && length(st.args) == 3 && st.args[2] isa Core.SSAValue
-                S = resolve(st.args[3])
-                S !== nothing && something(S) isa Type &&
-                    push!(get!(Vector{Any}, isas, st.args[2].id), something(S))
-            elseif st isa Core.PiNode && st.val isa Core.SSAValue
-                push!(get!(Vector{Int}, narrowed, st.val.id), inst.ssa_idx)
+            st, id = inst[:stmt], inst.ssa_idx
+            T = fc.ssatypes[id]
+            if st isa IRStructurizer.IfOp
+                escape!(st.condition)
+                rs = reskeys(id)
+                scan!(st.then_region, rs, loop)
+                scan!(st.else_region, rs, loop)
+            elseif st isa IRStructurizer.LoopOp
+                cs = argkeys(st.body.args)
+                flow!(st.init_values, cs)
+                scan!(st.body, yields, (cs, reskeys(id)))
+            elseif st isa IRStructurizer.WhileOp
+                cs = argkeys(st.before.args)
+                flow!(st.init_values, cs)
+                rs = reskeys(id)
+                scan!(st.before, yields, (cs, rs), (rs, argkeys(st.after.args)))
+                scan!(st.after, cs, (cs, rs))
+            elseif st isa IRStructurizer.ControlFlowOp
+                # (a `try`'s results, and the values of any other operation, are not split)
+                foreach(escape!, IRStructurizer.operands(st))
+                for r in IRStructurizer.blocks(st)
+                    scan!(r, nothing, st isa IRStructurizer.TryOp ? loop : nothing)
+                end
+            elseif iscall(st, Core.isa) && length(st.args) == 3 && key(st.args[2]) !== nothing &&
+                   (S = resolve(st.args[3])) !== nothing && something(S) isa Type
+                push!(get!(Vector{Any}, isas, key(st.args[2])), something(S))
+            elseif st isa Core.PiNode && key(st.val) !== nothing
+                k = key(st.val)
+                if isconcretetype(T)
+                    push!(get!(Vector{Any}, narrowed, k), T)
+                elseif haskey(nodes, k) && register!(id, T)
+                    push!(links, (id, k))
+                else
+                    push!(bad, k)
+                end
+            elseif st isa Expr && st.head === :call && length(st.args) == 3 && st.args[2] isa Core.SSAValue &&
+                   st.args[3] isa Int && haskey(nresults, st.args[2].id)
+                # a projection of a result of a control flow operation
+                r = (:res, st.args[2].id, st.args[3])
+                haskey(nodes, r) && (register!(id, T) ? push!(links, (id, r)) : push!(bad, r))
+            else
+                escape!(st)
+                isfield(st, T) && (register!(id, T); push!(fields, id))
             end
         end
-        b.terminator === nothing || count!(b.terminator)
-    end
-    scan!(block)
-    function splittable(id, ms)
-        ts, ps = get(isas, id, ()), get(narrowed, id, ())
-        length(ts) + length(ps) == get(uses, id, 0) > 0 || return false
-        all(T -> all(M -> M <: T || typeintersect(M, T) === Union{}, ms), ts) || return false
-        for p in ps
-            P = fc.ssatypes[p]
-            any(M -> M === P, ms) && continue
-            (P isa Union && all(Q -> any(M -> M === Q, ms), Base.uniontypes(P)) && splittable(p, ms)) || return false
+        t = b.terminator
+        if t isa IRStructurizer.YieldOp
+            flow!(t.values, yields === nothing ? () : yields)
+        elseif t isa IRStructurizer.ContinueOp
+            flow!(t.values, loop === nothing ? () : loop[1])
+        elseif t isa IRStructurizer.BreakOp
+            flow!(t.values, loop === nothing ? () : loop[2])
+        elseif t isa IRStructurizer.ConditionOp
+            escape!(t.condition)
+            conds === nothing ? flow!(t.args, ()) : foreach(ks -> flow!(t.args, ks), conds)
+        elseif t !== nothing
+            escape!(t)
         end
-        return true
+    end
+    scan!(block, nothing, nothing)
+    isempty(isas) && isempty(narrowed) && return
+    # the sets of values that flow into one another
+    parent = Dict{Any,Any}(k => k for k in keys(nodes))
+    function root(k)
+        while parent[k] != k
+            k = parent[k]
+        end
+        return k
+    end
+    for (a, b) in links
+        parent[root(a)] = root(b)
+    end
+    # (a value that is not one of them is of its type: a member, or its destination is not split)
+    leaves = Tuple{Any,Any}[]
+    for (v, d) in flows
+        k = key(v)
+        if k !== nothing && haskey(nodes, k)
+            parent[root(k)] = root(d)
+        elseif !(v isa IRStructurizer.Undef)
+            L = optype(v)
+            L !== nothing && isconcretetype(L) ? push!(leaves, (d, L)) : push!(bad, d)
+        end
+    end
+    sets = Dict{Any,Vector{Any}}()
+    for k in keys(nodes)
+        push!(get!(Vector{Any}, sets, root(k)), k)
+    end
+    leaftypes = Dict{Any,Vector{Any}}()
+    for (d, L) in leaves
+        push!(get!(Vector{Any}, leaftypes, root(d)), L)
+    end
+    for (r, ks) in sets
+        any(in(bad), ks) && continue
+        ms = Base.uniontypes(Union{Any[nodes[k] for k in ks]...})
+        ismember(@nospecialize(T)) = any(M -> M === T, ms)
+        ts = reduce(vcat, Any[get(isas, k, Any[]) for k in ks])
+        ps = reduce(vcat, Any[get(narrowed, k, Any[]) for k in ks])
+        isempty(ts) && isempty(ps) && continue
+        all(T -> all(M -> M <: T || typeintersect(M, T) === Union{}, ms), ts) || continue
+        all(ismember, ps) && all(ismember, get(leaftypes, r, Any[])) || continue
+        for k in ks
+            fc.uses.split[k] = ms
+        end
     end
     for id in fields
-        T = fc.ssatypes[id]
-        (T isa Union && all(isconcretetype, Base.uniontypes(T))) || continue
-        splittable(id, Base.uniontypes(T)) && push!(fc.uses.splitunions, id)
+        ms = get(fc.uses.split, id, nothing)
+        ms === nothing || (fc.uses.splitfields[id] = ms)
     end
 end
 
@@ -792,11 +985,13 @@ ptr_value_type(fc::FnCtx, @nospecialize(v)) =
 # enclosing `if`'s result it is forwarded to, or new ones
 function result_val!(fc::FnCtx, opidx::Int, i::Int, @nospecialize(T))
     d = forwarded_result(fc, opidx, i, T)
-    return d === nothing ? new_val!(fc, T) : d
+    d === nothing || return d
+    ms = split_members(fc, (:res, opidx, i))
+    return ms === nothing ? new_val!(fc, T) : new_split!(fc, T, ms)
 end
 
 """
-    forwarded_result(fc, opidx, i, T) -> Union{Nothing,CGVal}
+    forwarded_result(fc, opidx, i, T) -> Union{Nothing,CGVal,SplitUnion}
 
 Where the result `i` of the control flow operation `opidx` only goes to the yield that ends
 its block, to the results of the enclosing `if`: that destination, which the operation
@@ -820,7 +1015,10 @@ function forwarded_result(fc::FnCtx, opidx::Int, i::Int, @nospecialize(T))
     dsts = fc.yields[end]
     j <= length(dsts) || return nothing
     d = dsts[j]
-    (d.kind !== Bottom && d.typ === T) || return nothing
+    # (a split union to a split union: they are of the same members, the result flows into it)
+    split = split_members(fc, (:res, opidx, i)) !== nothing
+    d isa SplitUnion && return split && d.typ === T ? d : nothing
+    (!split && d.kind !== Bottom && d.typ === T) || return nothing
     return d
 end
 
@@ -841,7 +1039,7 @@ function emit_region!(fc::FnCtx, block)
     emit_block!(fc, block)
 end
 
-function bind_block_args!(fc::FnCtx, args, vals::Vector{CGVal})
+function bind_block_args!(fc::FnCtx, args, vals::Vector{FlowVal})
     for (a, v) in zip(args, vals)
         fc.blockargs[a.id] = v
     end
@@ -850,12 +1048,14 @@ end
 # the locals of the carries of a loop; a carry nothing reads has none (bottom: its
 # assignments are dropped)
 function carry_vals!(fc::FnCtx, args, inits=fill(nothing, length(args)))
-    return CGVal[a.id in fc.usedargs ? carry_val!(fc, a, init) : bottom() for (a, init) in zip(args, inits)]
+    return FlowVal[a.id in fc.usedargs ? carry_val!(fc, a, init) : bottom() for (a, init) in zip(args, inits)]
 end
 
 # the locals of a carry, and for a pointer carry that keeps its origin, the byte offset
 # into the array of the origin of its initial value `init`
 function carry_val!(fc::FnCtx, a, @nospecialize(init))
+    ms = split_members(fc, (:arg, a.id))
+    ms === nothing || return new_split!(fc, CC.widenconst(a.type), ms)
     v = new_val!(fc, CC.widenconst(a.type))
     a.id in fc.uses.ptrcarries || return v
     (init === nothing || init isa IRStructurizer.Undef) && return v
@@ -870,7 +1070,7 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.LoopOp, @nospecialize(typ))
     carries = carry_vals!(fc, op.body.args, op.init_values)
     assign_all!(fc, carries, op.init_values)
     bind_block_args!(fc, op.body.args, carries)
-    results = CGVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
+    results = FlowVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
     block!(fc.b); exit = open_label!(fc)
     loop!(fc.b); cont = open_label!(fc)
     push!(fc.loops, LoopTarget(exit, cont, carries, results))
@@ -887,7 +1087,7 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
     carries = carry_vals!(fc, op.before.args)
     assign_all!(fc, carries, op.init_values)
     bind_block_args!(fc, op.before.args, carries)
-    results = CGVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
+    results = FlowVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
     block!(fc.b); exit = open_label!(fc)
     loop!(fc.b); cont = open_label!(fc)
     push!(fc.loops, LoopTarget(exit, cont, carries, results))
@@ -919,7 +1119,7 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
             br!(fc.b, br_depth(fc, exit))
             end!(fc.b); close_label!(fc)
             # on true: they are the arguments of the after region
-            afterargs = new_vals!(fc, [CC.widenconst(a.type) for a in op.after.args])
+            afterargs = FlowVal[carry_val!(fc, a, nothing) for a in op.after.args]
             assign_all!(fc, afterargs, term.args)
             bind_block_args!(fc, op.after.args, afterargs)
             # the after region yields the next carried values
@@ -1009,8 +1209,10 @@ function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return emit_new!(fc, constant_value(T), args)
     elseif head === :splatnew
         T = operand(fc, ex.args[1])
-        isconstant(T) || unsupported("`splatnew` of a type that is not known at compile time")
         tup = operand(fc, ex.args[2])
+        # (of a type known only at run time, as `new` of it: `NamedTuple{names}(t)` of a tuple
+        # whose element types are, `splatnew(NamedTuple{names, typeof(t)}, t)`)
+        isconstant(T) || return emit_splatnew_rt!(fc, T, tuple_elements(fc, tup), typ)
         return emit_new!(fc, constant_value(T), tuple_elements(fc, tup))
     elseif head === :boundscheck
         cb = Base.JLOptions().check_bounds
@@ -1139,17 +1341,12 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
                  all(i -> lv.leaves[i].type == lt.leaves[i].type, eachindex(lt.leaves)))
                 # tuples of different representations of their elements (an element of a
                 # union and one of its types): element by element
-                (v.typ <: Tuple && T <: Tuple && !Base.isvatuple(v.typ) && !Base.isvatuple(T) &&
-                 fieldcount(v.typ) == fieldcount(T)) || return no_conversion!(fc, v.typ, T)
-                leaves = LeafVal[]
-                for i in 1:fieldcount(T)
-                    e = convert_repr(fc, get_field(fc, v, i), fieldtype(T, i))
-                    e.kind === Bottom && return e
-                    append!(leaves, e.leaves)
-                end
-                return CGVal(T, Inline, leaves)
+                return convert_tuple_elements(fc, v, T)
             end
             return CGVal(T, Inline, v.leaves, v.constant, v.origin)
+        elseif lv.kind === Ghost
+            # a tuple of singletons as a tuple with elements of unions of them
+            return convert_tuple_elements(fc, v, T)
         elseif lv.kind === Boxed && lv.elements !== nothing
             # a tuple of unknown length (an array) as a tuple of known length: its elements
             leaves = LeafVal[]
@@ -1201,6 +1398,20 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
             return no_conversion!(fc, v.typ, T)
         end
     end
+end
+
+# the tuple `v` as a tuple of type `T`, of another representation of its elements: each element
+# in the representation of `T`'s
+function convert_tuple_elements(fc::FnCtx, v::CGVal, @nospecialize(T))
+    (v.typ <: Tuple && T <: Tuple && !Base.isvatuple(v.typ) && !Base.isvatuple(T) &&
+     fieldcount(v.typ) == fieldcount(T)) || return no_conversion!(fc, v.typ, T)
+    leaves = LeafVal[]
+    for i in 1:fieldcount(T)
+        e = convert_repr(fc, get_field(fc, v, i), fieldtype(T, i))
+        e.kind === Bottom && return e
+        append!(leaves, e.leaves)
+    end
+    return CGVal(T, Inline, leaves)
 end
 
 # the tuple-array object `v` (of a tuple type of unknown length) as an object of the large

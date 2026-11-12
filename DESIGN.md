@@ -88,6 +88,52 @@ are defined in a new world for a compilation (or a session of compilations,
 afterwards (deleting a method that replaced another restores it; the one constant juliac
 rebinds, `Base.invokelatest`, is rebound).
 
+**Resident patches** (`install_trim_patches!`). Deleting the patches invalidates the native
+code of whatever depends on the methods they replace, in every package loaded, not only the
+compiler's. A process that compiles one program after another while its packages stay warm (a
+compile server, a system image) can instead define them once, for its life: compilations then
+share that session and define no method. In one process, a ModelingToolkit `mtkcompile` that
+took 1.6 s took 141 s after a single session of patches. Installed, the patches invalidate
+once (the first `mtkcompile` after the installation pays it; a system image built with them
+does not), and the next models' `mtkcompile` took about 2 s. The module is the one a session compiles: its code,
+types, imports and exports are byte-identical; data and globals hold addresses and unused
+capacity of the build process's objects, which differ from process to process anyway.
+
+The process's own Base is then patched for its life, so the patches that would break it are
+methods of `WASM_METHODS` instead (applied while the files are included, before macro
+expansion, so the files are the session's). On Julia 1.13 the installation defines 229 methods
+(keyword, closure and generated methods included): 206 real methods and 23 overlays. The
+overlays are the startup, initialization, project, artifact and lazy-library stubs
+(`reinit_stdio`, `init_active_project`, `set_active_project`, the `__init__`s, `_artifact_str`,
+`string(::LazyLibraryPath)`, ...), the logger lookup, `invokelatest_gr` (`Base.invokelatest`
+keeps Core's binding), and the simplified printers of types, type names, functions and enums:
+the package loader sends `repr`s of `PkgId`s to a precompiling process as code, which then had
+`PkgId` for `Base.PkgId`. A function an overlay replaces that the native module does not have
+(`wait_forever` on 1.12, some initializers) is declared without methods, for the overlay to
+have a function, and an initializer is a native no-op, since loading a module calls it. These overlays are looked up as the patch's method is in a
+session: in the native lookup (`findall`, `findsup`), in place of the native method of their
+own signature, which the patch's method replaces, so in its place in Julia's specificity order
+and with its ambiguities (native methods more specific than one, Base's
+`show(::IO, ::Core.TypeofBottom)` or a package's `show` of its enum, varargs included, are still
+the ones called, and a call ambiguous with the replaced method still is); one that replaces no
+native method (a method of another signature, a function the process lacks natively) is
+looked up by Julia's own lookup, of a method table of stand-ins of its function's methods and
+of it (each of the real one's signature, so with its static parameters; one table per set of
+native methods, by the world looked up): the matches, ambiguities and `invoke`'s method of the methods defined. (An overlay of `WasmMethodTable` otherwise hides
+every method it covers.) The real methods do natively what Base does (IO and the file
+system through the runtime, whose functions call the methods before the installation:
+`Runtime.original`; paths split by bytes; Random's vector operations element by element), or
+change only messages (assertions, deprecations) and specialization (`max_args`). The one
+constant juliac rebinds is not rebound: the process's `Base.invokelatest` stays the builtin
+`Core.invokelatest`, so where a program reads that binding (any binding that resolves to it,
+by its identity, renamed imports included; as a `GlobalRef`, or as Julia 1.13
+lowers `Base.invokelatest`, `getproperty(Base, :invokelatest)`; to call it, directly or applied
+to splatted arguments, or as a value, one of the callees of a call), the module's interpreter
+infers the read as juliac's `invokelatest_trimmed` and replaces it with that before optimizing,
+as the rebinding does in a session; `Core.invokelatest`, and other bindings or values of the
+builtin, are the builtin, as in a session. Another session in the process must have
+the same patches and bindings, by identity (`same_session`).
+
 **The compiler runs in its own world**: the world WasmCodegen was loaded in. All of
 `compile` runs through `invoke_in_world(COMPILER_WORLD, ...)`, so the compiler's native
 code stays valid whatever is defined or deleted later (patches, the program, packages
@@ -198,7 +244,10 @@ As in JuliaCodegen (and Julia's code generator), a value's representation follow
 One exception, for an element at a run-time index of an inline tuple of mixed concrete
 types (`t[k]`, as `string` and `print` read their arguments), which is of a union: where it
 is only tested with `isa` and narrowed, it is *split*, a tag (which member it is) and a value
-of each member, assigned by the field the index selects, and never boxed.
+of each member, assigned by the field the index selects, and never boxed. A loop's carry or
+an `if`'s result that such an element flows into (`for x in t`) is held the same way, where
+it too is only tested, narrowed or passed on to another, and every other value that flows
+into it is of a member type.
 
 Primitives: 8/16/32-bit integers, `Bool`, `Char` (its bits) are `i32`, kept zero-extended
 (masked after arithmetic, sign-extended where signedness matters); 64-bit `i64`; floats
@@ -279,9 +328,18 @@ byte through two run-time helpers, `jl_ptr_load_byte(address, owner)` and
 `jl_ptr_store_byte(address, owner, byte)`, generated once the module's types are known:
 they find the byte from the owner's type id: of a memory whose elements are stored as
 laid out, of a memory of widened or padded isbits elements (by the leaves of an element),
-of a string, or of the isbits fields of a mutable object. `memmove` and `memset` without
-origins are byte loops in the runtime (`Runtime.ptr_memmove`/`ptr_memset`). An owner whose
-bytes are not addressable (a memory of references) traps.
+of a string, or of the isbits fields of a mutable object. A load or store of 4 or 8 bytes
+goes through `jl_ptr_load_bits4/8(address, owner)` and `jl_ptr_store_bits4/8(address,
+owner, bits)` instead, one call: one array access when the bytes are a whole element of a
+memory whose elements are stored in 4 or 8 bytes (aligned to it), or a whole 4- or 8-byte leaf
+of a memory of inline structs; the bytes of the byte array of an owner of bytes; otherwise the
+byte helpers (misaligned, across elements or leaves, the fields of objects). `memmove`,
+`memset` and `memcmp` without origins are loops in the runtime (`Runtime.ptr_memmove`,
+`ptr_memset`, `ptr_memcmp`), by 8-byte words when both addresses are aligned to 8, else by
+bytes; but copies between memories of bytes or from a string: the runtime reads the pointer's
+owner once (`Runtime.ptr_owner`, a primitive of the code generator) and copies with
+`array.copy` or a loop over the string's bytes, as IOStream reads and writes through such
+pointers do. An owner whose bytes are not addressable (a memory of references) traps.
 
 ## 6. The image: serializing objects
 
@@ -446,7 +504,10 @@ as other pointers of the build process are.
   SimpleVectors). Their `objectid` is `jl_object_id`, by type too: of each type whose
   values may be objects, the code of `objectid` for that type, compiled once the program's
   code is (until it adds no types; a type whose `objectid` cannot be compiled traps there,
-  not an error of the program). So is `getfield` of a value whose type is not concrete (an
+  not an error of the program). Both call a function per type through a table by type id
+  (arrays of function references, as the `cfunction`s are kept): constant time, and each
+  type's case stays a function the engine compiles when it runs it, not one function over
+  every type of the module. So is `getfield` of a value whose type is not concrete (an
   abstract type, a `Union`, a `UnionAll`), which natively the builtin finds by the value's
   type: of each concrete type of the module whose objects may be of that type, `getfield` of
   that type (with the native `FieldError`, `BoundsError` and `UndefRefError`), chosen by the
@@ -457,30 +518,62 @@ as other pointers of the build process are.
   module, a test of the elements and the conversion, compiled with the code. A tuple whose
   concrete type the module does not have (no code names it) is an object of `Tuple`, its
   elements as objects: one such object of its elements whatever type it came from,
-  compared (`===`) and hashed (`objectid`, not the native one) by its elements, and tested
-  by them for tuple types; `typeof` of it is `Tuple`. These cases are compiled until
+  compared (`===`) by its elements, its `objectid` the native one (of its concrete type's
+  hash and layout, computed from its elements' types: `Runtime.tuple_objectid`), and `isa`
+  of it `<:` of the type its elements make, tested by them (against a tuple type with type
+  variables, `Tuple{T,Vararg{T}} where T`, by its elements against the variables' bounds and,
+  of a variable at more than one element, of one type, the diagonal rule; of another shape, a
+  variable in a parameter, the closed world's error where they are within the bounds);
+  `typeof` of it is the closed world's error. These cases are compiled until
   they, and the values of the type maps, add no types, and the tables are built after
   them and the image. `Core.apply_type` and `new` of types known only at run time
   (a closure capturing a variable of a small union is `new(apply_type(#f, typeof(v)), v)`)
   are the builtins at run time, as natively (`jl_f_apply_type`, `jl_new_structv`), over the
-  module's types: `apply_type(W, ps...)` calls `jl_apply_type_<W>`, the instantiations of
-  `W` the module has (the closed world's cache of them), found by their parameters (type
-  objects by reference, other values with `jl_egal`); one the module does not have is an
-  error (written to `Core.stderr` too: `apply_type` does not throw for inference). Before
-  it, parameters that may not be ones, or outside their variable's bounds, are native's
-  `TypeError` (`Runtime.apply_type_check`). Some native errors and results are the closed
-  world's error instead: a bound that depends on an earlier parameter (`S<:T`) and the
-  checks made while making the type (a `NamedTuple`'s names, a `Vararg`'s count). So are
-  erased parameters: an instantiation whose parameters do not all appear in it (`Tuple{}` of
-  `NTuple{0,T}`) is never found by them, and an erased parameter outside its bound is a
-  `TypeError` natively skipped once it is erased. And of an alias, whose bounds and its
-  type's are checked each list in turn, where natively they interleave, the `TypeError` may
-  name another parameter than native's first.
-  `new(T, xs...)` calls `jl_new_<n>`, which goes by the type id of `T` to `Runtime.new_as`
-  compiled for each concrete type of the module some `new` site's `T` may be by inference
-  (`T` of type `DataType`, which would be every type, is not supported; the cases of a
-  program function's site are the program's code, with its errors): it checks the
-  fields (`TypeError(:new, ...)`) and builds the object, as `jl_new_structv`. Printing a type (juliac's `show`,
+  module's types. `apply_type(W, ps...)` calls `jl_apply_type_<W>`, the instantiations of
+  `W` the module has (the closed world's cache of them), found by their parameters: other
+  values than types with `jl_egal`, types by reference to each of the module's type objects
+  that natively gives the same type in their place (the cache takes a type equal to the
+  parameter, `typekey_eq`, after normalizing it: `Val{Tuple{S,S} where S}` is
+  `Val{Tuple{T,T} where T}`), decided by applying `W` to them when the module is finished.
+  Where none matches, parameters that may not be ones, or outside their variable's bounds,
+  are native's `TypeError` (`Runtime.apply_type_check`, its `expected` the `TypeVar`), as are
+  a `Union{}` element of a tuple type and too many parameters; else the closed-world limit:
+  an error that says the type is valid but was not compiled into the module (types are not
+  made at run time: the module has the types its code names), written to `Core.stderr` too,
+  as inference may treat the call as not throwing (it does where the types of the parameters
+  make the application valid) and remove the handlers around it. Some native errors are the
+  closed-world limit instead: a bound that depends on an earlier parameter (`S<:T`) and the
+  checks made while making the type (a `NamedTuple`'s names); and of an alias, whose bounds
+  and its type's are checked each list in turn, where natively they interleave, the
+  `TypeError` may name another parameter than native's first. Supported shapes, where one
+  recovered parameter list per type is a complete inverse (no parameter erased, so a type
+  the module has is never reported missing): `Tuple`, and a `UnionAll` each of whose type
+  variables is a parameter of the type it makes and nowhere else in it (`Val`, `Vector`,
+  `Dict`, a closure's type), with at most 16 parameters. Refused when compiling: an alias
+  that may erase or normalize parameters away (`NTuple{0,T}` is `Tuple{}` for every `T`),
+  `Type`, a partial application (a `UnionAll` made at run time), a wrapper not known at
+  compile time, and a parameter of a tuple type inference says is a `Vararg` (it changes the
+  number of parameters; a last one it cannot rule out is an error at run time that says it
+  is not supported). `new(T, xs...)` calls `jl_new_<n>`, which goes by the type id of `T` to
+  `Runtime.new_as` compiled for each concrete type of the module some `new` site's `T` may be
+  by inference, `Type{<:X}` (`T` of type `DataType` or `Type`, which would be every type, is
+  not supported; nor are more than 16 fields): it checks the fields (`TypeError(:new, ...)`,
+  without converting) and builds the object, as `jl_new_structv`; a case that always throws
+  (a field of type `Union{}`) returns nothing. A wrong number of fields is the native
+  "invalid struct allocation", a type that is not concrete the native `TypeError`; a concrete
+  type with no case (one the module had not when its cases were compiled, or `String`,
+  `Memory`, ... `new` is not supported for) is the closed-world limit. The cases of a program
+  function's site are the program's code, with its errors. The rows and cases are compiled
+  in the fixed point of the runtime cases above, which ends: each (helper, type) pair is
+  considered once, and what a row or a case adds is a parameter or field type of a type the
+  module has (a part of it), or a type of the closed world's code, of which there are
+  finitely many. Their size is linear in the rows (each row tests each parameter): with
+  `progress` the sizes are reported per wrapper and number of parameters and per number of
+  fields, and above 512 rows a warning says so. (They keep dictionaries of their own, as
+  `by_type` does, sharing `getfield_any`'s promotion of cases: the source of the type id, the
+  result and the arity differ.) A field constructors may leave out is undefined natively
+  where its pointer, or an inline value's first pointer, is null: `isdefined` and reading it
+  test that reference leaf. Printing a type (juliac's `show`,
   which reflects on it) is a foldable function returning its name as a Symbol, so that
   inference computes it for a type known at compile time (a `Union` or `UnionAll` is not
   a constant for inference: printing one at run time needs reflection, not supported).
@@ -520,6 +613,20 @@ as other pointers of the build process are.
     `mktemp`'s, get the host's modes); the permissions of an fd's `stat` (0o644, 0o755);
     times before 1970, which cannot be set (EINVAL); and `cd(f, dir)`, which returns to the
     previous directory by its path, not an fd.
+
+  The program's own imports (`Config(import_libraries)`, either host) are calls of Wasm
+  imports of the libraries it declares, with integer arguments and results, and bytes
+  (`Vector{UInt8}`, `String`, `Memory{UInt8}`) as arguments. A Wasm GC array is opaque to
+  JavaScript, and Wasm has no bulk copy between arrays and the linear memory, so a call copies
+  the bytes to the linear memory (a loop, `jl_import_bytes`, growing the memory as needed) and
+  passes their offset and length: from the memory's start for `:js` (whose modules have a
+  memory only for this, exported as `memory`), after `Runtime.Staging` for `:wasi`. The bytes
+  are the import's until it returns: the next call with bytes, which may be one the import
+  makes back into the module, writes over them, and growing the memory replaces its buffer.
+  They are a copy, in one direction: natively a `ccall` passes the array itself, which a C
+  function may write, but what the import writes there the program does not see. (Such a
+  module exports its memory as a WASI module does, so its entry points cannot be named
+  `memory` or `_initialize`, which a host takes for WASI's.)
 
   The test runner (`test/runner.mjs`) runs `:js` modules with `js/julia.mjs` and `:wasi`
   ones with Node's `node:wasi`; `WASMCODEGEN_TEST_HOST=wasi` runs the suite for WASI.
