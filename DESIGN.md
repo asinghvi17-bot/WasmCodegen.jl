@@ -343,6 +343,10 @@ pointers do; and copies between a memory of bytes and a memory of one of Base's 
 2, 4 or 8 bytes, aligned to its elements (a `write` of a `Vector{Float32}` to an IOBuffer, a
 `read!` of one from it): a loop over the elements, each one array access and its bytes
 (`Runtime.wide_bytes!`). An owner whose bytes are not addressable (a memory of references) traps.
+Copies between arrays and dense arrays reinterpreted (`collect(reinterpret(UInt8, img))`),
+which Base makes element by element through `Ref`s and pointers, are one `memmove` of their
+bytes when neither element type has padding (`trim/wasm-base.jl`; a reinterpreted `Array` has
+all its parent's bytes, from its first).
 
 ## 6. The image: serializing objects
 
