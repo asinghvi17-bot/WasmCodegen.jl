@@ -324,12 +324,41 @@ function singleton_global!(img::Image, @nospecialize(T))
 end
 
 """
+    build_root_task_global!(img) -> Global
+
+The build's root task in the image: the module's own (`root_task_global!`), as a native image
+has it, the loading process's root task, not a copy (src/staticdata.c, `TagRef` 0); with the
+build's task-local storage, as a system image restores it into the loading root task. Its
+other fields are not serialized: a value that refers to it (the key of a per-task cache, a
+WeakRef) brings in only its storage. (A system image restores the storage whether or not
+anything refers to the task; here only then: a program that reaches it only as its current
+task, `task_local_storage()`, finds it empty, as it was before. The build's storage is the
+compiling session's, whatever it holds.)
+"""
+function build_root_task_global!(img::Image)
+    cgm = img.cgm
+    g = root_task_global!(cgm)
+    get!(cgm.helpers, :root_task_storage) do
+        # (set once every global exists, after the start function's `nothing` there)
+        tls = Base.roottask.storage
+        if tls !== nothing
+            l = layout(types(img), Task)
+            k = Base.fieldindex(Task, :storage)
+            push!(img.patches, (g, :struct, l.wtype, first(l.fields[k]) - 1, tls, fieldtype(Task, k), img.owner, false))
+        end
+        true
+    end
+    return g
+end
+
+"""
     object_global!(img, x) -> Global
 
 The global of the object `x` (of a boxed type), serializing it (and the objects it refers
 to) on first use.
 """
 function object_global!(img::Image, @nospecialize(x))
+    x === Base.roottask && return build_root_task_global!(img)
     g = get(img.globals, x, nothing)
     if g !== nothing
         note_reach!(img, x)
@@ -406,6 +435,10 @@ function new_object_global!(img::Image, @nospecialize(x))
         return opaque_object_global!(img, x)
     elseif any(R -> T === R, RUNTIME_TYPES)
         unsupported("serializing the runtime object ", x, " of type ", T)
+    elseif T === Task
+        # (the root task is the module's own, `object_global!`) as natively: "Task cannot be
+        # serialized" (src/staticdata.c, `jl_queue_for_serialization`)
+        unsupported("serializing a Task of the build (other than its root task)")
     elseif T <: Ptr || T === Ptr
         unsupported("serializing a pointer")
     elseif l.elements !== nothing
@@ -446,7 +479,7 @@ function type_object_global!(img::Image, @nospecialize(x::Type))
     st = type_object_type!(ts)
     init = Inst[Inst(:i32_const, typeid!(ts, typeof(x))), native_id_hash(img, x),
                 Inst(:i32_const, typeid!(ts, x)), Inst(:struct_new, st)]
-    name = "jl_type_" * replace(string(x), r"[^A-Za-z0-9_]" => "_")
+    name = string("jl_type_", replace(typename_str(x), r"[^A-Za-z0-9_]" => "_"), "_", typeid!(ts, x))
     g = add_global!(img.cgm.mod, name, RefType(st, false), false, init)
     img.globals[x] = g
     return g
@@ -577,8 +610,10 @@ function memory_global!(img::Image, mem; tuple_reset::Union{Nothing,Bool}=nothin
     g = add_array_global!(img, nothing, ml.array, n, fixed ? elems : Inst[], !fixed)
     obj = memory_object_global!(img, mem, g)
     if !fixed
-        # set by the start function, element by element
+        # set by the start function, element by element, but for the null references:
+        # array.new_default created every slot null (a hash table's unused slots stay so)
         for (i, e) in enumerate(elems)
+            e.op === :ref_null && continue
             push!(img.init, Inst(:global_get, g), Inst(:i32_const, i - 1), e,
                   Inst(:array_set, ml.array))
         end
@@ -812,7 +847,9 @@ function finish_image!(cgm::CGModule)
     isempty(img.init) && isempty(img.patches) && isempty(img.late) && !img.failed && return
     f = add_func!(cgm.mod, "jl_init_image", ValType[], ValType[])
     b = Builder(cgm.mod, f)
-    for inst in img.init
+    ninit = length(img.init)
+    for k in 1:ninit
+        inst = img.init[k]
         emit!(b, inst.op, inst.imm...)
     end
     # field and element values set once every global exists (cycles, shells of mutable objects);
@@ -851,6 +888,12 @@ function finish_image!(cgm::CGModule)
         end
     end
     empty!(img.patches)
+    # what serializing the values of the patches added to the start function (the fields of the
+    # root task, the elements of a large memory), after them: they only store into objects
+    for k in ninit+1:length(img.init)
+        inst = img.init[k]
+        emit!(b, inst.op, inst.imm...)
+    end
     for inst in img.late
         emit!(b, inst.op, inst.imm...)
     end
