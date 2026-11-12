@@ -9,8 +9,10 @@
 # statically (it was made in the same function): the array of the owner, the byte offset
 # into it, and the type of its elements. Otherwise it dispatches on the owner's kind at run
 # time (`jl_ptr_load_byte`/`jl_ptr_store_byte`, generated once the module's types are
-# known). The memory is addressed by bytes as Julia lays it out, so a pointer may
-# reinterpret it (`Ptr{UInt64}` into bytes, bytes of `UInt32`s).
+# known; 4 and 8 bytes at once through `jl_ptr_load_bits4/8`/`jl_ptr_store_bits4/8`, one
+# array access when they are an aligned element of the owner). The memory is addressed by
+# bytes as Julia lays it out, so a pointer may reinterpret it (`Ptr{UInt64}` into bytes,
+# bytes of `UInt32`s).
 
 # `Ptr`s, and C strings (pointers by another type)
 is_ptr_type(@nospecialize(T)) = T isa DataType && (T.name === Ptr.body.name || T === Cstring || T === Cwstring)
@@ -272,7 +274,7 @@ function ptr_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
             push!(leaves, Inst(:ref_null, fc.cgm.types.jlvalue))
             continue
         end
-        bits = load_bits!(fc, p, byte, off, nbytes(P))
+        bits = load_bits!(fc, p, byte, off, nbytes(P), P)
         push!(leaves, bits_to_leaf!(fc, bits, P))
     end
     l = layout(fc, T)
@@ -323,7 +325,7 @@ function ptr_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
     for ((P, off), leaf) in bits_value_leaves(fc, v, T)
         P === :owner && continue
         bits = leaf_to_bits!(fc, leaf, P)
-        store_bits!(fc, p, byte, off, nbytes(P), bits)
+        store_bits!(fc, p, byte, off, nbytes(P), bits, P)
     end
     return p
 end
@@ -373,7 +375,7 @@ function byte_offset!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
 end
 
 # the `n` bytes at `byte + off` (little-endian), as an i64 local
-function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int)
+function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int, @nospecialize(P)=nothing)
     kind, b = byte
     acc = new_local!(fc, I64)
     if kind === :static
@@ -394,6 +396,21 @@ function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int)
             load_static_bytes!(fc, o, b, off, n, s, acc)
         end
         return acc
+    end
+    stg = P === nothing ? nothing : view_storage(P)
+    typed = stg !== nothing && storage_bytes(stg) == n && ptr_owner(p) isa Int
+    if typed
+        # an aligned whole element of the owner's typed view: one array.get, no call; else
+        # as without a typed view (the byte view of an owner of bytes, then the helpers)
+        arr, boff = typed_view_offset!(fc, p, b, off, stg)
+        if!(fc.b)
+        emit!(fc.b, :local_get, arr)
+        emit!(fc.b, :local_get, boff); emit!(fc.b, :i64_const, trailing_zeros(n)); emit!(fc.b, :i64_shr_u)
+        emit!(fc.b, :i32_wrap_i64)
+        emit!(fc.b, :array_get, array_type!(fc.cgm.types, stg))
+        storage_to_bits!(fc.b, stg)
+        emit!(fc.b, :local_set, acc)
+        else!(fc.b)
     end
     view = byte_view!(fc, ptr_owner(p))
     if view !== nothing
@@ -423,7 +440,17 @@ function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int)
         emit!(fc.b, :local_set, acc)
         else!(fc.b)
     end
-    # through the owner, at run time, byte by byte
+    # through the owner, at run time: 4 or 8 bytes in one call (`jl_ptr_load_bits4/8`: one
+    # array access when they are an aligned element of the owner), else byte by byte
+    if n == 4 || n == 8
+        emit!(fc.b, :local_get, b); off != 0 && (emit!(fc.b, :i64_const, off); emit!(fc.b, :i64_add))
+        push_leaf!(fc, ptr_owner(p))
+        call!(fc.b, ptr_byte_helper!(fc.cgm, n == 8 ? :load8 : :load4))
+        emit!(fc.b, :local_set, acc)
+        view === nothing || end!(fc.b)
+        typed && end!(fc.b)
+        return acc
+    end
     emit!(fc.b, :i64_const, 0); emit!(fc.b, :local_set, acc)
     loadb = ptr_byte_helper!(fc.cgm, :load)
     for j in 0:n-1
@@ -437,6 +464,7 @@ function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int)
         emit!(fc.b, :local_get, acc); emit!(fc.b, :i64_or); emit!(fc.b, :local_set, acc)
     end
     view === nothing || end!(fc.b)
+    typed && end!(fc.b)
     return acc
 end
 
@@ -497,7 +525,7 @@ function load_static_bytes!(fc::FnCtx, o::PtrOrigin, b::Int, off::Int, n::Int, s
 end
 
 # store the `n` low bytes of the i64 local `bits` at `byte + off`
-function store_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int, bits::Int)
+function store_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int, bits::Int, @nospecialize(P)=nothing)
     kind, b = byte
     if kind === :static
         o = p.origin
@@ -515,6 +543,32 @@ function store_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int, bits::Int)
         else
             store_static_bytes!(fc, o, b, off, n, s, bits)
         end
+        return
+    end
+    stg = P === nothing ? nothing : view_storage(P)
+    if stg !== nothing && storage_bytes(stg) == n && ptr_owner(p) isa Int
+        # an aligned whole element of the owner's typed view: one array.set, no call
+        arr, boff = typed_view_offset!(fc, p, b, off, stg)
+        if!(fc.b)
+        emit!(fc.b, :local_get, arr)
+        emit!(fc.b, :local_get, boff); emit!(fc.b, :i64_const, trailing_zeros(n)); emit!(fc.b, :i64_shr_u)
+        emit!(fc.b, :i32_wrap_i64)
+        emit!(fc.b, :local_get, bits); bits_to_storage!(fc.b, stg)
+        emit!(fc.b, :array_set, array_type!(fc.cgm.types, stg))
+        else!(fc.b)
+        emit!(fc.b, :local_get, b); off != 0 && (emit!(fc.b, :i64_const, off); emit!(fc.b, :i64_add))
+        push_leaf!(fc, ptr_owner(p))
+        emit!(fc.b, :local_get, bits)
+        call!(fc.b, ptr_byte_helper!(fc.cgm, n == 8 ? :store8 : :store4))
+        end!(fc.b)
+        return
+    end
+    if n == 4 || n == 8
+        # 4 or 8 bytes in one call (`jl_ptr_store_bits4/8`)
+        emit!(fc.b, :local_get, b); off != 0 && (emit!(fc.b, :i64_const, off); emit!(fc.b, :i64_add))
+        push_leaf!(fc, ptr_owner(p))
+        emit!(fc.b, :local_get, bits)
+        call!(fc.b, ptr_byte_helper!(fc.cgm, n == 8 ? :store8 : :store4))
         return
     end
     storeb = ptr_byte_helper!(fc.cgm, :store)
@@ -639,17 +693,26 @@ end
 """
     ptr_byte_helper!(cgm, kind) -> Func
 
-`jl_ptr_load_byte(address, owner) -> i32` or `jl_ptr_store_byte(address, owner, byte)`:
-a byte of the memory a pointer without a static origin points into, found from its
-owner's kind at run time; or `jl_ptr_byte_view(owner) -> (array, base, len)`, the byte view
-of an owner (`byte_view!`). Their bodies are generated with the module's types
-(`finish_pointers!`).
+`jl_ptr_load_byte(address, owner) -> i32` or `jl_ptr_store_byte(address, owner, byte)`
+(`kind` `:load`, `:store`): a byte of the memory a pointer without a static origin points
+into, found from its owner's kind at run time; `jl_ptr_load_bits4/8(address, owner) -> i64` or
+`jl_ptr_store_bits4/8(address, owner, bits)` (`:load4`, `:load8`, `:store4`, `:store8`): 4 or 8
+bytes at once (see `finish_typed_ptr_helper!`); or `jl_ptr_byte_view(owner) -> (array, base,
+len)` (`:view`), the byte view of an owner (`byte_view!`). Their bodies are generated with the
+module's types (`finish_pointers!`).
 """
-function ptr_byte_helper!(cgm::CGModule, kind::Symbol)
+function ptr_byte_helper!(cgm::CGModule, kind)
     get!(cgm.helpers, (:ptr, kind)) do
         jl = jlvalue_ref(cgm.types)
         kind === :load ? add_func!(cgm.mod, "jl_ptr_load_byte", ValType[I64, jl], ValType[I32]) :
         kind === :store ? add_func!(cgm.mod, "jl_ptr_store_byte", ValType[I64, jl, I32], ValType[]) :
+        # 4 or 8 bytes at a time, falling back to the byte helpers
+        kind in (:load8, :load4) ? (ptr_byte_helper!(cgm, :load);
+                                   add_func!(cgm.mod, "jl_ptr_load_bits" * string(kind)[end], ValType[I64, jl], ValType[I64])) :
+        kind isa Tuple && kind[1] === :view ? add_func!(cgm.mod, "jl_ptr_view_" * lowercase(string(kind[2])), ValType[jl],
+                  ValType[RefType(array_type!(cgm.types, kind[2]), true), I64, I64]) :
+        kind in (:store8, :store4) ? (ptr_byte_helper!(cgm, :store);
+                                     add_func!(cgm.mod, "jl_ptr_store_bits" * string(kind)[end], ValType[I64, jl, I64], ValType[])) :
         add_func!(cgm.mod, "jl_ptr_byte_view", ValType[jl],
                   ValType[RefType(array_type!(cgm.types, I8), true), I64, I64])
     end
@@ -1045,4 +1108,288 @@ function finish_pointers!(cgm::CGModule)
         unreachable!(b)
         finish!(b)
     end
+    for stg in (F64, F32, I64, I32)
+        f = get(cgm.helpers, (:ptr, (:view, stg)), nothing)
+        f === nothing || finish_typed_view!(cgm, f, stg, byte_owners(cgm))
+    end
+    for kind in (:load8, :load4, :store8, :store4)
+        f = get(cgm.helpers, (:ptr, kind), nothing)
+        f === nothing && continue
+        finish_typed_ptr_helper!(cgm, f, kind, byte_owners(cgm), leaf_memory_owners(cgm))
+    end
+end
+
+# the body of `jl_ptr_load_bits{n}(address, owner) -> i64` or
+# `jl_ptr_store_bits{n}(address, owner, bits)`, by the owner's type id:
+# - an owner whose array elements are stored in `n` bytes (a memory of Float64, of Int32, of
+#   ComplexF64, ...), at an offset aligned to one: a single `array.get`/`array.set`;
+# - an owner of bytes (a string, a symbol, a memory of bytes), the `n` bytes within its array:
+#   `n` byte accesses;
+# - a memory of inline structs whose leaves are stored with a stride, a leaf of `n` bytes at the
+#   offset: a single `array.get`/`array.set`;
+# - otherwise byte by byte through the byte helpers (misaligned, across elements or leaves,
+#   objects' fields, the NUL past a string's end, the traps of unaddressable owners).
+function finish_typed_ptr_helper!(cgm::CGModule, f::Func, kind::Symbol, owners, leafmems)
+    n = kind in (:load8, :store8) ? 8 : 4
+    load = kind in (:load8, :load4)
+    b = Builder(cgm.mod, f)
+    off = add_local!(f, I64)
+    tid = add_local!(f, I32)
+    idx = add_local!(f, I64)
+    arrays = Dict{TypeRef,Int}()
+    emit!(b, :local_get, 1); emit!(b, :ref_is_null)
+    if!(b); unreachable!(b); end!(b)
+    emit!(b, :local_get, 0)
+    emit!(b, :local_get, 1)
+    call!(b, object_hash_func!(cgm))
+    emit!(b, :i64_extend_i32_u); emit!(b, :i64_const, 32); emit!(b, :i64_shl)
+    emit!(b, :i64_sub)
+    emit!(b, :local_set, off)
+    emit!(b, :local_get, 1); emit!(b, :struct_get, cgm.types.jlvalue, 0)
+    emit!(b, :local_set, tid)
+    for ((st, at, stg), ids) in owners
+        storage_bytes(stg) == n || continue
+        a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
+        for (k, id) in enumerate(ids)
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            k > 1 && emit!(b, :i32_or)
+        end
+        emit!(b, :local_get, off); emit!(b, :i64_const, n - 1); emit!(b, :i64_and); emit!(b, :i64_eqz)
+        emit!(b, :i32_and)
+        if!(b)
+        emit!(b, :local_get, 1); emit!(b, :ref_cast, st)
+        emit!(b, :struct_get, st, DATA_FIELD)
+        emit!(b, :local_set, a)
+        push_byte_elem!(b, a, off, n)
+        if load
+            get_elem_bits!(b, at, stg)
+        else
+            emit!(b, :local_get, 2); bits_to_storage!(b, stg)
+            emit!(b, :array_set, at)
+        end
+        return!(b)
+        end!(b)
+    end
+    # owners of bytes (strings, symbols, memories of bytes): the n bytes of their byte array,
+    # when within it (the NUL past a string's end, and the rest, below), with no calls
+    rem = add_local!(f, I64)
+    for ((st, at, stg), ids) in owners
+        stg === I8 || continue
+        a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
+        for (k, id) in enumerate(ids)
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            k > 1 && emit!(b, :i32_or)
+        end
+        if!(b)
+        emit!(b, :local_get, 1); emit!(b, :ref_cast, st)
+        emit!(b, :struct_get, st, DATA_FIELD)
+        emit!(b, :local_tee, a)
+        emit!(b, :array_len); emit!(b, :i64_extend_i32_u); emit!(b, :local_set, rem)
+        # off < len and len - off >= n
+        emit!(b, :local_get, off); emit!(b, :local_get, rem); emit!(b, :i64_lt_u)
+        emit!(b, :local_get, rem); emit!(b, :local_get, off); emit!(b, :i64_sub)
+        emit!(b, :i64_const, n); emit!(b, :i64_ge_u)
+        emit!(b, :i32_and)
+        if!(b)
+        if load
+            emit!(b, :i64_const, 0); emit!(b, :local_set, idx)
+            for j in 0:n-1
+                emit!(b, :local_get, a)
+                emit!(b, :local_get, off); emit!(b, :i32_wrap_i64)
+                j > 0 && (emit!(b, :i32_const, j); emit!(b, :i32_add))
+                emit!(b, :array_get_u, at)
+                emit!(b, :i64_extend_i32_u)
+                j > 0 && (emit!(b, :i64_const, 8j); emit!(b, :i64_shl))
+                emit!(b, :local_get, idx); emit!(b, :i64_or); emit!(b, :local_set, idx)
+            end
+            emit!(b, :local_get, idx)
+        else
+            for j in 0:n-1
+                emit!(b, :local_get, a)
+                emit!(b, :local_get, off); emit!(b, :i32_wrap_i64)
+                j > 0 && (emit!(b, :i32_const, j); emit!(b, :i32_add))
+                emit!(b, :local_get, 2)
+                j > 0 && (emit!(b, :i64_const, 8j); emit!(b, :i64_shr_u))
+                emit!(b, :i32_wrap_i64)
+                emit!(b, :array_set, at)
+            end
+        end
+        return!(b)
+        end!(b)
+        end!(b)
+    end
+    # memories of inline structs whose leaves are stored with a stride: a leaf of n bytes at the
+    # offset (the type id tested first, then the offset in the element once)
+    for (id, st, at, stg, esz, stride, leaves) in leafmems
+        storage_bytes(stg) == n || continue
+        cands = [(j, loff) for (j, loff, ln) in leaves if ln == n]
+        isempty(cands) && continue
+        a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
+        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+        if!(b)
+        emit!(b, :local_get, off); emit!(b, :i64_const, esz); emit!(b, :i64_rem_u); emit!(b, :local_set, rem)
+        for (j, loff) in cands
+            emit!(b, :local_get, rem); emit!(b, :i64_const, loff); emit!(b, :i64_eq)
+            if!(b)
+            emit!(b, :local_get, 1); emit!(b, :ref_cast, st)
+            emit!(b, :struct_get, st, DATA_FIELD)
+            emit!(b, :local_set, a)
+            emit!(b, :local_get, a)
+            emit!(b, :local_get, off); emit!(b, :i64_const, esz); emit!(b, :i64_div_u)
+            emit!(b, :i64_const, stride); emit!(b, :i64_mul)
+            emit!(b, :i64_const, j); emit!(b, :i64_add); emit!(b, :i32_wrap_i64)
+            if load
+                get_elem_bits!(b, at, stg)
+            else
+                emit!(b, :local_get, 2); bits_to_storage!(b, stg)
+                emit!(b, :array_set, at)
+            end
+            return!(b)
+            end!(b)
+        end
+        end!(b)
+    end
+    # otherwise, byte by byte
+    if load
+        loadb = cgm.helpers[(:ptr, :load)]
+        emit!(b, :i64_const, 0); emit!(b, :local_set, idx)
+        for j in 0:n-1
+            emit!(b, :local_get, 0); emit!(b, :i64_const, j); emit!(b, :i64_add)
+            emit!(b, :local_get, 1)
+            call!(b, loadb)
+            emit!(b, :i64_extend_i32_u)
+            j > 0 && (emit!(b, :i64_const, 8j); emit!(b, :i64_shl))
+            emit!(b, :local_get, idx); emit!(b, :i64_or); emit!(b, :local_set, idx)
+        end
+        emit!(b, :local_get, idx)
+    else
+        storeb = cgm.helpers[(:ptr, :store)]
+        for j in 0:n-1
+            emit!(b, :local_get, 0); emit!(b, :i64_const, j); emit!(b, :i64_add)
+            emit!(b, :local_get, 1)
+            emit!(b, :local_get, 2)
+            j > 0 && (emit!(b, :i64_const, 8j); emit!(b, :i64_shr_u))
+            emit!(b, :i32_wrap_i64)
+            call!(b, storeb)
+        end
+    end
+    finish!(b)
+end
+
+## typed views
+
+# The typed view of an owner: for a pointer without static origin into a memory whose
+# elements are stored as `stg` laid out as Julia lays them out (a memory of Float64, of
+# ComplexF64, of Int32, ...), the array, the owner's base address and the array's length in
+# bytes, kept in locals per owner local and storage. An aligned access of a whole element in
+# the view is then one array access, with no call; others go through the helpers.
+
+# the storage of a view for a load or store of a value of the primitive type `P`
+view_storage(@nospecialize(P)) = P === Float64 ? F64 : P === Float32 ? F32 :
+    (P === Int64 || P === UInt64) ? I64 : (P === Int32 || P === UInt32) ? I32 : nothing
+
+# the locals (array, base, len) of the typed view of storage `stg` of the owner local `owner`:
+# made at function entry for a pointer argument (`bind_ptr_views!`), else refreshed
+# (`jl_ptr_view_<stg>`) when the owner differs from the one they were made for (as `byte_view!`)
+function typed_view!(fc::FnCtx, owner::Int, stg)
+    ts = fc.cgm.types
+    at = array_type!(ts, stg)
+    cown, arr, base, len = get!(fc.typedviews, (owner, stg)) do
+        (new_local!(fc, jlvalue_ref(ts)), new_local!(fc, RefType(at, true)),
+         new_local!(fc, I64), new_local!(fc, I64))
+    end
+    if cown < 0
+        # a pointer argument's view: made at function entry, once an access uses it
+        cown == -1 && (fc.typedviews[(owner, stg)] = (-2, arr, base, len))
+        return (arr, base, len)
+    end
+    emit!(fc.b, :local_get, owner); emit!(fc.b, :local_get, cown); emit!(fc.b, :ref_eq)
+    emit!(fc.b, :i32_eqz)
+    if!(fc.b)
+    emit!(fc.b, :local_get, owner)
+    call!(fc.b, ptr_byte_helper!(fc.cgm, (:view, stg)))
+    emit!(fc.b, :local_set, len); emit!(fc.b, :local_set, base); emit!(fc.b, :local_set, arr)
+    emit!(fc.b, :local_get, owner); emit!(fc.b, :local_set, cown)
+    end!(fc.b)
+    return (arr, base, len)
+end
+
+# with the view refreshed: the locals (array, byte offset) and on the stack whether the
+# access of an element at `b + off` is in the view and aligned (an i32)
+function typed_view_offset!(fc::FnCtx, p::CGVal, b::Int, off::Int, stg)
+    arr, base, len = typed_view!(fc, ptr_owner(p)::Int, stg)
+    n = storage_bytes(stg)
+    boff = new_local!(fc, I64)
+    emit!(fc.b, :local_get, b)
+    off != 0 && (emit!(fc.b, :i64_const, off); emit!(fc.b, :i64_add))
+    emit!(fc.b, :local_get, base); emit!(fc.b, :i64_sub)
+    emit!(fc.b, :local_tee, boff)
+    emit!(fc.b, :local_get, len); emit!(fc.b, :i64_lt_u)
+    emit!(fc.b, :local_get, boff); emit!(fc.b, :i64_const, n - 1); emit!(fc.b, :i64_and); emit!(fc.b, :i64_eqz)
+    emit!(fc.b, :i32_and)
+    return (arr, boff)
+end
+
+# the body of `jl_ptr_view_<stg>(owner) -> (array, base, len)`: of the owners whose bytes are
+# an array of `stg` elements laid out as Julia lays them out (a memory of Float64, of
+# ComplexF64, ...), the array, the base address and the array's length in bytes; of others, a
+# null array and length 0
+function finish_typed_view!(cgm::CGModule, f::Func, stg, owners)
+    ts = cgm.types
+    at = array_type!(ts, stg)
+    n = storage_bytes(stg)
+    b = Builder(cgm.mod, f)
+    tid = add_local!(f, I32)
+    arr = add_local!(f, RefType(at, true))
+    emit!(b, :local_get, 0); emit!(b, :ref_is_null)
+    if!(b); emit!(b, :ref_null, at); emit!(b, :i64_const, 0); emit!(b, :i64_const, 0); return!(b); end!(b)
+    emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+    for ((st, a, s), ids) in owners
+        (a == at && s === stg) || continue
+        for (k, id) in enumerate(ids)
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            k > 1 && emit!(b, :i32_or)
+        end
+        if!(b)
+        emit!(b, :local_get, 0); emit!(b, :ref_cast, st)
+        emit!(b, :struct_get, st, DATA_FIELD)
+        emit!(b, :local_tee, arr)
+        emit!(b, :local_get, 0); call!(b, object_hash_func!(cgm))
+        emit!(b, :i64_extend_i32_u); emit!(b, :i64_const, 32); emit!(b, :i64_shl)
+        emit!(b, :local_get, arr); emit!(b, :array_len); emit!(b, :i64_extend_i32_u)
+        emit!(b, :i64_const, n); emit!(b, :i64_mul)
+        return!(b)
+        end!(b)
+    end
+    emit!(b, :ref_null, at); emit!(b, :i64_const, 0); emit!(b, :i64_const, 0)
+    finish!(b)
+end
+
+# The typed views of the pointer arguments of the function (of `Ptr{Float64}`, `Ptr{Int32}`,
+# ...): their locals now (marked -1: not used yet), their making at function entry once the
+# body is emitted, for the views an access used (marked -2; `entry_ptr_views!`). An argument's
+# owner local is never assigned, and pointers moved by arithmetic keep it, so a view made at
+# entry dominates every access through them and needs no check of the owner.
+function bind_ptr_views!(fc::FnCtx)
+    ts = fc.cgm.types
+    for a in fc.args
+        is_ptr_type(a.typ) && a.typ isa DataType && a.typ <: Ptr || continue
+        stg = view_storage(eltype(a.typ))
+        stg === nothing && continue
+        owner = a.leaves[2]
+        owner isa Int || continue
+        at = array_type!(ts, stg)
+        fc.typedviews[(owner, stg)] = (-1, new_local!(fc, RefType(at, true)), new_local!(fc, I64), new_local!(fc, I64))
+    end
+end
+
+# the making of the used views of pointer arguments, prepended to the function's body
+function entry_ptr_views!(fc::FnCtx)
+    insts = Inst[]
+    for ((owner, stg), (cown, arr, base, len)) in fc.typedviews
+        cown == -2 || continue
+        append!(insts, (Inst(:local_get, owner), Inst(:call, ptr_byte_helper!(fc.cgm, (:view, stg))),
+                        Inst(:local_set, len), Inst(:local_set, base), Inst(:local_set, arr)))
+    end
+    isempty(insts) || prepend!(fc.b.func.body, insts)
 end

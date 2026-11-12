@@ -61,8 +61,11 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     config.host in (:js, :wasi) || throw(ArgumentError("Config: host must be :js or :wasi, got $(repr(config.host))"))
     check_import_libraries(config)
     check_foreign_functions(config)
+    # (and a JavaScript module that may pass bytes to its declared imports exports its memory as
+    # WASI's: a host takes an `_initialize` with it for WASI's, `js/julia.mjs`)
+    reserved = config.host === :wasi || !isempty(config.import_libraries)
     for e in entries
-        config.host === :wasi && e.name in WASI_EXPORTS &&
+        reserved && e.name in WASI_EXPORTS &&
             throw(ArgumentError("the entry point $(e.f) is exported as \"$(e.name)\", a name WASI reserves: give it another (`Entry(f, argtypes; name)`)"))
     end
     if config.abi_version !== nothing
@@ -216,7 +219,8 @@ compile(f, argtypes::Tuple; kw...) = compile([Entry(f, argtypes)]; kw...)
 # the WebAssembly features the code generator uses, for Binaryen
 const WASM_FEATURES = `--enable-gc --enable-reference-types --enable-multivalue --enable-bulk-memory
                        --enable-nontrapping-float-to-int --enable-sign-ext
-                       --enable-exception-handling --enable-tail-call --enable-mutable-globals`
+                       --enable-exception-handling --enable-tail-call --enable-mutable-globals
+                       --enable-simd --enable-relaxed-simd`
 
 """
     wasm_opt(bytes, options) -> Vector{UInt8}
@@ -243,11 +247,14 @@ function finish_module!(cgm::CGModule)
     finish_image!(cgm)
     finish_type_maps!(cgm)
     finish_typeof!(cgm)
+    t = time_ns()
     finish_apply_type!(cgm)
     finish_new!(cgm)
+    report_rt_types_growth(cgm, t)
     finish_type_isa!(cgm)
     finish_egal!(cgm)
     finish_objectid_any!(cgm)
+    finish_tuple_elems!(cgm)
     finish_by_type!(cgm)
     finish_getfield_any!(cgm)
     finish_tuples!(cgm)

@@ -148,12 +148,74 @@ function bind_handler_args!(fc::FnCtx, block)
     end
 end
 
-"An upsilon: its value assigned to the handler argument it feeds."
+"""
+    upsilon_test_type(T)
+
+The type an upsilon's value is tested against for a handler argument of type `T`: `T`, but each
+tuple type with type variables in it that `isa` tests a tuple's elements against (`T`, a member
+of a union, an element of a tuple type, a `Vararg`'s) and whose test may be the closed world's
+error (`Runtime.throw_isa_unknown`: not one the elements' types decide, `tuple_datatype`,
+`bound_tuple_shape`) replaced by the tuple type its variables' bounds make
+(`tuple_bounds_type`). Every value of `T` is of it, and its test is never that error.
+"""
+function upsilon_test_type(@nospecialize(T))
+    T isa Union && return Union{upsilon_test_type(T.a),upsilon_test_type(T.b)}
+    test(P) = P isa Core.TypeofVararg ?
+        (isdefined(P, :N) ? Vararg{upsilon_test_type(P.T),P.N} : isdefined(P, :T) ? Vararg{upsilon_test_type(P.T)} : P) :
+        P isa Type ? upsilon_test_type(P) : P
+    if T isa UnionAll
+        has_tuple_members(T) || return T
+        U = Base.unwrap_unionall(T)
+        U isa Union && return Union{upsilon_test_type(Base.rewrap_unionall(U.a, T)),
+                                    upsilon_test_type(Base.rewrap_unionall(U.b, T))}
+        D = tuple_datatype(T)
+        if D === nothing
+            sh = bound_tuple_shape(T)
+            (sh === nothing || !all(v -> upsilon_test_type(v.ub) == v.ub, sh.vars)) &&
+                return upsilon_test_type(tuple_bounds_type(T))
+            # (decided by its elements' types: its variables' elements, by bounds whose tests
+            # are, and its other members, which have none of its variables)
+            return Base.rewrap_unionall(Tuple{Any[test(P) for P in U.parameters]...}, T)
+        end
+        T = D
+    end
+    (T isa DataType && T.name === Tuple.name) || return T
+    return Tuple{Any[test(P) for P in T.parameters]...}
+end
+
+"""
+An upsilon: its value assigned to the handler argument it feeds, if it is of the argument's
+type. The argument's type is what the handler can see, and a value assigned after the try's
+last statement that may throw is one it never sees, so it may be of another type (the value a
+`return` passes through a `finally` feeds the catch's argument, of type `Union{}`). As natively
+(`emit_upsilonnode`'s stores, which allow mismatches), such a value is not assigned: never
+where it cannot be of the argument's type, else only where a test finds it is.
+"""
 function emit_upsilon!(fc::FnCtx, idx::Int, u::Core.UpsilonNode)
     dst = get(fc.upsilons, idx, nothing)
-    (dst === nothing || !isdefined(u, :val)) && return
-    v = convert_repr(fc, operand(fc, u.val), dst.typ)
-    v.kind === Bottom && return
+    (dst === nothing || dst.kind === Bottom || !isdefined(u, :val)) && return
+    v = operand(fc, u.val)
+    S, T = v.typ, dst.typ
+    if !(S <: T)
+        typeintersect(S, T) === Union{} && return
+        # (a value tested by its type: an object, a tuple of unknown length, a tuple of unions;
+        # against a tuple type with type variables whose test of a tuple of a type the module
+        # does not have may be the closed world's error, an exception the program has not, by
+        # the variables' bounds. A limitation: a value of the bounds that is not of such a type
+        # is assigned, and its conversion traps)
+        l = layout(fc, S)
+        if (v.kind === Boxed && (l.wtype == fc.cgm.types.jlvalue || l.elements !== nothing)) || is_union_tuple(S)
+            t = emit_isa!(fc, v, upsilon_test_type(T))
+            if !isconstant(t)
+                push_val!(fc, t)
+                if!(fc.b)
+                assign!(fc, dst, v)
+                end!(fc.b)
+                return
+            end
+            constant_value(t) || return
+        end
+    end
     assign!(fc, dst, v)
 end
 
@@ -178,7 +240,7 @@ dropped).
 """
 function emit_cfop!(fc::FnCtx, op::IRStructurizer.TryOp, @nospecialize(typ))
     rtypes = result_types(typ)
-    results = CGVal[result_val!(fc, fc.opidx, i, rtypes[i]) for i in eachindex(rtypes)]
+    results = FlowVal[result_val!(fc, fc.opidx, i, rtypes[i]) for i in eachindex(rtypes)]
     catches = op.handler !== nothing && fc.cgm.exceptions !== :none
     cgm = fc.cgm
     if catches

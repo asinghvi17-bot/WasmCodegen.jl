@@ -73,6 +73,14 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     elseif m.module === Runtime && m.name === :map_type_value
         f = mi.specTypes.parameters[2]
         return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
+    elseif m.module === Runtime && m.name === :type_layout
+        return emit_type_layout!(fc, operand(fc, ex.args[3]))
+    elseif m.module === Runtime && m.name === :tuple_elem
+        return emit_tuple_elem!(fc, CGVal[operand(fc, a) for a in ex.args[3:5]])
+    elseif m.module === Runtime && m.name === :immut_id
+        T = mi.specTypes.parameters[2]
+        return immut_id!(fc, convert_repr(fc, operand(fc, ex.args[3]), T), T,
+                         convert_repr(fc, operand(fc, ex.args[4]), UInt64))
     elseif m.module === Runtime && m.name === :by_type
         # (`f(x, y, typeof(x))` of the module's case for the type of `x`, see `BY_TYPE_CASES`)
         f = mi.specTypes.parameters[2].instance
@@ -112,6 +120,18 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
             emit!(fc.b, :array_set, ml.array)
         end
         return ghost(Nothing, nothing)
+    elseif m.module === Runtime && m.name === :ptr_owner
+        # the pointer's owner leaf, or `nothing` when it has none (null)
+        p = operand(fc, ex.args[3])
+        jl = jlvalue_ref(fc.cgm.types)
+        none = convert_repr(fc, const_value(fc, nothing), Any)
+        push_leaf!(fc, ptr_owner(p)); emit!(fc.b, :ref_is_null)
+        if!(fc.b, jl)
+        push_val!(fc, none)
+        else!(fc.b)
+        push_leaf!(fc, ptr_owner(p))
+        end!(fc.b)
+        return pop_val!(fc, Any)
     elseif m.module === Runtime && m.name === :reinterpret_bits
         Out = mi.specTypes.parameters[2].parameters[1]
         In = mi.specTypes.parameters[3]

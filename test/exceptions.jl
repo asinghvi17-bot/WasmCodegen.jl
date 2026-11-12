@@ -114,6 +114,235 @@ function return_finally(i::Int, r::Base.RefValue{Int})
     return r[]
 end
 return_through_finally(i::Int) = (r = Ref(0); return_finally(i, r) + 1000 * r[])
+# a return out of the try of try/catch/finally (and of a try/catch in a try/finally): the
+# value it returns also feeds the catch, which never reads it (its argument is of type Union{})
+@noinline coded_work(i::Int) = i > 2 ? throw(CodedError(i)) : i + 1
+function return_catch_finally(i::Int, r::Base.RefValue{Int})
+    try
+        return coded_work(i)
+    catch
+        return -1
+    finally
+        r[] += 10
+    end
+end
+return_through_catch_finally(i::Int) = (r = Ref(0); return_catch_finally(i, r) + 1000 * r[])
+function return_nested_catch_finally(i::Int)
+    r = Ref(0)
+    v = i * 3
+    x = try
+        try
+            coded_work(i)
+            return v + r[]
+        catch e
+            (e::CodedError).code
+        end
+    finally
+        r[] += 1
+    end
+    return x + 100 * r[]
+end
+# a variable assigned after the try's last statement that may throw: the catch's argument is
+# of the type the catch can see, not of the type assigned (another type, or a wider one)
+function catch_sees_other_type(i::Int)
+    x = "s"
+    try
+        x = coded_work(i)
+    catch
+    end
+    return x isa Int ? x : length(x)
+end
+function catch_sees_narrower_type(i::Int)
+    x = 1
+    try
+        coded_work(i)
+        x = i > 1 ? nothing : i
+    catch
+    end
+    return x === nothing ? -7 : x
+end
+function catch_sees_narrower_boxed(i::Int)
+    x = 1
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? "z" : i)
+    catch
+    end
+    return x isa Int ? x : -9
+end
+# (a tuple of unknown length, where the catch sees one of a known length)
+function catch_sees_tuple_length(i::Int)
+    x = (42,)
+    try
+        coded_work(i)
+        x = Tuple(fill(7, i - 1))
+    catch
+    end
+    return 100 * length(x) + (isempty(x) ? 0 : x[1])
+end
+# (where it sees one of a few lengths; a tuple holding one of a few lengths; a tuple of a union
+# element; one of unknown length of another element type)
+function catch_sees_tuple_lengths(i::Int)
+    x = i > 3 ? (42,) : (42, 43)
+    try
+        coded_work(i)
+        x = Tuple(fill(7, i - 1))
+    catch
+    end
+    return 100 * length(x) + (isempty(x) ? 0 : x[1])
+end
+mutable struct TupleHolder
+    x::Tuple{Union{Tuple{Int},Tuple{Int,Int}}}
+    y::Tuple{Union{Int,Float64}}
+    z::Tuple{Vararg{Int}}
+end
+const TUPLE_HOLDER = TupleHolder(((42,),), (42,), (42, 43))
+function catch_sees_nested_lengths(i::Int)
+    x = TUPLE_HOLDER.x
+    try
+        coded_work(i)
+        x = Tuple(Tuple{Vararg{Int}}[Tuple(fill(7, i - 1))])
+    catch
+    end
+    return length(x[1])
+end
+function catch_sees_union_element(i::Int)
+    x = TUPLE_HOLDER.y
+    try
+        coded_work(i)
+        x = Tuple(fill(7, i - 1))
+    catch
+    end
+    return 100 * length(x) + (isempty(x) ? 0 : Int(x[1]))
+end
+function catch_sees_other_elements(i::Int)
+    x = TUPLE_HOLDER.z
+    try
+        coded_work(i)
+        x = Tuple(fill(7.5, i))
+    catch
+    end
+    return 100 * length(x) + (isempty(x) ? 0 : Int(2 * x[1]))
+end
+# (where it sees a tuple of a type with type variables)
+mutable struct WhereHolder
+    x::Tuple{Tuple{Vararg{T}},T} where T
+end
+const WHERE_HOLDER = WhereHolder(((42,), 42))
+function catch_sees_where_type(i::Int)
+    x = WHERE_HOLDER.x
+    try
+        coded_work(i)
+        x = Tuple(Any[Tuple(fill(7, i - 1)), 7])
+    catch
+    end
+    return length(x[1]::Tuple)
+end
+# (and in a tuple of unknown length; and a value not of the type of a concrete one whose
+# parameter is a `UnionAll`, `Base.RefValue{Vector}`: tested, as an object)
+mutable struct WhereVarargHolder
+    x::Tuple{Vararg{Tuple{Tuple{Vararg{T}},T} where T}}
+end
+const WHERE_VARARG_HOLDER = WhereVarargHolder((((42,), 42),))
+function catch_sees_where_vararg(i::Int)
+    x = WHERE_VARARG_HOLDER.x
+    try
+        coded_work(i)
+        x = Tuple(Any[Tuple(Any[Tuple(fill(7, i - 1)), 7])])
+    catch
+    end
+    return length((x[1]::Tuple)[1]::Tuple)
+end
+function catch_sees_ref(i::Int)
+    x = Ref{Vector}([42])
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? "z" : x)
+    catch
+    end
+    return x isa String ? 99 : length((x::Base.RefValue{Vector})[]::Vector{Int})
+end
+# (a value that is no tuple, against tuple types with `UnionAll` elements and with type variables:
+# not assigned)
+mutable struct VectorsHolder
+    x::Tuple{Vararg{Vector}}
+end
+const VECTORS_HOLDER = VectorsHolder(([42],))
+function catch_sees_vectors(i::Int)
+    x = VECTORS_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? "z" : x)
+    catch
+    end
+    return x isa String ? 99 : length(x::Tuple)
+end
+function catch_sees_where_other(i::Int)
+    x = WHERE_VARARG_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? "z" : x)
+    catch
+    end
+    return x isa String ? 99 : length(x::Tuple)
+end
+# (a tuple of the bounds of a type with type variables, not of it: `(1, 2.0)` for a `Tuple{T,T}`)
+mutable struct PairsHolder
+    x::Tuple{Vararg{Tuple{T,T} where T}}
+end
+const PAIRS_HOLDER = PairsHolder(((42, 42),))
+function catch_sees_pairs(i::Int)
+    x = PAIRS_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? ((1, 2.0),) : ((1, 2), (3, 4)))
+    catch
+    end
+    return length(x::Tuple)
+end
+# (and beside a type whose test the elements' types do not decide, in a union)
+mutable struct PairsOrHolder
+    x::Tuple{Vararg{Union{Tuple{T,T} where T,Tuple{Vector{T},T} where T}}}
+end
+const PAIRS_OR_HOLDER = PairsOrHolder(((42, 42),))
+function catch_sees_pairs_or(i::Int)
+    x = PAIRS_OR_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? ((1, 2.0),) : ((1, 2), (3, 4)))
+    catch
+    end
+    return length(x::Tuple)
+end
+# (and in a type with a variable of its own, whose constraint stays)
+mutable struct NestedPairsHolder
+    x::Tuple{Vararg{Tuple{A,A,Tuple{Vector{B},B} where B} where A}}
+end
+const NESTED_PAIRS_HOLDER = NestedPairsHolder(((42, 42, ([1], 1)),))
+function catch_sees_nested_pairs(i::Int)
+    x = NESTED_PAIRS_HOLDER.x
+    try
+        coded_work(i)
+        x = Base.inferencebarrier(i > 1 ? ((1, 2.0, ([1], 1)),) : ((1, 2, ([1], 1)), (3, 4, ([2], 2))))
+    catch
+    end
+    return length(x::Tuple)
+end
+# (and in a variable's bound: the tuple is of the type)
+mutable struct BoundPairsHolder
+    x::Tuple{A,A} where A<:(Tuple{Tuple{Vararg{Z}},Z} where Z)
+end
+const BOUND_PAIRS_HOLDER = BoundPairsHolder((((42,), 42), ((42,), 42)))
+function catch_sees_bound_pairs(i::Int)
+    x = BOUND_PAIRS_HOLDER.x
+    try
+        coded_work(i)
+        a = Tuple(Any[Tuple(fill(7, i)), 7])
+        x = Tuple(Any[a, a])
+    catch
+    end
+    return length((x[1]::Tuple)[1]::Tuple)
+end
 function catch_nested(i::Int)
     acc = 0
     try
@@ -145,6 +374,25 @@ uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
         @wtest catch_custom(i + 3)
         @wtest catch_inexact(i)
         @wtest return_through_finally(i)
+        @wtest return_through_catch_finally(i)
+        @wtest return_nested_catch_finally(i)
+        @wtest catch_sees_other_type(i)
+        @wtest catch_sees_narrower_type(i)
+        @wtest catch_sees_narrower_boxed(i)
+        @wtest catch_sees_tuple_length(i)
+        @wtest catch_sees_tuple_lengths(i)
+        @wtest catch_sees_nested_lengths(i)
+        @wtest catch_sees_union_element(i)
+        @wtest catch_sees_other_elements(i)
+        @wtest catch_sees_where_type(i)
+        @wtest catch_sees_where_vararg(i)
+        @wtest catch_sees_ref(i)
+        @wtest catch_sees_vectors(i)
+        @wtest catch_sees_where_other(i)
+        @wtest catch_sees_pairs(i)
+        @wtest catch_sees_pairs_or(i)
+        @wtest catch_sees_nested_pairs(i)
+        @wtest catch_sees_bound_pairs(i)
     end
     for i in 1:4
         @wtest catch_parse(i)

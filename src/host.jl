@@ -70,6 +70,61 @@ function staging_memory!(cgm::CGModule)
     end
 end
 
+## bytes for the imports a program declares (`Config(import_libraries)`)
+
+"""
+    import_bytes_base(cgm)
+
+Where the bytes of the arguments of an import are copied in the linear memory
+(`stage_import_bytes!`): from its start in a module for JavaScript, which has no other use of
+it, and after the runtime's part (`Runtime.Staging`) in one for WASI.
+"""
+import_bytes_base(cgm::CGModule) = cgm.config.host === :wasi ? Runtime.Staging.SIZE : UInt32(0)
+
+"""
+    import_bytes_func!(cgm) -> Func
+
+`jl_import_bytes(array, start, length, offset)`: copy `length` bytes of the byte array from
+`start` (0-based) to the linear memory at `offset`, first growing the memory to hold them (a
+trap if it cannot). The memory is exported as `memory` (`wasi_memory!`), for the host to read
+them.
+"""
+function import_bytes_func!(cgm::CGModule)
+    get!(cgm.helpers, :import_bytes) do
+        wasi_memory!(cgm)
+        arr = array_type!(cgm.types, I8)
+        f = add_func!(cgm.mod, "jl_import_bytes", ValType[RefType(arr, true), I32, I32, I32], ValType[])
+        b = Builder(cgm.mod, f)
+        # the end of the bytes (an i64: it may be past 4 GiB): past the memory's, grow it by the
+        # pages missing
+        stop, i = add_local!(f, I64), add_local!(f, I32)
+        emit!(b, :local_get, 3); emit!(b, :i64_extend_i32_u)
+        emit!(b, :local_get, 2); emit!(b, :i64_extend_i32_u); emit!(b, :i64_add); emit!(b, :local_set, stop)
+        emit!(b, :local_get, stop)
+        emit!(b, :memory_size, 0); emit!(b, :i64_extend_i32_u); emit!(b, :i64_const, 16); emit!(b, :i64_shl)
+        emit!(b, :i64_gt_u)
+        if!(b)
+        emit!(b, :local_get, stop); emit!(b, :i64_const, 0xffff); emit!(b, :i64_add)
+        emit!(b, :i64_const, 16); emit!(b, :i64_shr_u); emit!(b, :i32_wrap_i64)
+        emit!(b, :memory_size, 0); emit!(b, :i32_sub)
+        emit!(b, :memory_grow, 0); emit!(b, :i32_const, -1); emit!(b, :i32_eq)
+        if!(b); unreachable!(b); end!(b)
+        end!(b)
+        # memory[offset + i] = array[start + i], for i in 0:length-1
+        block!(b); loop!(b)
+        emit!(b, :local_get, i); emit!(b, :local_get, 2); emit!(b, :i32_ge_u); br_if!(b, 1)
+        emit!(b, :local_get, 3); emit!(b, :local_get, i); emit!(b, :i32_add)
+        emit!(b, :local_get, 0); emit!(b, :local_get, 1); emit!(b, :local_get, i); emit!(b, :i32_add)
+        emit!(b, :array_get_u, arr)
+        emit!(b, :i32_store8, 0, 0)
+        emit!(b, :local_get, i); emit!(b, :i32_const, 1); emit!(b, :i32_add); emit!(b, :local_set, i)
+        br!(b, 0)
+        end!(b); end!(b)
+        finish!(b)
+        f
+    end
+end
+
 ## WASI
 
 const WASI = "wasi_snapshot_preview1"
