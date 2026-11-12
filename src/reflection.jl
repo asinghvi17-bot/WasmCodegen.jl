@@ -259,7 +259,7 @@ over the module's types of whether each is a `T`; of another object, by its type
 """
 type_isa_func!(cgm::CGModule, @nospecialize(T)) = get!(cgm.helpers, (:type_isa, T)) do
     jl = jlvalue_ref(cgm.types)
-    add_func!(cgm.mod, string("jl_type_isa_", replace(string(T), r"[^A-Za-z0-9_]" => "_")), ValType[jl], ValType[I32])
+    add_func!(cgm.mod, helper_name(cgm, "type_isa_" * typename_str(T)), ValType[jl], ValType[I32])
 end
 
 function finish_type_isa!(cgm::CGModule)
@@ -293,6 +293,60 @@ function finish_type_isa!(cgm::CGModule)
     end
 end
 
+## calls by a type id: through a table of functions, a function per case
+
+"The type ids of a part of a table of `type_table_call!` (a part is an array built by `array.new_fixed`)."
+const TYPE_TABLE_PART = 256
+
+"""
+    type_table_call!(cgm, b, name, params, results, tid, cases)
+
+Emits, at the end of the function being built by `b` (of parameters `params` and results
+`results`), the call of the case of the type id in the local `tid`, `cases[id]` (a function of
+the same parameters and results), and returns its results: a table of the cases by type id
+(the global `name_table`: arrays of function references, `TYPE_TABLE_PART` ids each, as the
+module's `cfunction`s are kept), read and called by `call_ref`. A type id without a case traps
+(a null reference), as one beyond the table does (out of bounds).
+
+Constant time, where a comparison per type is linear in the number of types; and each case
+stays a function of its own, called through a reference, which an engine compiles (and
+optimizes) when it runs, not one function of every type compiled whole.
+"""
+function type_table_call!(cgm::CGModule, b::Builder, name::AbstractString, params::Vector{ValType},
+                          results::Vector{ValType}, tid::Int, cases::Dict{Int,Func})
+    np = length(params)
+    if isempty(cases)
+        return unreachable!(b)
+    end
+    sig = WasmBuilder.functype!(cgm.mod, params, results)
+    part = add_type!(cgm.mod, ArrayType(FieldType(RefType(sig, true), false)))
+    table = add_type!(cgm.mod, ArrayType(FieldType(RefType(part, false), false)))
+    P = TYPE_TABLE_PART
+    n = maximum(keys(cases))           # ids from 1: the slot of id is id - 1
+    parts = Inst[]
+    for k in 0:((n - 1) ÷ P)
+        elems = Inst[(f = get(cases, k * P + j + 1, nothing); f === nothing ? Inst(:ref_null, sig) : Inst(:ref_func, f))
+                     for j in 0:min(P, n - k * P)-1]
+        g = add_global!(cgm.mod, string(name, "_table_", k), RefType(part, false), false,
+                        Inst[elems..., Inst(:array_new_fixed, part, length(elems))])
+        push!(parts, Inst(:global_get, g))
+    end
+    tg = add_global!(cgm.mod, string(name, "_table"), RefType(table, false), false,
+                     Inst[parts..., Inst(:array_new_fixed, table, length(parts))])
+    for i in 0:np-1
+        emit!(b, :local_get, i)
+    end
+    emit!(b, :local_get, tid); emit!(b, :i32_const, 1); emit!(b, :i32_sub); emit!(b, :local_set, tid)
+    emit!(b, :global_get, tg)
+    emit!(b, :local_get, tid); emit!(b, :i32_const, trailing_zeros(P)); emit!(b, :i32_shr_u)
+    emit!(b, :array_get, table)
+    emit!(b, :local_get, tid); emit!(b, :i32_const, P - 1); emit!(b, :i32_and)
+    emit!(b, :array_get, part)
+    emit!(b, :call_ref, sig)
+    return!(b)
+    return nothing
+end
+
 ## === of values whose types are known only at run time
 
 """
@@ -324,14 +378,20 @@ function finish_egal!(cgm::CGModule)
     emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_tee, tid)
     emit!(b, :local_get, 1); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :i32_ne)
     if!(b); emit!(b, :i32_const, 0); return!(b); end!(b)
-    casts = Dict{TypeRef,Tuple{Int,Int}}()
-    cast_locals(st) = get!(casts, st) do
-        (add_local!(f, RefType(st, true)), add_local!(f, RefType(st, true)))
-    end
+    # each type's comparison in a function of its own (types compared by identity share one:
+    # different objects), called by the type id
+    cases = Dict{Int,Func}()
+    byid = nothing
     for (id, T) in enumerate(copy(ts.typelist))
         # (and tuples of a type of unknown length, their concrete one not in the module)
         (T isa DataType && (isconcretetype(T) || is_vararg_tuple(T))) || continue
-        l = layout(ts, T)
+        # (a type the module has only as a type object, of no representation: no value of it)
+        l = try
+            layout(ts, T)
+        catch err
+            err isa Unsupported || rethrow()
+            continue
+        end
         # the Wasm struct type of T's objects, and what to compare in it
         st, how = if T === String || T === Symbol
             bytes_object_type!(ts, T), :bytes
@@ -347,31 +407,39 @@ function finish_egal!(cgm::CGModule)
             nothing, :none
         end
         how === :none && continue
-        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-        if!(b)
         if how === :identity
-            emit!(b, :i32_const, 0); return!(b)
-        else
-            ca, cb = cast_locals(st)
-            emit!(b, :local_get, 0); emit!(b, :ref_cast, st); emit!(b, :local_set, ca)
-            emit!(b, :local_get, 1); emit!(b, :ref_cast, st); emit!(b, :local_set, cb)
-            if how === :bytes
-                emit!(b, :local_get, ca); emit!(b, :struct_get, st, DATA_FIELD)
-                emit!(b, :local_get, cb); emit!(b, :struct_get, st, DATA_FIELD)
-                call!(b, bytes_egal_func!(cgm))
-                return!(b)
-            elseif how === :elements
-                egal_array_elements!(cgm, b, f, st, l.elements::MemoryLayout, ca, cb)
-            else
-                # (fields from the header's end, as `egal_leaves`)
-                emit_fields_egal!(cgm, b, f, st, ca, cb, egal_leaves(ts, T))
-                emit!(b, :i32_const, 1); return!(b)
+            if byid === nothing
+                byid = add_func!(cgm.mod, "jl_egal_identity", ValType[jl, jl], ValType[I32])
+                ib = Builder(cgm.mod, byid)
+                emit!(ib, :i32_const, 0)
+                finish!(ib)
             end
+            cases[id] = byid
+            continue
         end
-        end!(b)
+        cf = add_func!(cgm.mod, string("jl_egal_case_", id), ValType[jl, jl], ValType[I32])
+        cb = Builder(cgm.mod, cf)
+        ca, cb2 = add_local!(cf, RefType(st, true)), add_local!(cf, RefType(st, true))
+        emit!(cb, :local_get, 0); emit!(cb, :ref_cast, st); emit!(cb, :local_set, ca)
+        emit!(cb, :local_get, 1); emit!(cb, :ref_cast, st); emit!(cb, :local_set, cb2)
+        if how === :bytes
+            emit!(cb, :local_get, ca); emit!(cb, :struct_get, st, DATA_FIELD)
+            emit!(cb, :local_get, cb2); emit!(cb, :struct_get, st, DATA_FIELD)
+            call!(cb, bytes_egal_func!(cgm))
+            return!(cb)
+        elseif how === :elements
+            egal_array_elements!(cgm, cb, cf, st, l.elements::MemoryLayout, ca, cb2; egal = f)
+        else
+            # (fields from the header's end, as `egal_leaves`)
+            emit_fields_egal!(cgm, cb, cf, st, ca, cb2, egal_leaves(ts, T); egal = f)
+            emit!(cb, :i32_const, 1); return!(cb)
+        end
+        is_unreachable(cb) || unreachable!(cb)
+        finish!(cb)
+        cases[id] = cf
     end
-    # a type it cannot compare
-    unreachable!(b)
+    # (a type it cannot compare: a trap)
+    type_table_call!(cgm, b, "jl_egal", ValType[jl, jl], ValType[I32], tid, cases)
     finish!(b)
 end
 
@@ -409,7 +477,7 @@ them: a case that cannot be compiled traps there, and is not an error of the pro
 function compile_runtime_cases!(cgm::CGModule)
     with_optional_config(cgm) do
         while true
-            n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm) +
+            n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_elem_cases!(cgm) + add_tuple_cases!(cgm) +
                 add_by_type_cases!(cgm) + add_getfield_any_cases!(cgm) + add_new_cases!(cgm)
             n == 0 && break
             process_worklist!(cgm)
@@ -549,7 +617,7 @@ function getfield_any_func!(cgm::CGModule, @nospecialize(T), f::Union{Symbol,Int
     note_case_owner!(cgm, (:getfield_any_owners, T, f))
     return get!(cgm.helpers, (:getfield_any, T, f)) do
         jl = jlvalue_ref(cgm.types)
-        add_func!(cgm.mod, string("jl_getfield_any_", replace(string(T, "_", f), r"[^A-Za-z0-9_]" => "_")),
+        add_func!(cgm.mod, helper_name(cgm, string("getfield_any_", typename_str(T), "_", f)),
                   ValType[jl], ValType[jl])
     end::Func
 end
@@ -662,20 +730,17 @@ function finish_objectid_any!(cgm::CGModule)
     b = Builder(cgm.mod, f)
     tid = add_local!(f, I32)
     emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+    targets = Dict{Int,Func}()
     for (id, T) in enumerate(ts.typelist)
         info = get(cases, id, nothing)
         if info === nothing
             # mutable objects and type objects: by identity
             ((T isa DataType && ismutabletype(T)) || is_type_object_type(T)) || continue
         end
-        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
-        if!(b)
-        emit!(b, :local_get, 0)
-        call!(b, info === nothing ? objectid_mutable_func!(cgm) : info.func)
-        return!(b)
-        end!(b)
+        targets[id] = info === nothing ? objectid_mutable_func!(cgm) : info.func
     end
-    unreachable!(b)
+    # (a type it has no case for: a trap)
+    type_table_call!(cgm, b, "jl_object_id", ValType[jlvalue_ref(ts)], ValType[I64], tid, targets)
     finish!(b)
 end
 
@@ -709,7 +774,7 @@ their elements (`jl_egal` the function comparing others).
 tuple_egal_func!(cgm::CGModule, @nospecialize(S), egal::Func) = get!(cgm.helpers, (:tuple_egal, S)) do
     l = layout(cgm.types, S)
     r = RefType(l.wtype, true)
-    h = add_func!(cgm.mod, "jl_tuple_egal_" * typename_str(S), ValType[r, r], ValType[I32])
+    h = add_func!(cgm.mod, helper_name(cgm, "tuple_egal_" * typename_str(S)), ValType[r, r], ValType[I32])
     b = Builder(cgm.mod, h)
     emit!(b, :local_get, 0); emit!(b, :local_get, 1); emit!(b, :ref_eq)
     if!(b); emit!(b, :i32_const, 1); return!(b); end!(b)
@@ -736,21 +801,23 @@ end
 "`jl_tuple_canon(x::S) -> \$JlValue`: the tuple `x` of the tuple type of unknown length `S` as an object."
 tuple_canon_func!(cgm::CGModule, @nospecialize(S)) = get!(cgm.helpers, (:tuple_canon, S)) do
     l = layout(cgm.types, S)
-    add_func!(cgm.mod, "jl_tuple_canon_" * typename_str(S), ValType[l.leaves[1].type],
+    add_func!(cgm.mod, helper_name(cgm, "tuple_canon_" * typename_str(S)), ValType[l.leaves[1].type],
               ValType[jlvalue_ref(cgm.types)])
 end
 
 "`jl_tuple_from(x::\$JlValue) -> S`: the tuple object `x` as a value of the tuple type of unknown length `S`."
 tuple_from_func!(cgm::CGModule, @nospecialize(S)) = get!(cgm.helpers, (:tuple_from, S)) do
     l = layout(cgm.types, S)
-    add_func!(cgm.mod, "jl_tuple_from_" * typename_str(S), ValType[jlvalue_ref(cgm.types)],
+    add_func!(cgm.mod, helper_name(cgm, "tuple_from_" * typename_str(S)), ValType[jlvalue_ref(cgm.types)],
               ValType[l.leaves[1].type])
 end
 
-# the concrete tuple types of the module of the tuple type of unknown length `S`
+# the concrete tuple types of the module a value of the tuple type of unknown length `S` may
+# have: natively `Tuple{typeof(x)...}` of its elements, which may not be a subtype of `S` (of
+# an element `Int` of an `S` of `Type{<:Integer}`s, `Tuple{DataType}`)
 function tuple_case_types(ts::Types, @nospecialize(S))
     return [(id, C) for (id, C) in enumerate(ts.typelist)
-            if C isa DataType && C <: Tuple && isconcretetype(C) && C <: S && C !== S]
+            if C isa DataType && C <: Tuple && isconcretetype(C) && C !== S && typeintersect(C, S) !== Union{}]
 end
 
 # the cases of the tuple helpers (the number added)
@@ -834,7 +901,7 @@ function finish_tuples!(cgm::CGModule)
 end
 
 function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::Int, cb::Int,
-                           how::Vector{Any})
+                           how::Vector{Any}; egal::Func=f)
     fields = (typedef(cgm.mod, st).comp::StructType).fields
     for w in HEADER_FIELDS+1:length(fields)
         k = w - HEADER_FIELDS
@@ -856,10 +923,10 @@ function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::
             # (the array of a memory, in a reference to its element: the same memory)
             emit!(b, :ref_eq); emit!(b, :i32_eqz)
         elseif stg isa RefType && h !== nothing
-            call!(b, tuple_egal_func!(cgm, h, f)); emit!(b, :i32_eqz)
+            call!(b, tuple_egal_func!(cgm, h, egal)); emit!(b, :i32_eqz)
         elseif stg isa RefType
             # (a reference to some object: compared with jl_egal)
-            call!(b, f); emit!(b, :i32_eqz)
+            call!(b, egal); emit!(b, :i32_eqz)
         else
             emit!(b, :i32_ne)
         end
@@ -950,12 +1017,54 @@ function apply_type_params(@nospecialize(W), @nospecialize(T), n::Int)
 end
 
 """
+    apply_type_shape(W, n) -> Int
+
+The number of type variables of `W` that `Core.apply_type(W, p1, …, pn)` of parameters known
+only at run time binds (`n` for `Tuple`; more parameters than that are native's "too many
+parameters" error, `apply_type_check`). Supported, as the module's types can then be looked up
+by their parameters (an application of them is injective: one result per parameters, the
+parameters of a result recovered from it, none erased): `Tuple`, and a `UnionAll` each of whose
+type variables is a parameter of the type it makes and appears nowhere else in it (`Vector`,
+`Dict`, `Val`, a closure's type). Otherwise an `Unsupported` error, so that a type the module
+has is never reported as missing: an alias whose application may drop or normalize parameters
+away (`NTuple{0,T}` is `Tuple{}` for every `T`), `Type`, and a partial application (fewer
+parameters: a `UnionAll` made at run time).
+"""
+function apply_type_shape(@nospecialize(W), n::Int)
+    W === Tuple && return n
+    U = Base.unwrap_unionall(W)
+    (W isa UnionAll && U isa DataType) ||
+        unsupported("apply_type of types not known at compile time (", W, " of ", n, " parameters)")
+    U.name === Tuple.name &&
+        unsupported("apply_type of the tuple type alias ", W, " of parameters not known at compile time ",
+                    "(its application may normalize parameters away: `NTuple{0,T}` is `Tuple{}` for every `T`)")
+    U.name === Type.body.name &&
+        unsupported("apply_type of `Type` of a parameter not known at compile time")
+    vars = TypeVar[]
+    V = W
+    while V isa UnionAll
+        push!(vars, V.var); V = V.body
+    end
+    # (each variable a parameter of the type made, and only there: an application then
+    # instantiates no other type, whose bound errors natively come first, and erases none)
+    all(v -> count(p -> p === v, U.parameters) == 1 &&
+             !any(p -> p !== v && Base.has_typevar(p, v), U.parameters), vars) ||
+        unsupported("apply_type of the alias ", W, " of parameters not known at compile time ",
+                    "(its type variables are not each just a parameter of the type it makes)")
+    n < length(vars) &&
+        unsupported("apply_type of types not known at compile time (", W, " of ", n,
+                    " parameters: a partial application)")
+    return length(vars)
+end
+
+"""
     emit_apply_type!(fc, args, typ) -> CGVal
 
 `Core.apply_type(W, ps...)` of parameters not known at compile time: a call of
 `jl_apply_type_<W>`, the instantiations of `W` the module has (generated by
-`finish_apply_type!`, the closed world's cache of `W`'s instantiations, `tn->cache`).
-`W` must be known and given all its parameters (or be `Tuple`).
+`finish_apply_type!`, the closed world's cache of `W`'s instantiations, `tn->cache`), else
+native's error of an invalid application (`Runtime.apply_type_check`), else the closed-world
+limit. `W` must be known and of a shape `apply_type_shape` supports.
 """
 function emit_apply_type!(fc::FnCtx, args::Vector{Any}, @nospecialize(typ))
     all(a -> a isa CGVal, args) && isconstant(args[1]) ||
@@ -964,17 +1073,24 @@ function emit_apply_type!(fc::FnCtx, args::Vector{Any}, @nospecialize(typ))
     n = length(args) - 1
     n <= Runtime.MAX_APPLY_PARAMS ||
         unsupported("apply_type of types not known at compile time, of ", n, " parameters")
-    (W === Tuple || (W isa UnionAll && Base.unwrap_unionall(W) isa DataType && type_var_count(W) == n)) ||
-        unsupported("apply_type of types not known at compile time (", W, " of ", n, " parameters)")
+    k = apply_type_shape(W, n)
+    # (a `Vararg` parameter of a tuple type changes its number of parameters: not supported;
+    # one inference cannot rule out is an error at run time that says so, `apply_type_check`)
+    if W === Tuple && any(a -> a.typ !== Union{} && a.typ <: Core.TypeofVararg, args[2:end])
+        unsupported("apply_type(Tuple, …) of a Vararg parameter (not supported: it changes the number of parameters)")
+    end
     cgm = fc.cgm
     h = get!(cgm.helpers, (:apply_type, W, n)) do
         jl = jlvalue_ref(cgm.types)
-        f = add_func!(cgm.mod, "jl_apply_type_" * replace(typename_str(W), r"[^A-Za-z0-9_]" => "_"),
+        f = add_func!(cgm.mod, helper_name(cgm, "apply_type_" * typename_str(W)),
                       ValType[jl for _ in 1:n], ValType[jl])
-        msg = string("Core.apply_type(", W, ", …): the type is not one of this module's (types are not made at run time)")
+        # (`W` printed as far as a diagnostic is: a wrapper of fixed parameters can be large)
+        msg = string("WasmCodegen: closed-world limit: Core.apply_type(", limited_sprint(print, W), ", …) of these parameters ",
+                     "is a valid type that was not compiled into this module (types are not made at run ",
+                     "time: the module has the types its code names)")
         # (the native errors of parameters that may not be ones, or outside the bounds)
         argtypes = (Val{W}, ntuple(_ -> Any, n)...)
-        (; func=f, msg=object_global!(cgm.image, msg),
+        (; func=f, k, msg=object_global!(cgm.image, msg),
            throw=runtime_function!(cgm, Runtime.throw_apply_type_unknown, (String,)),
            check=runtime_function!(cgm, Runtime.apply_type_check, argtypes),
            cands=IdDict{Any,Vector{Any}}())
@@ -1000,6 +1116,7 @@ function add_apply_type_types!(cgm::CGModule)
     for (k, h) in collect(cgm.helpers)
         (k isa Tuple && length(k) == 3 && k[1] === :apply_type) || continue
         W, n = k[2], k[3]
+        n == h.k || continue   # (too many parameters: no type, native's error)
         for T in copy(ts.typelist)
             haskey(h.cands, T) && continue
             P = apply_type_params(W, T, n)
@@ -1020,21 +1137,72 @@ function add_apply_type_types!(cgm::CGModule)
     return length(img.globals) + length(img.boxes) - m0
 end
 
+"""
+    type_param_class(types, p) -> Vector{Any}
+
+The module's type objects (of `types`; `abstract`, those not concrete) equal to the type `p`
+(`jl_types_equal`), `p` first:
+those the type cache may take for it as a parameter (`typekey_eq`, after `normalize_unionalls`
+and `extract_wrapper`: `Tuple{S,S} where S` for `Tuple{T,T} where T`, `Tuple{Vararg{Int,N}}
+where N` for `Tuple{Vararg{Int}}`, `Vector{T} where Int<:T<:Int` for `Vector{Int}`). Which of
+them a row takes is decided natively, by applying `W` to them (`same_application`).
+"""
+function type_param_class(types::Vector{Any}, abstract::Vector{Any}, @nospecialize(p))
+    class = Any[p]
+    # (two concrete types are equal only if they are one: of a concrete `p`, the others only)
+    for Q in (p isa DataType && isconcretetype(p) ? abstract : types)
+        Q !== p && p == Q && push!(class, Q)
+    end
+    return class
+end
+
+# whether `Core.apply_type(W, P...)` with `Q` for the parameter `i` is `T` natively
+function same_application(@nospecialize(W), P::Vector{Any}, i::Int, @nospecialize(Q), @nospecialize(T))
+    Q === P[i] && return true
+    R = try
+        Core.apply_type(W, Any[j == i ? Q : P[j] for j in eachindex(P)]...)
+    catch
+        nothing
+    end
+    return R === T
+end
+
 function finish_apply_type!(cgm::CGModule)
     img, ts = cgm.image, cgm.types
+    types = abstract = nothing
+    classes = IdDict{Any,Vector{Any}}()
     for (k, h) in cgm.helpers
         (k isa Tuple && length(k) == 3 && k[1] === :apply_type) || continue
-        n = k[3]
+        W, n = k[2], k[3]
         b = Builder(cgm.mod, h.func)
         call_check(c::FuncInfo) = (for i in 1:n; emit!(b, :local_get, i - 1); end;
                                    call!(b, c.func); foreach(_ -> emit!(b, :drop), c.func.results))
         for T in sort!(collect(keys(h.cands)); by=T -> typeid!(ts, T))
             P = h.cands[T]
             for (i, p) in enumerate(P)
-                emit!(b, :local_get, i - 1)
-                emit!(b, :global_get, boxed_object_global!(img, p))
-                # (type objects are interned: by reference; other values with `jl_egal`)
-                p isa Type ? emit!(b, :ref_eq) : call!(b, egal_any_func!(cgm))
+                if p isa Type
+                    # (type objects are interned: by reference, to each of the module's type
+                    # objects that natively gives this type in place of `p`, as the type cache
+                    # takes types equal to it, `typekey_eq`; the rows stay disjoint, as each
+                    # object gives one type)
+                    if types === nothing
+                        types = type_objects(cgm)
+                        abstract = Any[Q for Q in types if !(Q isa DataType && isconcretetype(Q))]
+                    end
+                    class = get!(() -> type_param_class(types, abstract, p), classes, p)
+                    class = Any[Q for Q in class if same_application(W, P, i, Q, T)]
+                    for (j, Q) in enumerate(class)
+                        emit!(b, :local_get, i - 1)
+                        emit!(b, :global_get, object_global!(img, Q))
+                        emit!(b, :ref_eq)
+                        j > 1 && emit!(b, :i32_or)
+                    end
+                else
+                    # (other values with `jl_egal`)
+                    emit!(b, :local_get, i - 1)
+                    emit!(b, :global_get, boxed_object_global!(img, p))
+                    call!(b, egal_any_func!(cgm))
+                end
                 i > 1 && emit!(b, :i32_and)
             end
             n == 0 && emit!(b, :i32_const, 1)
@@ -1058,12 +1226,15 @@ case of `new` for that type (`Runtime.new_as`). Its cases are the module's concr
 some site's `T` may be by inference (`add_new_cases!`); the members inference names are the
 module's, and the cases of a site a program function has are the program's code
 (`promote_new_cases!`). Of a `T` that inference bounds
-only by `DataType` (or wider), not supported: that would be every concrete type of the module.
+only by `DataType` or `Type` (or wider), not supported: that would be every concrete type of the
+module.
 """
 function emit_new_rt!(fc::FnCtx, T::CGVal, args::Vector{CGVal}, @nospecialize(typ))
     Tinf = CC.widenconst(T.typ)
     members = Tinf isa Union ? Base.uniontypes(Tinf) : Any[Tinf]
-    is_type_bound(S) = (U = Base.unwrap_unionall(S); U isa DataType && U.name === Type.body.name)
+    # (`Type{<:X}`, `Type{X}`; of `Type`, every type, not supported, as of `DataType`)
+    is_type_bound(S) = (U = Base.unwrap_unionall(S); U isa DataType && U.name === Type.body.name &&
+                        !(Type <: S))
     all(is_type_bound, members) ||
         unsupported("`new` of a type that is not known at compile time (of type ", Tinf, ")")
     n = length(args)
@@ -1085,6 +1256,7 @@ function emit_new_rt!(fc::FnCtx, T::CGVal, args::Vector{CGVal}, @nospecialize(ty
     end
     get!(() -> runtime_function!(cgm, Runtime.throw_new_not_concrete, (Any,)), cgm.helpers, :new_not_concrete)
     get!(() -> runtime_function!(cgm, Runtime.throw_invalid_struct_allocation, ()), cgm.helpers, :new_bad_arity)
+    get!(() -> runtime_function!(cgm, Runtime.throw_new_closed_world, ()), cgm.helpers, :new_closed_world)
     f = get!(cgm.helpers, (:new_rt, n)) do
         jl = jlvalue_ref(ts)
         add_func!(cgm.mod, "jl_new_" * string(n), ValType[jl for _ in 0:n], ValType[jl])
@@ -1099,12 +1271,40 @@ function emit_new_rt!(fc::FnCtx, T::CGVal, args::Vector{CGVal}, @nospecialize(ty
     return convert_repr(fc, pop_val!(fc, Any), typ)
 end
 
+"""
+    emit_splatnew_rt!(fc, T, args, typ) -> CGVal
+
+`splatnew(T, t)` of a type known only at run time: `new` of it (`emit_new_rt!`) of exactly its
+number of fields, as `jl_new_structt` (natively an `ArgumentError` of too few or too many
+arguments, where `new` may leave fields out): first a check of the type's number of fields,
+`jl_splatnew_arity_<n>` (generated by `finish_new!`).
+"""
+function emit_splatnew_rt!(fc::FnCtx, T::CGVal, args::Vector{CGVal}, @nospecialize(typ))
+    cgm = fc.cgm
+    n = length(args)
+    bounds = get!(() -> Any[], cgm.helpers, (:splatnew_rt_bounds, n))::Vector{Any}
+    Tinf = CC.widenconst(T.typ)
+    any(B -> B === Tinf, bounds) || push!(bounds, Tinf)
+    get!(() -> runtime_function!(cgm, Runtime.throw_splatnew_arity, (Int, Int)), cgm.helpers, :splatnew_arity)
+    f = get!(cgm.helpers, (:splatnew_rt, n)) do
+        add_func!(cgm.mod, "jl_splatnew_arity_" * string(n), ValType[jlvalue_ref(cgm.types)], ValType[])
+    end
+    push_val!(fc, convert_repr(fc, T, Any))
+    call!(fc.b, f)
+    return emit_new_rt!(fc, T, args, typ)
+end
+
+# whether natively the layout of the concrete type `C` is opaque (not a struct's: `new` of it is a
+# TypeError, before its number of fields is checked)
+opaque_layout(@nospecialize(C)) =
+    is_memory_type(C) || C === String || C === Symbol || C === Core.SimpleVector || C === Module
+
 # whether `C` is a concrete type `new` of a type known only at run time, of inferred type
 # `Tinf`, may build with `n` fields (`nothing`: of that type, but not with `n` fields, natively
 # "invalid struct allocation")
 function new_case_kind(ts::Types, @nospecialize(C), @nospecialize(Tinf), n::Int)
     (C isa DataType && isconcretetype(C) && C isa Tinf) || return false
-    (is_memory_type(C) || C === String || C === Symbol || C === Core.SimpleVector || C === Module) && return false
+    opaque_layout(C) && return false
     any(R -> C === R, RUNTIME_TYPES) && return false
     fieldcount(C) - C.name.n_uninitialized <= n <= fieldcount(C) || return nothing
     return true
@@ -1185,9 +1385,181 @@ function finish_new!(cgm::CGModule)
             emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
             if!(b); call!(b, (cgm.helpers[:new_bad_arity]::FuncInfo).func); unreachable!(b); end!(b)
         end
+        # (a concrete type a site's type may be with no case: one the module had not when the
+        # cases were compiled, or one `new` is not supported for: the closed-world limit, not
+        # the native error of a type that is not concrete)
+        bounds = cgm.helpers[(:new_rt_bounds, n)]::Vector{Any}
+        for (id, C) in enumerate(ts.typelist)
+            # (of an opaque layout, `String`, natively the TypeError of a type that is not a
+            # struct's: below)
+            (C isa DataType && isconcretetype(C) && !opaque_layout(C) && !haskey(cases, id) && !(id in bad) &&
+             any(B -> C isa B, bounds)) || continue
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            if!(b); call!(b, (cgm.helpers[:new_closed_world]::FuncInfo).func); unreachable!(b); end!(b)
+        end
         emit!(b, :local_get, 0)
         call!(b, (cgm.helpers[:new_not_concrete]::FuncInfo).func)
         unreachable!(b)
         finish!(b)
     end
+    # `splatnew`'s check: of a type a site's type may be with another number of fields, the
+    # error (any other type: as `new`'s)
+    for (k, f) in cgm.helpers
+        (k isa Tuple && length(k) == 2 && k[1] === :splatnew_rt) || continue
+        n = k[2]
+        bounds = cgm.helpers[(:splatnew_rt_bounds, n)]::Vector{Any}
+        b = Builder(cgm.mod, f)
+        tid = add_local!(f, I32)
+        emit!(b, :local_get, 0); emit!(b, :ref_test, st)
+        if!(b)
+        emit!(b, :local_get, 0); emit!(b, :ref_cast, st); emit!(b, :struct_get, st, 2); emit!(b, :local_set, tid)
+        end!(b)
+        for (id, C) in enumerate(ts.typelist)
+            # (of any concrete type of a struct's layout, as `jl_new_structt` checks the number
+            # before the type: also of those `new` builds no case of, `UnionAll`, ...; of an opaque
+            # layout, `String`, the TypeError comes first)
+            (C isa DataType && isconcretetype(C) && !opaque_layout(C) && fieldcount(C) != n &&
+             any(B -> C isa B, bounds)) || continue
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            if!(b)
+            emit!(b, :i64_const, n); emit!(b, :i64_const, fieldcount(C))
+            call!(b, (cgm.helpers[:splatnew_arity]::FuncInfo).func); unreachable!(b)
+            end!(b)
+        end
+        finish!(b)
+    end
+end
+
+## objectid of a tuple of a type the module does not have: its elements' layouts and ids
+
+"`Runtime.type_layout(x)`: of a table by the type id of `x`, of the module's types (`finish_tuple_elems!`)."
+function emit_type_layout!(fc::FnCtx, x::CGVal)
+    f = get!(fc.cgm.helpers, :type_layout) do
+        add_func!(fc.cgm.mod, "jl_type_layout", ValType[jlvalue_ref(fc.cgm.types)], ValType[I64])
+    end
+    push_val!(fc, convert_repr(fc, x, Any))
+    call!(fc.b, f)
+    return pop_val!(fc, UInt64)
+end
+
+"""
+`Runtime.tuple_elem(x, buf, off)`: by the type id of `x`, its case `Runtime.tuple_elem_as`, of
+each type of the module stored inline (`add_tuple_elem_cases!`, `finish_tuple_elems!`).
+"""
+function emit_tuple_elem!(fc::FnCtx, args::Vector{CGVal})
+    cgm = fc.cgm
+    x, buf, off = args
+    f = get!(cgm.helpers, :tuple_elem) do
+        add_func!(cgm.mod, "jl_tuple_elem",
+                  ValType[jlvalue_ref(cgm.types), only(layout(cgm.types, Vector{UInt8}).leaves).type, I64], ValType[I64])
+    end
+    push_val!(fc, convert_repr(fc, x, Any))
+    push_val!(fc, convert_repr(fc, buf, Vector{UInt8}))
+    push_val!(fc, convert_repr(fc, off, Int))
+    call!(fc.b, f)
+    return pop_val!(fc, UInt64)
+end
+
+# the cases of `jl_tuple_elem`: of each type of the module stored inline whose values may be
+# objects (the number added)
+function add_tuple_elem_cases!(cgm::CGModule)
+    haskey(cgm.helpers, :tuple_elem) || return 0
+    cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, :tuple_elem_cases)
+    ts = cgm.types
+    n = length(cases)
+    for (id, T) in enumerate(copy(ts.typelist))
+        haskey(cases, id) && continue
+        (objectid_case_type(ts, T) && Base.allocatedinline(T)) || continue
+        # (as `immut_id!`: of its bits, of no padding and no references)
+        bits = !Base.datatype_haspadding(T) && Base.datatype_pointerfree(T) &&
+               (isprimitivetype(T) || Base.datatype_isbitsegal(T))
+        cases[id] = runtime_function!(cgm, Runtime.tuple_elem_as, (Any, Vector{UInt8}, Int, Type{T}, Val{bits}))
+    end
+    return length(cases) - n
+end
+
+"""
+    finish_tuple_elems!(cgm)
+
+The helpers of `objectid` of a tuple of a type the module does not have: `jl_type_layout`, a
+table by type id of the module's types' layouts (`Runtime.layout_info`), and `jl_tuple_elem`,
+a case by type id of each type stored inline (a type id without one traps).
+"""
+function finish_tuple_elems!(cgm::CGModule)
+    ts = cgm.types
+    f = get(cgm.helpers, :type_layout, nothing)
+    if f !== nothing
+        n = length(ts.typelist)
+        n <= 10_000 || unsupported("objectid of a tuple of a type the module does not have in a module of more than 10000 types")
+        i64s = array_type!(ts, I64)
+        elems = Inst[Inst(:i64_const, reinterpret(Int64, Runtime.layout_info(T))) for T in ts.typelist]
+        table = add_global!(cgm.mod, "jl_type_layout_table", RefType(i64s, false), false,
+                            Inst[elems..., Inst(:array_new_fixed, i64s, n)])
+        b = Builder(cgm.mod, f)
+        emit!(b, :global_get, table)
+        emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0)
+        emit!(b, :i32_const, 1); emit!(b, :i32_sub)
+        emit!(b, :array_get, i64s)
+        finish!(b)
+    end
+    f = get(cgm.helpers, :tuple_elem, nothing)
+    if f !== nothing
+        cases = get(cgm.helpers, :tuple_elem_cases, Dict{Int,FuncInfo}())
+        b = Builder(cgm.mod, f)
+        tid = add_local!(f, I32)
+        emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+        for id in sort!(collect(keys(cases)))
+            info = cases[id]
+            info.func.params == f.params[1:3] ||
+                error("WasmCodegen: the case of `tuple_elem` of ", ts.typelist[id], " has an unexpected signature")
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            if!(b)
+            emit!(b, :local_get, 0); emit!(b, :local_get, 1); emit!(b, :local_get, 2)
+            call!(b, info.func)
+            # (a case that always throws returns nothing)
+            isempty(info.func.results) ? unreachable!(b) : return!(b)
+            end!(b)
+        end
+        unreachable!(b)
+        finish!(b)
+    end
+end
+
+"""
+The most rows a helper of `apply_type` or `new` at run time has (instantiations of one wrapper
+and number of parameters; cases of one number of fields) before the module warns of it.
+"""
+const RT_TYPES_WARN = 512
+
+"""
+    rt_types_growth(cgm) -> Vector{Tuple{String,Int}}
+
+The sizes of the helpers of `apply_type` and `new` at run time: each one's rows (the code of
+the lookup is linear in them, and in the parameters of each), by wrapper and number of
+parameters, and by number of fields. Reported with `progress`, and in a warning above
+`RT_TYPES_WARN`.
+"""
+function rt_types_growth(cgm::CGModule)
+    out = Tuple{String,Int}[]
+    for (k, h) in cgm.helpers
+        k isa Tuple || continue
+        if length(k) == 3 && k[1] === :apply_type
+            push!(out, (string("apply_type(", k[2], ", ", k[3], " parameters)"), length(h.cands)))
+        elseif length(k) == 2 && k[1] === :new_rt_cases
+            push!(out, (string("new of ", k[2], " fields"), length(h)))
+        end
+    end
+    return sort!(out; by=last, rev=true)
+end
+
+function report_rt_types_growth(cgm::CGModule, t::UInt64)
+    g = rt_types_growth(cgm)
+    isempty(g) && return
+    progress(cgm.config, "types at run time", t, join((string(w, ": ", n) for (w, n) in g), ", "))
+    big = filter(x -> last(x) > RT_TYPES_WARN, g)
+    isempty(big) ||
+        @warn string("WasmCodegen: large helpers of apply_type/new of types known only at run time ",
+                     "(more than ", RT_TYPES_WARN, " rows; the lookup is linear in them): ",
+                     join((string(w, ": ", n) for (w, n) in big), ", "))
+    return
 end

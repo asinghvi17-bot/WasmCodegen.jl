@@ -1,6 +1,11 @@
 # WasmCodegen.jl
 
 [![CI](https://github.com/gbaraldi/WasmCodegen.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/gbaraldi/WasmCodegen.jl/actions/workflows/CI.yml)
+[![Examples](https://github.com/gbaraldi/WasmCodegen.jl/actions/workflows/Pages.yml/badge.svg)](https://gbaraldi.github.io/WasmCodegen.jl/)
+
+**[Live examples](https://gbaraldi.github.io/WasmCodegen.jl/)**: pages that run compiled Julia in
+the browser (ODE solvers, a ModelingToolkit model, Julia's parser, image filters), built from
+`main`.
 
 A compiler from Julia to WebAssembly with garbage collection (WasmGC), working like
 `juliac --trim`. From entry points, it collects the closed world of code they can run,
@@ -70,6 +75,31 @@ const { instance } = await WebAssembly.instantiate(await WebAssembly.compile(byt
 wasi.initialize(instance);
 instance.exports.f(100n);
 ```
+
+A program can call functions of a host of its own: `Config(import_libraries = ["lib"])` makes a
+`ccall((:name, "lib"), ...)` a call of the Wasm import `lib.name`. The arguments and the result
+are 32- and 64-bit integers, and an argument may also be bytes (`Vector{UInt8}`, `String`,
+`Memory{UInt8}`), which the import gets as their offset and length in the module's `memory`:
+
+```julia
+using WasmCodegen
+send(n::Int) = (ccall((:message, "page"), Cvoid, (Vector{UInt8},), fill(0x2a, n)); n)
+c = WasmCodegen.compile(send, (Int,); config = WasmCodegen.Config(import_libraries = ["page"]))
+write("send.wasm", c.bytes)   # imports page.message(offset, length), exports memory
+```
+
+```js
+const { instance } = await instantiate(fs.readFileSync('send.wasm'), {
+  imports: (host) => ({ page: { message: (offset, length) => deliver(host.bytes(offset, length).slice()) } }),
+});
+instance.exports.send(1024n);
+```
+
+`host.bytes` is a `Uint8Array` view of the memory, and `host.string` decodes it from UTF-8. The
+bytes are a copy the module makes for the call, valid only until the import returns: a call
+from the import back into the module may overwrite them, and growing the memory detaches
+existing views, so copy them (`.slice()`) to keep them. `examples/jsbytes` gives a message to a page this way, and compares
+it with reading it by calls of an export.
 
 WASI file paths use absolute preopen names and a virtual working directory (`PWD`, or the
 first preopen). Preopens must occupy contiguous descriptors starting at 3; the first EBADF
@@ -224,7 +254,10 @@ output with Node's and native Julia's.
 - **The program's world.** The program is inferred in a world with juliac's trim patches
   (method redefinitions from JuliaC.jl) and the pseudo-runtime's own (`src/trim`), such
   as IO through a host import instead of libuv. The patches are deleted afterwards. The
-  compiler itself runs in the world it was loaded in.
+  compiler itself runs in the world it was loaded in. A long-lived process (a compile server,
+  a system image) can install the patches once with `install_trim_patches!()` instead, so that
+  compilations do not invalidate the native code of the packages it keeps loaded
+  ([DESIGN.md](DESIGN.md) §1).
 - **Collecting.** `Core.Compiler.compile!` with a Wasm interpreter, as juliac's
   `typeinf_ext_toplevel` does, so the code compiled is the code juliac compiles.
 - **Structuring.** Each function's IR is turned into structured control flow by

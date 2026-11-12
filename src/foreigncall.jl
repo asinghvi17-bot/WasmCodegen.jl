@@ -45,11 +45,8 @@ end
 reserved_import_library(lib::AbstractString) =
     lib == "wasi_snapshot_preview1" || lib == "julia" || startswith(lib, "julia_")
 
-"Check `Config(import_libraries)`: for `host = :wasi`, names that are not WasmCodegen's own."
+"Check `Config(import_libraries)`: names that are not WasmCodegen's own."
 function check_import_libraries(config)
-    isempty(config.import_libraries) && return
-    config.host === :wasi ||
-        throw(ArgumentError("Config(import_libraries): the libraries of host imports a program declares are for host = :wasi"))
     for lib in config.import_libraries
         isempty(lib) && throw(ArgumentError("Config(import_libraries): an empty library name"))
         reserved_import_library(lib) &&
@@ -62,6 +59,8 @@ const IMPORT_LIBRARIES = ("wasi_snapshot_preview1", "julia_io", "julia_task")
 
 # the types of the arguments and results of host imports
 const IMPORT_SCALARS = (Int32, UInt32, Int64, UInt64)
+# and of the arguments of the imports a program declares: bytes, passed in the linear memory
+const IMPORT_BYTES = (Vector{UInt8}, String, Memory{UInt8})
 
 """
     emit_import_ccall!(fc, lib, name, ex, args, typ) -> CGVal
@@ -71,6 +70,10 @@ const IMPORT_SCALARS = (Int32, UInt32, Int64, UInt64)
 Wasm import `lib.name`. The types must be 32- and 64-bit integers (or `Cvoid` for no result).
 WASI's functions are imported only by modules for WASI (`Config(host = :wasi)`), which have the
 linear memory their pointers address.
+
+An import the program declared may also take bytes, a `Vector{UInt8}`, `String` or
+`Memory{UInt8}`: they are copied to the linear memory (`stage_import_bytes!`), and the
+argument is two `i32`s, their offset and their length.
 """
 function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args::Vector{Any})
     # (an extension of the host: only for a module that asks for it)
@@ -88,23 +91,84 @@ function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args
     if !(lib in IMPORT_LIBRARIES)
         # (a library the program declared: its own interface, whose misuse is the program's)
         ex.args[4] == 0 || unsupported("a variadic ccall of the host import ", lib, ".", name)
+        filter!(T -> !(T in IMPORT_BYTES), bad)
         (RT === Cvoid || RT in IMPORT_SCALARS) && isempty(bad) ||
             unsupported("the host import ", lib, ".", name, " with a type other than Int32, UInt32, Int64, ",
-                        "UInt64 (or Cvoid as its result): ", RT, " (", join(ATs, ", "), ")")
+                        "UInt64 (or Cvoid as its result) or, as an argument, Vector{UInt8}, String, ",
+                        "Memory{UInt8}: ", RT, " (", join(ATs, ", "), ")")
     end
     (RT === Cvoid || RT in IMPORT_SCALARS) && isempty(bad) ||
         error("WasmCodegen: the host import $lib.$name has a type other than Int32, UInt32, Int64, " *
               "UInt64 (or Cvoid as its result): $RT ($(join(ATs, ", ")))")
     # (its pointers are offsets of the runtime's part of the memory: `Runtime.Staging`)
     lib in IMPORT_LIBRARIES && staging_memory!(fc.cgm)
+    vals = CGVal[convert_repr(fc, a::CGVal, T) for (a, T) in zip(args, ATs)]
+    bytes = stage_import_bytes!(fc, vals)
     wt(T) = sizeof(T) == 8 ? I64 : I32
-    params = ValType[wt(T) for T in ATs]
+    params = ValType[]
+    for T in ATs
+        T in IMPORT_BYTES ? append!(params, (I32, I32)) : push!(params, wt(T))
+    end
     results = RT === Cvoid ? ValType[] : ValType[wt(RT)]
-    for (a, T) in zip(args, ATs)
-        push_val!(fc, convert_repr(fc, a::CGVal, T))
+    for (k, v) in enumerate(vals)
+        if haskey(bytes, k)
+            off, len = bytes[k]
+            emit!(fc.b, :local_get, off); emit!(fc.b, :local_get, len)
+        else
+            push_val!(fc, v)
+        end
     end
     call!(fc.b, add_import!(fc.cgm.mod, lib, String(name), params, results))
     return RT === Cvoid ? ghost(Nothing, nothing) : pop_val!(fc, RT)
+end
+
+"""
+    stage_import_bytes!(fc, vals) -> Dict(k => (offset, length))
+
+The bytes arguments of a call of an import (`IMPORT_BYTES`), copied to the linear memory one
+after the other (each from a multiple of 8), from `import_bytes_base`: for the `k`th
+argument, the locals holding the offset and the length of its bytes. They stay there until
+the next call of an import with bytes, which may be one the host's function makes.
+"""
+function stage_import_bytes!(fc::FnCtx, vals::Vector{CGVal})
+    bytes = Dict{Int,Tuple{Int,Int}}()
+    any(v -> v.typ in IMPORT_BYTES, vals) || return bytes
+    cgm = fc.cgm
+    # (the next offset as an i64: past 4 GiB, a trap, not an offset that wrapped around)
+    next = new_local!(fc, I64)
+    emit!(fc.b, :i64_const, Int64(import_bytes_base(cgm))); emit!(fc.b, :local_set, next)
+    for (k, v) in enumerate(vals)
+        v.typ in IMPORT_BYTES || continue
+        off, len = new_local!(fc, I32), new_local!(fc, I32)
+        # jl_import_bytes(array, start, length, offset)
+        if v.typ === Vector{UInt8}
+            # (its memory reference: the array and the index of its first byte)
+            r = get_field(fc, v, 1)
+            n = get_field(fc, get_field(fc, v, 2), 1)
+            push_leaf!(fc, r.leaves[2]); push_leaf!(fc, r.leaves[3])
+            push_val!(fc, n); emit!(fc.b, :i32_wrap_i64)
+        else
+            arr = new_local!(fc, RefType(array_type!(cgm.types, I8), true))
+            if v.typ === String
+                push_val!(fc, v); emit!(fc.b, :struct_get, layout(fc, String).wtype, DATA_FIELD)
+            else
+                push_memory_array!(fc, v)
+            end
+            emit!(fc.b, :local_tee, arr); emit!(fc.b, :i32_const, 0)
+            emit!(fc.b, :local_get, arr); emit!(fc.b, :array_len)
+        end
+        emit!(fc.b, :local_tee, len)
+        emit!(fc.b, :local_get, next); emit!(fc.b, :i64_const, Int64(typemax(UInt32))); emit!(fc.b, :i64_gt_u)
+        if!(fc.b); unreachable!(fc.b); end!(fc.b)
+        emit!(fc.b, :local_get, next); emit!(fc.b, :i32_wrap_i64); emit!(fc.b, :local_tee, off)
+        call!(fc.b, import_bytes_func!(cgm))
+        emit!(fc.b, :local_get, off); emit!(fc.b, :i64_extend_i32_u)
+        emit!(fc.b, :local_get, len); emit!(fc.b, :i64_extend_i32_u); emit!(fc.b, :i64_add)
+        emit!(fc.b, :i64_const, 7); emit!(fc.b, :i64_add); emit!(fc.b, :i64_const, -8); emit!(fc.b, :i64_and)
+        emit!(fc.b, :local_set, next)
+        bytes[k] = (off, len)
+    end
+    return bytes
 end
 
 "The Julia function `Config(foreign_functions)` gives for `ccall((name, lib), ...)`, or nothing."
@@ -154,6 +218,9 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     args = Any[operand(fc, a) for a in ex.args[6:5+nargs]]
     lib = foreigncall_library(ex.args[1])
     # (a function the program implements, before the host's of a library it declares)
+    if lib == SIMD128.LIBRARY && name isa Symbol && startswith(String(name), "wasm_simd_")
+        return emit_simd!(fc, String(name)[11:end], args, typ)   # SIMD128 (simd128.jl)
+    end
     f = foreign_function(fc.cgm.config, name, lib)
     f === nothing || return emit_foreign_function!(fc, f, name::Symbol, lib::String, ex, args, typ)
     if lib !== nothing && name !== nothing && (lib in IMPORT_LIBRARIES || lib in fc.cgm.config.import_libraries)

@@ -18,12 +18,12 @@ const SESSION_TESTS = [
     "basics", "cfunctions", "data", "random", "dicts", "object_graphs", "globals", "exceptions",
     "coverage", "linalg", "eachindex_trim", "task_fields", "ptrcarry", "regressions", "exprs",
     "ir_cache", "progress", "hosts", "import_libraries", "ptrbytes", "ptrhash", "typeof_any",
-    "getfield_any", "invoke_cycle", "reflection_rt", "printing", "runtime", "idset", "unset",
-    "image_pointers", "vararg_tuples", "split_unions", "versions", "specialize", "invokelatest",
+    "getfield_any", "invoke_cycle", "reflection_rt", "rt_types", "printing", "runtime", "idset", "unset",
+    "image_pointers", "ptrtyped", "ptrviews", "simd128", "vararg_tuples", "abstract_tuples", "split_unions", "versions", "specialize", "invokelatest",
     "staging", "env", "fs", "event", "diagnostics", "type_hash", "foreign_functions",
-    "verifier", "juliac/runtests"]
+    "verifier", "type_dispatch", "ptr_copies", "type_names", "root_task", "juliac/runtests"]
 # the files that open sessions with other patches themselves
-const OWN_SESSION_TESTS = ["patch_sessions", "tasks"]
+const OWN_SESSION_TESTS = ["patch_sessions", "tasks", "resident_patches"]
 
 # in each worker, once: the harness, the programs and the references of printing.jl (with
 # Base's printing: before the patches), in `Main`; the names they define, which each test's
