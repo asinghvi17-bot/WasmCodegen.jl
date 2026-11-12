@@ -5,12 +5,14 @@
 "`memmove(dst, src, n)`: the `n` bytes at `src` copied to `dst`, which may overlap."
 function ptr_memmove(dst::Ptr{UInt8}, src::Ptr{UInt8}, n::UInt)
     # between memories of bytes (or from a String): one `array.copy` (which may overlap), or
-    # a loop over the String's bytes, without finding the owners at each byte
+    # a loop over the String's bytes, without finding the owners at each byte; between a
+    # memory of bytes and a memory of wider elements (`write` of a `Vector{Float32}` to an
+    # IOBuffer, `read!` of one from it): a loop over the elements
     if n <= UInt(typemax(Int32))
         m = Int(n)
         od, jd = owner_bytes(dst, m)
+        os, js = owner_bytes(src, m)
         if od isa Memory{UInt8}
-            os, js = owner_bytes(src, m)
             if os isa Memory{UInt8}
                 m > 0 && unsafe_copyto!(memoryref(od, jd), memoryref(os, js), m)
                 return dst
@@ -20,6 +22,9 @@ function ptr_memmove(dst::Ptr{UInt8}, src::Ptr{UInt8}, n::UInt)
                 end
                 return dst
             end
+            wide_bytes!(true, od, jd, ptr_owner(src), ptr_offset(src), m) && return dst
+        elseif os isa Memory{UInt8}
+            wide_bytes!(false, os, js, ptr_owner(dst), ptr_offset(dst), m) && return dst
         end
     end
     # by 8-byte words when both are aligned to 8 (one array access each for a memory of
@@ -55,6 +60,51 @@ function ptr_memmove(dst::Ptr{UInt8}, src::Ptr{UInt8}, n::UInt)
         end
     end
     return dst
+end
+
+"""
+    wide_bytes!(from_wide, b, j, o, off, m) -> Bool
+
+`m` bytes copied between the memory of bytes `b`, from its index `j`, and the owner `o` at its
+byte offset `off`, from `o` to `b` if `from_wide`, else from `b` to `o`: if `o` is a memory of
+elements of one of Base's bits types of 2, 4 or 8 bytes, the bytes whole elements of it (offset
+and length aligned to them), element by element (two memories: they never overlap). Else
+nothing is copied (false).
+"""
+@inline function wide_bytes!(from_wide::Bool, b::Memory{UInt8}, j::Int, @nospecialize(o), off::Int, m::Int)
+    o isa Memory{Float64} && return wide_bytes_of!(from_wide, b, j, o, off, m)
+    o isa Memory{Float32} && return wide_bytes_of!(from_wide, b, j, o, off, m)
+    o isa Memory{Float16} && return wide_bytes_of!(from_wide, b, j, o, off, m)
+    o isa Memory{Int64} && return wide_bytes_of!(from_wide, b, j, o, off, m)
+    o isa Memory{UInt64} && return wide_bytes_of!(from_wide, b, j, o, off, m)
+    o isa Memory{Int32} && return wide_bytes_of!(from_wide, b, j, o, off, m)
+    o isa Memory{UInt32} && return wide_bytes_of!(from_wide, b, j, o, off, m)
+    o isa Memory{Int16} && return wide_bytes_of!(from_wide, b, j, o, off, m)
+    o isa Memory{UInt16} && return wide_bytes_of!(from_wide, b, j, o, off, m)
+    return false
+end
+
+function wide_bytes_of!(from_wide::Bool, b::Memory{UInt8}, j::Int, o::Memory{T}, off::Int, m::Int) where {T}
+    s = sizeof(T)
+    U = s == 8 ? UInt64 : s == 4 ? UInt32 : UInt16
+    ((off | m) % s == 0 && 0 <= off && m <= s * length(o) - off) || return false
+    # (the bytes of an element unrolled: `s` is a constant)
+    i = j
+    if from_wide
+        for k in off ÷ s + 1:(off + m) ÷ s
+            w = reinterpret(U, @inbounds o[k])
+            Base.Cartesian.@nexprs 8 t -> (t <= s && (@inbounds b[i+t-1] = (w >> (8t - 8)) % UInt8))
+            i += s
+        end
+    else
+        for k in off ÷ s + 1:(off + m) ÷ s
+            w = zero(U)
+            Base.Cartesian.@nexprs 8 t -> (t <= s && (w |= U(@inbounds b[i+t-1]) << (8t - 8)))
+            @inbounds o[k] = reinterpret(T, w)
+            i += s
+        end
+    end
+    return true
 end
 
 "`memset(p, b, n)`: the `n` bytes at `p` set to `b`."

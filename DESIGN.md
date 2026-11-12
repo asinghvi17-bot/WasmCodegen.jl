@@ -339,7 +339,10 @@ byte helpers (misaligned, across elements or leaves, the fields of objects). `me
 bytes; but copies between memories of bytes or from a string: the runtime reads the pointer's
 owner once (`Runtime.ptr_owner`, a primitive of the code generator) and copies with
 `array.copy` or a loop over the string's bytes, as IOStream reads and writes through such
-pointers do. An owner whose bytes are not addressable (a memory of references) traps.
+pointers do; and copies between a memory of bytes and a memory of one of Base's bits types of
+2, 4 or 8 bytes, aligned to its elements (a `write` of a `Vector{Float32}` to an IOBuffer, a
+`read!` of one from it): a loop over the elements, each one array access and its bytes
+(`Runtime.wide_bytes!`). An owner whose bytes are not addressable (a memory of references) traps.
 
 ## 6. The image: serializing objects
 
