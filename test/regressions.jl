@@ -108,6 +108,19 @@ rg_vt_storage(n::Int) = (x = tuple(Vector{Any}(collect(1:n))...)::NTuple{70,Int}
 struct RGVt; t::Tuple{Vararg{Union{Int,String}}}; end
 const RG_VT = RGVt((3, "a"))
 rg_vt_field(n::Int) = (a = rg_id(Any[RGVt((n, "a"))])[1]; b = rg_id(Any[RG_VT])[1]; (a === b, objectid(a) == objectid(b)))
+# (`isa` against tuple types of a `where` over the vararg's type, with a free variable in the data type)
+const RG_TV_A = Tuple{T,Vararg{T}} where T
+const RG_TV_B = Tuple{Vararg{T}} where T<:Real
+const RG_TV_VALUES = Any[(1.0, 2.0), (1, 2.5), (1, 2), ("a", "b"), ()]
+rg_vt_typevar(i::Int) = (x = RG_TV_VALUES[i]; (x isa RG_TV_A, x isa RG_TV_B))
+# (of tuples whose concrete types the module does not have, objects of `Tuple`: by the types of
+# their elements, natively `<:`: the variables of the common shape at more than one element of
+# one type; other shapes, a variable in a parameter, the closed world's error)
+rg_vt_typevar_unknown(n::Int) = (x = rg_id(Any[tuple(collect(1:n)...)])[1]; (x isa RG_TV_A) + 2 * (x isa RG_TV_B))
+rg_vt_typevar_mixed(n::Int) = (x = rg_id(Any[tuple(Any[1, 2.5, "s"][1:n]...)])[1]; (x isa RG_TV_A) + 2 * (x isa RG_TV_B))
+const RG_TV_NESTED = Tuple{Vector{T}, Vararg{Any}} where T
+struct RGTvItem; n::Int; end
+rg_vt_typevar_nested(n::Int) = (x = rg_id(Any[tuple(Any[[n], RGTvItem(n)][1:n]...)])[1]; x isa RG_TV_NESTED)
 
 # singular values and symmetric eigenvalues of extreme magnitudes (scaled, as LAPACK does)
 rg_svd(x::Float64) = (s = svdvals([x 2x; 3x 4x]); (s[1] / x, s[2] / x, svdvals(fill(x, 1, 1))[1] / x))
@@ -260,7 +273,7 @@ function rg_bad_param(i::Int, which::Int)
     end
 end
 # a parameter substitution drops (natively `RG_VTUPLE{0,T}` is `Tuple{}`, whose bound of `T` is
-# not checked): here an error, never that type (DESIGN.md)
+# not checked): refused when compiling (`apply_type_shape`, DESIGN.md)
 function rg_erased_bound(n::Int)
     p = RG_PARAMS[2]
     try
@@ -301,6 +314,52 @@ const RG_HOLES = Vector{Any}(undef, 2)
 @eval @noinline rg_holes_get(x::Float64) = (RG_SINK[] = x; $RG_HOLES)
 @noinline rg_holes_len(t::Tuple{Vector{Any}}) = length(t[1])
 @eval rg_holes(x::Float64) = (v = rg_holes_get(x); (length(v), isassigned(v, 1), rg_holes_len($((RG_HOLES,)))))
+# a tuple of singletons as a tuple with elements of unions of them: a field, an element of an
+# array, an element of another tuple
+struct RGDims
+    inner::Tuple{Union{Nothing,Float32},Union{Nothing,Float32}}
+    n::Int
+end
+const RG_DIMS = Ref(RGDims((1.0f0, 2.0f0), 0))
+function rg_singleton_tuple(n::Int)
+    RG_DIMS[] = RGDims((nothing, nothing), n)
+    d = RG_DIMS[]
+    a = Tuple{Union{Nothing,Float32},Union{Missing,Int}}[(1.0f0, n)]
+    push!(a, (nothing, missing))
+    t = Tuple{Tuple{Union{Nothing,Int},Union{Nothing,Int}},Int}[((n, nothing), 1)]
+    t[1] = ((nothing, nothing), n)
+    return (d.inner[1] === nothing, d.inner[2] === nothing, d.n, d.inner === (nothing, nothing),
+            a[n][1] === nothing, a[n][2] === missing, a[n] === (nothing, missing), a[1][2] === n,
+            t[1][1][1] === nothing, t[1][2])
+end
+# (and compared with a tuple of unknown length, in both orders)
+const RG_SINGLETONS = Ref{Tuple{Vararg{Union{Nothing,Float32}}}}((nothing, nothing))
+function rg_singleton_vararg(n::Int)
+    if n == 1
+        RG_SINGLETONS[] = (nothing, nothing)
+    elseif n == 2
+        RG_SINGLETONS[] = (nothing, 1.0f0)
+    elseif n == 3
+        RG_SINGLETONS[] = (nothing,)
+    else
+        RG_SINGLETONS[] = ()
+    end
+    t = RG_SINGLETONS[]
+    return (t === (nothing, nothing), (nothing, nothing) === t, t === (nothing,), (nothing,) === t, t === ())
+end
+# (and with nested tuples of more types than a tuple of unions is an object of: element by element)
+const RG_NESTED = Ref{NTuple{5,Tuple{Union{Nothing,Int}}}}(ntuple(_ -> (nothing,), 5))
+function rg_singleton_nested(n::Int)
+    s = ((nothing,), (nothing,), (nothing,), (nothing,), (nothing,))
+    if n == 1
+        RG_NESTED[] = s
+    else
+        RG_NESTED[] = ((nothing,), (nothing,), (n,), (nothing,), (nothing,))
+    end
+    t = RG_NESTED[]
+    return (t === s, s === t, t[3] === (nothing,), (nothing,) === t[1])
+end
+
 @testset "regressions" begin
     @wtest rg_unionfield(true, true)
     @wtest rg_unionfield(false, false)
@@ -329,20 +388,22 @@ const RG_HOLES = Vector{Any}(undef, 2)
     for n in 1:2
         @wtest rg_valtype_caught(n)
     end
-    # (natively 0: `Val{3}` is a type no code of the module names, an error here, written to
-    # stderr too, as inference may have removed the handler: `apply_type` does not throw for it)
+    # (natively 0: `Val{3}` is a type no code of the module names, the closed-world limit
+    # here, an error written to stderr too, as inference may have removed the handler)
     let r = wasm_run(wcompile(rg_valtype_caught, (Int,)), "rg_valtype_caught", 3; rettype=Int)
         @test r == -1 || (r isa Tuple && r[1] === :trap)
-        @test occursin("not one of this module's", LAST_OUTPUT[])
+        @test occursin("closed-world limit", LAST_OUTPUT[])
     end
     # (of valid parameters, applications whose types code names: others are the closed world's
     # error, as `Val{3}` above)
     for (i, which) in ((1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3), (4, 1), (4, 2), (4, 3), (4, 4), (5, 4))
         @wtest rg_bad_param(i, which)
     end
+    # (an alias that may erase parameters is refused when compiling: natively `RG_VTUPLE{0,T}`
+    # is `Tuple{}`, a type the module may have, which a lookup by parameters would miss)
     @test rg_erased_bound(0) == 1
-    let r = wasm_run(wcompile(rg_erased_bound, (Int,)), "rg_erased_bound", 0; rettype=Int)
-        @test r in (-1, -2) || (r isa Tuple && r[1] === :trap)
+    let err = try wcompile(rg_erased_bound, (Int,)); nothing catch e; e end
+        @test err isa WasmCodegen.UnsupportedConstructs && occursin("tuple type alias", sprint(showerror, err))
     end
     for flag in (true, false)
         @wtest rg_never_caught(flag)
@@ -383,6 +444,20 @@ const RG_HOLES = Vector{Any}(undef, 2)
     @wtest rg_vt_absent_egal(17)
     @wtest rg_vt_storage(70)
     @wtest rg_vt_field(3); @wtest rg_vt_field(4)
+    for i in 1:5
+        @wtest rg_vt_typevar(i)
+    end
+    for n in (0, 1, 2, 17)
+        @wtest rg_vt_typevar_unknown(n)
+    end
+    for n in 0:3
+        @wtest rg_vt_typevar_mixed(n)
+    end
+    @test rg_vt_typevar_nested(2)
+    let r = wasm_run(wcompile(rg_vt_typevar_nested, (Int,)), "rg_vt_typevar_nested", 2; rettype=Bool)
+        @test r isa Tuple && r[1] === :trap
+        @test occursin("isa of a tuple whose concrete type the module does not have", LAST_OUTPUT[])
+    end
     @wtest rg_type_tuple(true); @wtest rg_type_tuple(false)
     @wtest rg_type_tuple_loop(1); @wtest rg_type_tuple_loop(2)
     @wtest rg_type_many(1.5)
@@ -395,4 +470,9 @@ const RG_HOLES = Vector{Any}(undef, 2)
     end
     @wtest rg_triple(1.5)
     @wtest rg_holes(1.5)
+    @wtest rg_singleton_tuple(1); @wtest rg_singleton_tuple(2)
+    for n in 1:4
+        @wtest rg_singleton_vararg(n)
+    end
+    @wtest rg_singleton_nested(1); @wtest rg_singleton_nested(2)
 end

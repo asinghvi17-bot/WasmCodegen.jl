@@ -23,12 +23,18 @@ The configuration of the code generator:
   `:julia_io`, the host's events (`sleep` on its timers: `Runtime.Host`) and its file modes
   and symbolic links of any target for the filesystem (`js/julia_io.mjs`; waiting needs
   JavaScript Promise Integration);
-- `import_libraries`: libraries whose functions the host provides, declared by the program
-  (`host = :wasi` only): a `ccall((:name, "lib"), RT, (ArgT...), args...)` of one is a call
-  of the Wasm import `lib.name`, with 32- and 64-bit integer arguments and result (or `Cvoid`
-  for none). The code generator neither specifies nor provides these functions: they are the
-  program's interface with a host of its own. The names WasmCodegen uses for its own
-  imports (`wasi_snapshot_preview1`, `julia` and `julia_*`) cannot be declared;
+- `import_libraries`: libraries whose functions the host provides, declared by the program:
+  a `ccall((:name, "lib"), RT, (ArgT...), args...)` of one is a call of the Wasm import
+  `lib.name`, with 32- and 64-bit integer arguments and result (or `Cvoid` for none). An
+  argument may also be bytes, a `Vector{UInt8}`, `String` or `Memory{UInt8}`: they are copied
+  to the linear memory (exported as `memory`), and the import gets two `i32`s, their offset
+  and length (`host.bytes(offset, length)` of `js/julia.mjs`), valid until it returns: a copy,
+  in one direction (natively a `ccall` passes the array itself, whose bytes a C function may
+  write; what the import writes there, the program does not see). The code generator neither
+  specifies nor provides these functions: they are the program's interface with a host of its
+  own. The names WasmCodegen uses for its own imports (`wasi_snapshot_preview1`, `julia` and
+  `julia_*`) cannot be declared, and with them, as for WASI, entry points cannot be named
+  `memory` or `_initialize`;
 - `foreign_functions`: C functions the program implements in Julia, as `(name, library) => f`:
   a `ccall((name, library), ...)` naming that library (a constant string) is a call of `f` (the
   value given, in the image; also for a library of `import_libraries`) with the call's
@@ -65,6 +71,11 @@ Base.@kwdef struct Config
     The code generator emits simple code (a local per value) and leaves allocating locals,
     putting values on the operand stack and the rest to it."
     optimize::Union{Nothing,Cmd} = `-O3`
+    "Whether `muladd` of SIMD vectors (`SIMD128.muladd`) is relaxed SIMD's `relaxed_madd`, fused where
+    the engine's hardware has FMA (as `Base.muladd` may be natively, so results vary by machine);
+    by default a multiply and an add, as scalar `muladd` is, deterministic and for hosts without
+    relaxed SIMD."
+    relaxed_simd::Bool = false
     "The structured IR of each function is kept for the session (the process) and reused by every
     later compilation that has the same function: keyed by its CodeInstance and the module's
     exception mode. Pays off when compilations share code, e.g. a solver compiled for many models
@@ -155,8 +166,8 @@ the loop itself), and the locals of its carried values and results.
 struct LoopTarget
     exit::Int
     cont::Int
-    carries::Vector{CGVal}
-    results::Vector{CGVal}
+    carries::Vector{FlowVal}
+    results::Vector{FlowVal}
 end
 
 """
@@ -167,7 +178,7 @@ results (which a `LeaveOp` assigns before branching there).
 """
 struct TryTarget
     exit::Int
-    results::Vector{CGVal}
+    results::Vector{FlowVal}
 end
 
 """
@@ -183,12 +194,12 @@ mutable struct FnCtx
     b::Builder
     args::Vector{CGVal}
     ssavals::Dict{Int,Any}
-    blockargs::Dict{Int,CGVal}
+    blockargs::Dict{Int,FlowVal}
     loops::Vector{LoopTarget}
     "The number of labels (blocks, loops, ifs) enclosing the current position."
     depth::Int
     "The results of the enclosing ifs, which `YieldOp`s assign (bottom: not assigned)."
-    yields::Vector{Vector{CGVal}}
+    yields::Vector{Vector{FlowVal}}
     "The types of the SSA values of the structured IR."
     ssatypes::Dict{Int,Any}
     "The block arguments (loop carries) that are read somewhere."
@@ -207,12 +218,18 @@ mutable struct FnCtx
     excsaved::Dict{Int,Int}
     "The byte views of pointer owners, by owner local (see `byte_view!`)."
     byteviews::Dict{Int,NTuple{4,Int}}
+    "The typed views of pointer owners, by (owner local, storage): (the owner they were made for,
+    or -1 when made at function entry, array, base, length) (see `typed_view!`)."
+    typedviews::Dict{Tuple{Int,StorageType},NTuple{4,Int}}
+    "The v128 locals of SIMD vectors, by their leaf locals (see simd128.jl)."
+    v128s::Dict{Vector{Int},Int}
 end
 
 FnCtx(cgm::CGModule, info::FuncInfo, sci, b::Builder, args::Vector{CGVal}=CGVal[]) =
-    FnCtx(cgm, info, sci, b, args, Dict{Int,Any}(), Dict{Int,CGVal}(), LoopTarget[], 0,
-          Vector{CGVal}[], Dict{Int,Any}(), Set{Int}(), Uses(), Bool[], 0, TryTarget[],
-          Dict{Int,CGVal}(), Dict{Int,Int}(), Dict{Int,NTuple{4,Int}}())
+    FnCtx(cgm, info, sci, b, args, Dict{Int,Any}(), Dict{Int,FlowVal}(), LoopTarget[], 0,
+          Vector{FlowVal}[], Dict{Int,Any}(), Set{Int}(), Uses(), Bool[], 0, TryTarget[],
+          Dict{Int,CGVal}(), Dict{Int,Int}(), Dict{Int,NTuple{4,Int}}(),
+          Dict{Tuple{Int,StorageType},NTuple{4,Int}}(), Dict{Vector{Int},Int}())
 
 layout(fc::FnCtx, @nospecialize(T)) = layout(fc.cgm.types, T)
 valtypes(fc::FnCtx, @nospecialize(T)) = valtypes(fc.cgm.types, T)

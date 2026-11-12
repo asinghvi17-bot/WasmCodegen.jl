@@ -18,6 +18,17 @@
 // array of strings) and `env` (an object of strings) are WASI's arguments and environment
 // (a WasmCodegen module reads the environment, not yet the arguments: its `ARGS` are still
 // those of the process that compiled it).
+//
+// `imports` are the functions of the libraries the program declares (`Config(import_libraries)`),
+// as import modules (`{ lib: { name: f } }`), or a function of the host returning them. A
+// `Vector{UInt8}`, `String` or `Memory{UInt8}` argument of one is two arguments, the offset and
+// the length of its bytes in the module's memory, which `host.bytes(offset, length)` gives as a
+// Uint8Array (and `host.string(offset, length)` decoded from UTF-8). The bytes are the
+// argument's until the function returns, or until it calls the module: copy them to keep them.
+//
+//   const { instance } = await instantiate(bytes, {
+//     imports: (host) => ({ mylib: { send: (p, n) => deliver(host.bytes(p, n).slice()) } }),
+//   });
 
 const WASI_EBADF = 8, WASI_EINVAL = 28, WASI_ENOSYS = 52, WASI_ENOTDIR = 54, WASI_ENOTSOCK = 57,
   WASI_ENOTSUP = 58, WASI_ESPIPE = 70;
@@ -83,11 +94,12 @@ const cStrings = (strs) => strs.map((x) => new TextEncoder().encode(x + '\0'));
 
 /**
  * The imports of a module (both interfaces), to instantiate it with:
- * `{ imports, attach(instance), flush() }`. For a WASI module (one exporting its memory),
- * `attach` gives the WASI functions the instance's memory and runs its initialization
- * (`_initialize`), as WASI hosts do; a JavaScript module initializes as it is instantiated.
+ * `{ imports, attach(instance), flush(), bytes(offset, length), string(offset, length) }`.
+ * `attach` gives the host the instance's memory, if it exports one (a WASI module, or one
+ * passing bytes to `imports`), and runs a WASI module's initialization (`_initialize`), as
+ * WASI hosts do; a JavaScript module initializes as it is instantiated.
  */
-export function createHost({ write, args = [], env = {} } = {}) {
+export function createHost({ write, args = [], env = {}, imports = {} } = {}) {
   const out = write ?? consoleWriter();
   const argv = cStrings(args.map(String));
   // (an undefined value is no variable, as for Node's WASI)
@@ -232,7 +244,7 @@ export function createHost({ write, args = [], env = {} } = {}) {
     wasi[name] = onFd(name.startsWith('path_') ? () => WASI_ENOTDIR :
                       name.startsWith('sock_') ? () => WASI_ENOTSOCK : undefined);
   }
-  return {
+  const host = {
     imports: { julia, wasi_snapshot_preview1: wasi },
     attach(instance) {
       if (!(instance.exports.memory instanceof WebAssembly.Memory)) return;
@@ -240,7 +252,18 @@ export function createHost({ write, args = [], env = {} } = {}) {
       instance.exports._initialize?.();
     },
     flush() { out.flush?.(); },
+    // the bytes of an argument of a declared import, in the memory (a view: the memory's
+    // buffer is another once the module grows it)
+    bytes: (offset, length) => new Uint8Array(memory.buffer, offset >>> 0, length >>> 0),
+    // (a leading U+FEFF is the string's, not a byte order mark)
+    string: (offset, length) => new TextDecoder('utf-8', { ignoreBOM: true }).decode(host.bytes(offset, length)),
   };
+  // (by own properties: a library may be named as an Object's property, "constructor")
+  for (const [lib, funcs] of Object.entries(typeof imports === 'function' ? imports(host) : imports)) {
+    if (Object.hasOwn(host.imports, lib)) throw new Error(`imports: "${lib}" is a module of the host's own`);
+    Object.defineProperty(host.imports, lib, { value: funcs, enumerable: true, writable: true, configurable: true });
+  }
+  return host;
 }
 
 /**

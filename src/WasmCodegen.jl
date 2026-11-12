@@ -22,6 +22,7 @@ include("errors.jl")
 
 "Functions the code generator calls for what Wasm lacks, compiled into the module on demand."
 module Runtime
+include("runtime/owner.jl")
 include("runtime/int128.jl")
 include("runtime/io.jl")
 include("runtime/methods.jl")
@@ -67,6 +68,7 @@ include("foreigncall.jl")
 include("cfunctions.jl")
 include("runtime_ccalls.jl")
 include("pointers.jl")
+include("simd128.jl")
 include("image.jl")
 include("overlays.jl")
 include("host.jl")
@@ -74,10 +76,13 @@ include("types_runtime.jl")
 include("patches.jl")
 include("driver.jl")
 
-export compile, Entry, Config, UnsupportedConstructs
+export compile, Entry, Config, UnsupportedConstructs, install_trim_patches!
 
 function __init__()
     COMPILER_WORLD[] = Base.get_world_counter()
+    # (a system image's: by the worlds of the process that made it)
+    empty!(RESIDENT_STANDINS)
+    RESIDENT_PATCH_MODULE[] === nothing || (RESIDENT_WORLD[] = typemin(UInt))
     Runtime.BUILD_JLOPTIONS[] = Runtime.sanitized_jloptions()
 end
 
