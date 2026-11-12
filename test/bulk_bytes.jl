@@ -111,6 +111,34 @@ function bb_overlap(n::Int)
     return (s, bb_sum(v))
 end
 
+# copies between a memory of bytes and one of wider elements, both ways, of whole elements
+# (element by element) and of parts of them (offset or length not a multiple of the element
+# size: byte by byte), into destinations whose other bytes must be kept
+function bb_partial_of(::Type{T}, n::Int) where {T}
+    s = sizeof(T)
+    src = bb_bytes(s * n + 2s)
+    s0 = UInt64(0)
+    for (off, len) in ((0, s * n), (s, s * (n - 1)), (0, s * n - 1), (1, s * n - 1),
+                       (s - 1, s * n - s + 2), (3, 2), (s + 1, s * n - 3), (2, 1))
+        (len < 0 || off + len + 1 > s * (n + 1)) && continue   # (within `w`)
+        w = T[reinterpret(T, bb_bits(T, i)) for i in 1:n+1]
+        b = zeros(UInt8, s * n + 2s + 8)
+        GC.@preserve src w b begin
+            pw, pb = Ptr{UInt8}(pointer(w)), pointer(b)
+            bb_copy!(pw + off, pointer(src) + 3, len)      # bytes to elements
+            bb_copy!(pb + 5, pw + off, len + 1)            # elements to bytes (one more)
+            bb_copy!(pb + off, pw + s, len)                # elements to bytes at `off`
+        end
+        for x in w; s0 = s0 * 31 + UInt64(reinterpret(bb_uint(T), x)); end
+        s0 = s0 * 31 + bb_sum(b)[2]
+    end
+    return s0
+end
+bb_uint(::Type{T}) where {T} = sizeof(T) == 8 ? UInt64 : sizeof(T) == 4 ? UInt32 : UInt16
+bb_bits(::Type{T}, i::Int) where {T} = (UInt64(i) * 0x9e3779b97f4a7c15) % bb_uint(T)
+bb_partial(n::Int) = (bb_partial_of(Float64, n), bb_partial_of(Float32, n), bb_partial_of(Float16, n),
+                      bb_partial_of(Int64, n), bb_partial_of(UInt32, n), bb_partial_of(Int16, n))
+
 @testset "bulk copies of bytes" begin
     for n in (0, 1, 7, 4096, 70_001)
         @wtest bb_write(n)
@@ -122,6 +150,10 @@ end
     end
     for n in (2, 5, 1000)
         @wtest bb_overlap(n)
+    end
+    for n in (1, 3, 64)
+        @test bb_partial(n) isa NTuple{6,UInt64}   # (natively: not an exception, which @wtest takes as a trap)
+        @wtest bb_partial(n)
     end
 end
 

@@ -88,7 +88,7 @@ function wide_bytes_of!(from_wide::Bool, b::Memory{UInt8}, j::Int, o::Memory{T},
     s = sizeof(T)
     U = s == 8 ? UInt64 : s == 4 ? UInt32 : UInt16
     ((off | m) % s == 0 && 0 <= off && m <= s * length(o) - off) || return false
-    # (the bytes of an element unrolled: `s` is a constant)
+    # (the bytes of an element unrolled: `s` is a constant; little-endian, as Wasm is)
     i = j
     if from_wide
         for k in off ÷ s + 1:(off + m) ÷ s
