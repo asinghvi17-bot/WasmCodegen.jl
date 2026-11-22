@@ -263,6 +263,7 @@ function ptr_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
     end
     if o !== nothing && !is_object_origin(o) && T === o.eltype && !byte_addressable(fc, T)
         # a whole element of a memory whose elements are not stored as bytes
+        check_element_aligned!(fc, o)
         return outlined_memoryrefget!(fc, element_ref!(fc, o, i, T), const_value(fc, false), T)
     end
     isbitstype(T) || unsupported("a load of a ", T, " through a pointer")
@@ -270,8 +271,7 @@ function ptr_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
     leaves = LeafVal[]
     for (P, off) in bit_leaves(T)
         if P === :owner
-            # a pointer loaded from memory: an address without owner
-            push!(leaves, Inst(:ref_null, fc.cgm.types.jlvalue))
+            push!(leaves, load_owner!(fc, p, byte, off))
             continue
         end
         bits = load_bits!(fc, p, byte, off, nbytes(P), P)
@@ -291,7 +291,8 @@ end
 function ptr_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
     T = v.typ
     o = p.origin
-    if o !== nothing && !is_object_origin(o) && memory_layout(fc.cgm.types, o.eltype).storage isa RefType
+    if o !== nothing && !is_object_origin(o) && memory_layout(fc.cgm.types, o.eltype).storage isa RefType &&
+       !(T === o.eltype && isbitstype(T))
         # a memory of references: only clearing (storing a null pointer) is meaningful
         (isconstant(v) && constant_value(v) == C_NULL && !Base.allocatedinline(o.eltype)) ||
             unsupported("storing a ", v.typ, " through a pointer into a memory of ", o.eltype)
@@ -299,6 +300,7 @@ function ptr_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
         # (natively one pointer per element, the `i`-th pointer the `i`-th element; here an
         # element is `stride` reference leaves, all null: undefined, as `unset_element!`)
         el = new_local!(fc, I32)
+        check_element_aligned!(fc, o)
         push_leaf!(fc, o.index)
         emit!(fc.b, :i32_const, elem_unit(o.eltype)); emit!(fc.b, :i32_div_u)
         if !(isconstant(i) && constant_value(i) == 1)
@@ -317,17 +319,57 @@ function ptr_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
         return p
     end
     if o !== nothing && !is_object_origin(o) && T === o.eltype && !byte_addressable(fc, T)
+        check_element_aligned!(fc, o)
         outlined_memoryrefset!(fc, element_ref!(fc, o, i, T), v, const_value(fc, false))
         return p
     end
     isbitstype(T) || unsupported("a store of a ", T, " through a pointer")
     byte = byte_offset!(fc, p, i, T)
     for ((P, off), leaf) in bits_value_leaves(fc, v, T)
-        P === :owner && continue
+        if P === :owner
+            store_owner!(fc, p, byte, off, leaf)
+            continue
+        end
         bits = leaf_to_bits!(fc, leaf, P)
         store_bits!(fc, p, byte, off, nbytes(P), bits, P)
     end
     return p
+end
+
+# The owner of the pointer whose address is at `byte + off`. Only the pointer fields of
+# mutable objects (a `Ref{Ptr{T}}`, a field of a mutable struct) have one: the bytes of a
+# memory hold an address alone, and a pointer loaded from them cannot be dereferenced.
+function load_owner!(fc::FnCtx, p::CGVal, byte, off::Int)
+    kind, b = byte
+    kind === :static && return Inst(:ref_null, fc.cgm.types.jlvalue)
+    owner = new_local!(fc, jlvalue_ref(fc.cgm.types))
+    emit!(fc.b, :local_get, b); off != 0 && (emit!(fc.b, :i64_const, off); emit!(fc.b, :i64_add))
+    push_leaf!(fc, ptr_owner(p))
+    call!(fc.b, ptr_byte_helper!(fc.cgm, :loadowner))
+    emit!(fc.b, :local_set, owner)
+    return owner
+end
+
+# store the owner `leaf` of the pointer whose address was stored at `byte + off` (after the
+# address: a store of the bytes of an address clears the owner, `object_byte_access!`)
+function store_owner!(fc::FnCtx, p::CGVal, byte, off::Int, leaf::LeafVal)
+    kind, b = byte
+    kind === :static && return
+    emit!(fc.b, :local_get, b); off != 0 && (emit!(fc.b, :i64_const, off); emit!(fc.b, :i64_add))
+    push_leaf!(fc, ptr_owner(p))
+    push_leaf!(fc, leaf)
+    call!(fc.b, ptr_byte_helper!(fc.cgm, :storeowner))
+    return
+end
+
+# trap when the origin `o` is between two elements of its memory, whose elements are not
+# stored as bytes: an access of a whole element there has no bytes to address
+function check_element_aligned!(fc::FnCtx, o::PtrOrigin)
+    sz = elem_unit(o.eltype)
+    sz > 1 || return
+    push_leaf!(fc, o.index); emit!(fc.b, :i32_const, sz); emit!(fc.b, :i32_rem_u)
+    if!(fc.b); unreachable!(fc.b); end!(fc.b)
+    return
 end
 
 # the MemoryRef of the element at the byte offset of the origin, plus `i - 1` elements
@@ -697,8 +739,10 @@ end
 (`kind` `:load`, `:store`): a byte of the memory a pointer without a static origin points
 into, found from its owner's kind at run time; `jl_ptr_load_bits4/8(address, owner) -> i64` or
 `jl_ptr_store_bits4/8(address, owner, bits)` (`:load4`, `:load8`, `:store4`, `:store8`): 4 or 8
-bytes at once (see `finish_typed_ptr_helper!`); or `jl_ptr_byte_view(owner) -> (array, base,
-len)` (`:view`), the byte view of an owner (`byte_view!`). Their bodies are generated with the
+bytes at once (see `finish_typed_ptr_helper!`); `jl_ptr_load_owner(address, owner) -> owner` or
+`jl_ptr_store_owner(address, owner, stored)` (`:loadowner`, `:storeowner`): the owner of the
+pointer whose address is at `address` (see `finish_owner_helper!`); or `jl_ptr_byte_view(owner)
+-> (array, base, len)` (`:view`), the byte view of an owner (`byte_view!`). Their bodies are generated with the
 module's types (`finish_pointers!`).
 """
 function ptr_byte_helper!(cgm::CGModule, kind)
@@ -706,6 +750,8 @@ function ptr_byte_helper!(cgm::CGModule, kind)
         jl = jlvalue_ref(cgm.types)
         kind === :load ? add_func!(cgm.mod, "jl_ptr_load_byte", ValType[I64, jl], ValType[I32]) :
         kind === :store ? add_func!(cgm.mod, "jl_ptr_store_byte", ValType[I64, jl, I32], ValType[]) :
+        kind === :loadowner ? add_func!(cgm.mod, "jl_ptr_load_owner", ValType[I64, jl], ValType[jl]) :
+        kind === :storeowner ? add_func!(cgm.mod, "jl_ptr_store_owner", ValType[I64, jl, jl], ValType[]) :
         # 4 or 8 bytes at a time, falling back to the byte helpers
         kind in (:load8, :load4) ? (ptr_byte_helper!(cgm, :load);
                                    add_func!(cgm.mod, "jl_ptr_load_bits" * string(kind)[end], ValType[I64, jl], ValType[I64])) :
@@ -755,7 +801,10 @@ struct ObjectLeaf
     off::Int
     n::Int
     elem::Union{Nothing,Tuple{TypeRef,Int}}
+    # for the address of a `Ptr`, the field (0-based, of the last step's struct) of its owner
+    owner::Union{Nothing,Int}
 end
+ObjectLeaf(steps, storage, off, n, elem) = ObjectLeaf(steps, storage, off, n, elem, nothing)
 
 # the leaves of a value of the isbits type `FT` at byte offset `off`, stored in the Wasm
 # fields `ws` (1-based) of the struct type `st` reached by `steps`
@@ -768,9 +817,10 @@ function object_leaves!(out::Vector{ObjectLeaf}, ts::Types, @nospecialize(FT), o
     elseif l.kind === Inline && (isprimitivetype(FT) || is_ptr_type(FT))
         bl = bit_leaves(FT, off)
         length(bl) == length(ws) || return push!(out, ObjectLeaf(nothing, I8, off, sizeof(FT), nothing))
+        owner = is_ptr_type(FT) ? ws[2] - 1 : nothing
         for ((P, poff), w) in zip(bl, ws)
             P === :owner && continue
-            push!(out, ObjectLeaf([steps; (st, w - 1)], fields[w].storage, poff, nbytes(P), nothing))
+            push!(out, ObjectLeaf([steps; (st, w - 1)], fields[w].storage, poff, nbytes(P), nothing, owner))
         end
     elseif l.kind === Inline
         for j in 1:fieldcount(FT)
@@ -891,12 +941,78 @@ function push_leaf_steps!(b::Builder, obj::Int, steps, stg::Union{Nothing,Storag
     end
 end
 
+# store the byte in local 2 at byte offset `boff` (a local) of the leaf `lf` of a large
+# immutable field of the object in the local `obj`: the field's boxes and its tuple's array
+# are values other values may share, so the object gets copies of them with the byte replaced
+function store_shared_leaf!(b::Builder, f::Func, obj::Int, boff::Int, lf::ObjectLeaf, locals::Dict{Any,Int})
+    steps, stg = lf.steps::Vector{Tuple{TypeRef,Int}}, lf.storage
+    loc(key, t) = get!(() -> add_local!(f, t), locals, key)
+    # the boxes on the way to the leaf (the one each step but the last reads)
+    olds = Int[]
+    emit!(b, :local_get, obj)
+    for k in 1:length(steps)-1
+        sst, w = steps[k]
+        inner = steps[k+1][1]
+        emit!(b, :struct_get, sst, w); emit!(b, :ref_cast, inner)
+        push!(olds, loc((:old, k, inner), RefType(inner, true)))
+        emit!(b, :local_tee, olds[end])
+    end
+    sst, w = steps[end]
+    if lf.elem !== nothing
+        # a copy of the array, the byte's element replaced in it
+        at, s = lf.elem
+        a, new = loc((:old, at), RefType(at, true)), loc((:new, at), RefType(at, true))
+        eoff = loc(:eoff, I64)
+        emit!(b, :struct_get, sst, w); emit!(b, :ref_cast, at); emit!(b, :local_tee, a)
+        emit!(b, :array_len); emit!(b, :array_new_default, at); emit!(b, :local_set, new)
+        emit!(b, :local_get, new); emit!(b, :i32_const, 0); emit!(b, :local_get, a); emit!(b, :i32_const, 0)
+        emit!(b, :local_get, a); emit!(b, :array_len)
+        emit!(b, :array_copy, at, at)
+        push_byte_elem!(b, new, boff, s)
+        push_byte_elem!(b, new, boff, s)
+        get_elem_bits!(b, at, stg)
+        emit!(b, :local_get, boff); emit!(b, :i64_const, s); emit!(b, :i64_rem_u)
+        emit!(b, :local_set, eoff)
+        replace_byte!(b, eoff)
+        bits_to_storage!(b, stg)
+        emit!(b, :array_set, at)
+        val = new
+    else
+        emit!(b, stg isa PackedType ? :struct_get_u : :struct_get, sst, w)
+        storage_to_bits!(b, stg)
+        replace_byte!(b, boff)
+        bits_to_storage!(b, stg)
+        vt = stg isa PackedType ? I32 : stg
+        val = loc((:val, vt), vt)
+        emit!(b, :local_set, val)
+    end
+    # copies of the boxes from the innermost, each holding the copy made before it
+    for k in length(steps):-1:2
+        sst, w = steps[k]
+        old = olds[k-1]
+        fields = (typedef(b.mod, sst).comp::StructType).fields
+        for i in 0:length(fields)-1
+            if i == w
+                emit!(b, :local_get, val)
+            else
+                emit!(b, :local_get, old)
+                emit!(b, fields[i+1].storage isa PackedType ? :struct_get_u : :struct_get, sst, i)
+            end
+        end
+        emit!(b, :struct_new, sst)
+        val = loc((:new, k, sst), RefType(sst, true))
+        emit!(b, :local_set, val)
+    end
+    sst, w = steps[1]
+    emit!(b, :local_get, obj); emit!(b, :local_get, val); emit!(b, :struct_set, sst, w)
+end
+
 # the byte at offset `off` of a mutable object of struct type `st` (local 1), among its
 # isbits leaves; a padding byte reads as zero. A byte of a large immutable field (in a box
-# or a tuple's array, which other values may share) is read there; storing into it, or
-# accessing a byte whose field isn't addressable, traps
+# or a tuple's array, which other values may share) is read there, and stored into a copy
+# (`store_shared_leaf!`); accessing a byte whose field isn't addressable traps
 function object_byte_access!(b::Builder, f::Func, kind::Symbol, off::Int, boff::Int,
-                             st::TypeRef, leaves::Vector{ObjectLeaf}, objs::Dict{TypeRef,Int})
+                             st::TypeRef, leaves::Vector{ObjectLeaf}, objs::Dict{Any,Int}, jl::TypeRef)
     obj = get!(() -> add_local!(f, RefType(st, true)), objs, st)
     emit!(b, :local_get, 1); emit!(b, :ref_cast, st); emit!(b, :local_set, obj)
     for lf in leaves
@@ -906,8 +1022,11 @@ function object_byte_access!(b::Builder, f::Func, kind::Symbol, off::Int, boff::
         emit!(b, :local_set, boff)
         emit!(b, :local_get, boff); emit!(b, :i64_const, lf.n); emit!(b, :i64_lt_u)
         if!(b)
-        if lf.steps === nothing || (kind === :store && (length(lf.steps) > 1 || lf.elem !== nothing))
+        if lf.steps === nothing || (kind === :store && lf.owner !== nothing && length(lf.steps) > 1)
+            # (a pointer in a box: a copy would keep the owner of the address replaced)
             unreachable!(b)
+        elseif kind === :store && (length(lf.steps) > 1 || lf.elem !== nothing)
+            store_shared_leaf!(b, f, obj, boff, lf, objs)
         elseif kind === :load && lf.elem !== nothing
             at, s = lf.elem
             push_leaf_steps!(b, obj, lf.steps, nothing)
@@ -934,8 +1053,15 @@ function object_byte_access!(b::Builder, f::Func, kind::Symbol, off::Int, boff::
             replace_byte!(b, boff)
             bits_to_storage!(b, stg)
             emit!(b, :struct_set, sst, w)
+            if lf.owner !== nothing
+                # the bytes of an address: it is no longer the address of a pointer into its
+                # owner (a store of a pointer sets its owner after its address, `ptr_store!`)
+                emit!(b, :local_get, obj)
+                emit!(b, :ref_null, jl)
+                emit!(b, :struct_set, sst, lf.owner)
+            end
         end
-        lf.steps === nothing || (kind === :store && (length(lf.steps) > 1 || lf.elem !== nothing)) || return!(b)
+        return!(b)
         end!(b)
     end
     kind === :load && emit!(b, :i32_const, 0)
@@ -1096,17 +1222,21 @@ function finish_pointers!(cgm::CGModule)
             return!(b)
             end!(b)
         end
-        objs = Dict{TypeRef,Int}()
+        objs = Dict{Any,Int}()
         for (id, st, leaves) in objects
             emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
             if!(b)
-            object_byte_access!(b, f, kind, off, boff, st, leaves, objs)
+            object_byte_access!(b, f, kind, off, boff, st, leaves, objs, cgm.types.jlvalue)
             end!(b)
         end
         # an owner whose bytes are not addressable (a Ref, a memory of references or of
         # elements stored otherwise than as Julia lays them out)
         unreachable!(b)
         finish!(b)
+    end
+    for kind in (:loadowner, :storeowner)
+        f = get(cgm.helpers, (:ptr, kind), nothing)
+        f === nothing || finish_owner_helper!(cgm, f, kind, object_owners(cgm))
     end
     for stg in (F64, F32, I64, I32)
         f = get(cgm.helpers, (:ptr, (:view, stg)), nothing)
@@ -1117,6 +1247,53 @@ function finish_pointers!(cgm::CGModule)
         f === nothing && continue
         finish_typed_ptr_helper!(cgm, f, kind, byte_owners(cgm), leaf_memory_owners(cgm))
     end
+end
+
+# the body of `jl_ptr_load_owner(address, owner) -> owner` or `jl_ptr_store_owner(address,
+# owner, stored)`: the owner leaf of the pointer field of a mutable object whose address leaf
+# is at `address`. Anywhere else an address is stored without its owner: the load gives null
+# (a pointer that cannot be dereferenced) and the store does nothing.
+function finish_owner_helper!(cgm::CGModule, f::Func, kind::Symbol, objects)
+    b = Builder(cgm.mod, f)
+    jl = cgm.types.jlvalue
+    off = add_local!(f, I64)
+    tid = add_local!(f, I32)
+    objs = Dict{TypeRef,Int}()
+    emit!(b, :local_get, 1); emit!(b, :ref_is_null)
+    if!(b); unreachable!(b); end!(b)
+    emit!(b, :local_get, 0)
+    emit!(b, :local_get, 1)
+    call!(b, object_hash_func!(cgm))
+    emit!(b, :i64_extend_i32_u); emit!(b, :i64_const, 32); emit!(b, :i64_shl)
+    emit!(b, :i64_sub)
+    emit!(b, :local_set, off)
+    emit!(b, :local_get, 1); emit!(b, :struct_get, jl, 0)
+    emit!(b, :local_set, tid)
+    for (id, st, leaves) in objects
+        # (a store into a pointer in a box trapped at its address)
+        ptrs = filter(lf -> lf.owner !== nothing && (kind === :loadowner || length(lf.steps) == 1), leaves)
+        isempty(ptrs) && continue
+        obj = get!(() -> add_local!(f, RefType(st, true)), objs, st)
+        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+        if!(b)
+        emit!(b, :local_get, 1); emit!(b, :ref_cast, st); emit!(b, :local_set, obj)
+        for lf in ptrs
+            steps = lf.steps::Vector{Tuple{TypeRef,Int}}
+            emit!(b, :local_get, off); emit!(b, :i64_const, lf.off); emit!(b, :i64_eq)
+            if!(b)
+            if kind === :loadowner
+                push_leaf_steps!(b, obj, [steps[1:end-1]; (steps[end][1], lf.owner)], nothing)
+            else
+                emit!(b, :local_get, obj); emit!(b, :local_get, 2)
+                emit!(b, :struct_set, steps[end][1], lf.owner)
+            end
+            return!(b)
+            end!(b)
+        end
+        end!(b)
+    end
+    kind === :loadowner && emit!(b, :ref_null, jl)
+    finish!(b)
 end
 
 # the body of `jl_ptr_load_bits{n}(address, owner) -> i64` or

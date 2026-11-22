@@ -18,6 +18,8 @@ let basedir = joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "base")
             Meta.isexpr(def, :function) || continue
             call = def.args[1]
             Meta.isexpr(call, :call) && call.args[1] === name && sel(call) || continue
+            WasmCodegen.check_base_source("wasm-specialize.jl", call, file,
+                                          (def.args[2].args[1]::LineNumberNode).line)
             return def
         end
         error("wasm-specialize.jl: no definition of $name in $file")

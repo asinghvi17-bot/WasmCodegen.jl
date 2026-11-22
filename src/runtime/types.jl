@@ -129,6 +129,12 @@ struct NoEltype end
 "`Base.typeinfo_eltype(T)`, `NoEltype` for `nothing`: the element type a context of type `T` implies."
 typeinfo_eltype(@nospecialize(T)) = (e = Base.typeinfo_eltype(T); e === nothing ? NoEltype : e::Type)
 
+"What `typeinfo_implicit` gives where Base's is `true` (a table of a function of types holds types)."
+struct ImplicitTypeinfo end
+"`Base.typeinfo_implicit(T)`, as `ImplicitTypeinfo` or `Nothing`: whether the values of the type `T` are printed without it."
+# (a program adds methods to it: its table is computed in the program's world, see `map_value!`)
+typeinfo_implicit(@nospecialize(T)) = Base.typeinfo_implicit(T)::Bool ? ImplicitTypeinfo : Nothing
+
 "The types of the fields of a `Pair` type `T` (`fieldtype(T, 1)`, `fieldtype(T, 2)`), for `show` of a pair in a context of `T`; `Any` for other types."
 # (total: `map_type` computes them for every type of the module, `Union{}` among them, which is
 # `<: Pair` but has no fields; a context of `Union{}` holds no pair)

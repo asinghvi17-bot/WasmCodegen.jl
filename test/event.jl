@@ -90,15 +90,17 @@ function await_before()::Int64
         IO_.close(h)
     end
 end
-# a timer that fired does not end the wait for another: its ms
+# a timer that fired does not end the wait for another: the ms since the other was started
+# (-1: it is not ready after the wait)
 function await_unrelated()::Int64
     a = IO_.timer_start(Int64(1_000_000))
+    t0 = time_ns()
     b = IO_.timer_start(Int64(40_000_000))
     try
         sleep(0.005)
-        t0 = time_ns()
         H.await_handle(b)
-        return ms_since(t0)
+        ms = ms_since(t0)
+        return polled(b) ? ms : Int64(-1)
     finally
         IO_.close(a)
         IO_.close(b)
@@ -267,7 +269,7 @@ using .EventTests: EventTests as EV
     close(t)
     @test run_ev(EV.sleep_zero_yields; rettype=Int64) > 0
     @test run_ev(EV.await_before; rettype=Int64) < 10_000
-    @test run_ev(EV.await_unrelated; rettype=Int64) >= 30
+    @test run_ev(EV.await_unrelated; rettype=Int64) >= 40
     @test run_ev(EV.close_twice; rettype=Int32) == 8
     @test run_ev(EV.bad_handle; rettype=Int32) == 8
     @test run_ev(EV.arenas_restored; rettype=Int32) == 1
@@ -289,6 +291,8 @@ using .EventTests: EventTests as EV
         end
         @test e isa WasmCodegen.UnsupportedConstructs && occursin("host_extensions = [:julia_io]", sprint(showerror, e))
     end
+    # the host's `poll` on ranges outside the module's memory (of a size no i32 too): EINVAL
+    @test read(`$(node_cmd()) $(jspi_flags()) $(joinpath(@__DIR__, "poll_host.mjs"))`, String) == ""
 end
 
 @testset "host file modes: julia_io (path_mode, path_chmod, path_symlink)" begin

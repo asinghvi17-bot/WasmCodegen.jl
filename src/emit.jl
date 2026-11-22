@@ -233,9 +233,10 @@ end
 # Julia's IR does not require the values of a phi on an edge to be of the phi's type (a
 # branch on a type test narrows them), which IRStructurizer's terminator validation
 # requires of the yields replacing phis: validate everything else.
-# Loops stay `LoopOp`s and `WhileOp`s, with their own exit conditions: promoting them to
-# counting `ForOp`s gains nothing on Wasm, and a `ForOp` has neither the signedness of the
-# comparison it came from (`ult_int`) nor room for an inclusive bound at `typemax`
+# Loops stay `LoopOp`s, with their own exit conditions (`promote=false`: no `WhileOp` or
+# `ForOp` is made): promoting them gains nothing on Wasm, and a `ForOp` has neither the
+# signedness of the comparison it came from (`ult_int`) nor room for an inclusive bound at
+# `typemax`
 function structurize(ir::CC.IRCode)
     sci = StructuredIRCode(ir; validate=false, promote=false, exceptions=:structured)
     IRStructurizer.validate_scf(sci.entry)
@@ -773,8 +774,8 @@ function analyze_split_unions!(fc::FnCtx, block)
     end
     # the statements of the block `b` and its terminator, with the destinations the emitter
     # assigns its values to: `yields` of a yield, `loop` (carries, results) of a `continue` and
-    # a `break`, `conds` (results, arguments of the after region) of a `while`'s condition
-    function scan!(b, yields, loop, conds=nothing)
+    # a `break`
+    function scan!(b, yields, loop)
         for inst in IRStructurizer.instructions(b)
             st, id = inst[:stmt], inst.ssa_idx
             T = fc.ssatypes[id]
@@ -787,12 +788,6 @@ function analyze_split_unions!(fc::FnCtx, block)
                 cs = argkeys(st.body.args)
                 flow!(st.init_values, cs)
                 scan!(st.body, yields, (cs, reskeys(id)))
-            elseif st isa IRStructurizer.WhileOp
-                cs = argkeys(st.before.args)
-                flow!(st.init_values, cs)
-                rs = reskeys(id)
-                scan!(st.before, yields, (cs, rs), (rs, argkeys(st.after.args)))
-                scan!(st.after, cs, (cs, rs))
             elseif st isa IRStructurizer.ControlFlowOp
                 # (a `try`'s results, and the values of any other operation, are not split)
                 foreach(escape!, IRStructurizer.operands(st))
@@ -828,9 +823,6 @@ function analyze_split_unions!(fc::FnCtx, block)
             flow!(t.values, loop === nothing ? () : loop[1])
         elseif t isa IRStructurizer.BreakOp
             flow!(t.values, loop === nothing ? () : loop[2])
-        elseif t isa IRStructurizer.ConditionOp
-            escape!(t.condition)
-            conds === nothing ? flow!(t.args, ()) : foreach(ks -> flow!(t.args, ks), conds)
         elseif t !== nothing
             escape!(t)
         end
@@ -945,9 +937,8 @@ function collect_ptr_flow!(stmts, incoming, carrytypes, block, carries)
             add_incoming!(incoming, carrytypes, st.body.args, st.init_values)
             collect_ptr_flow!(stmts, incoming, carrytypes, st.body, st.body.args)
         elseif st isa IRStructurizer.ControlFlowOp
-            inner = st isa IRStructurizer.ForOp || st isa IRStructurizer.WhileOp ? IRStructurizer.BlockArgument[] : carries
             for b in IRStructurizer.blocks(st)
-                collect_ptr_flow!(stmts, incoming, carrytypes, b, inner)
+                collect_ptr_flow!(stmts, incoming, carrytypes, b, carries)
             end
         end
     end
@@ -1077,61 +1068,6 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.LoopOp, @nospecialize(typ))
     emit_block!(fc, op.body)
     pop!(fc.loops)
     # falling off the end of the body does not happen (it continues or breaks)
-    is_unreachable(fc.b) || unreachable!(fc.b)
-    end!(fc.b); close_label!(fc)
-    end!(fc.b); close_label!(fc)
-    return MultiVal(results)
-end
-
-function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
-    carries = carry_vals!(fc, op.before.args)
-    assign_all!(fc, carries, op.init_values)
-    bind_block_args!(fc, op.before.args, carries)
-    results = FlowVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
-    block!(fc.b); exit = open_label!(fc)
-    loop!(fc.b); cont = open_label!(fc)
-    push!(fc.loops, LoopTarget(exit, cont, carries, results))
-    # the before region, up to its condition
-    for inst in IRStructurizer.instructions(op.before)
-        is_unreachable(fc.b) && break
-        stmt = inst[:stmt]
-        typ_i = CC.widenconst(inst[:type])
-        if stmt isa IRStructurizer.ControlFlowOp
-            fc.opidx = inst.ssa_idx
-            fc.ssavals[inst.ssa_idx] = emit_cfop!(fc, stmt, typ_i)
-        else
-            res = emit_stmt_or_trap!(fc, stmt, typ_i, inst.ssa_idx)
-            res isa CGVal && res.kind !== Bottom && typ_i !== Union{} &&
-                (res = convert_repr(fc, res, typ_i))
-            res === nothing || (fc.ssavals[inst.ssa_idx] = res)
-            typ_i === Union{} && !is_unreachable(fc.b) && unreachable!(fc.b)
-        end
-    end
-    if !is_unreachable(fc.b)
-        term = op.before.terminator
-        if term isa IRStructurizer.ConditionOp
-            c = convert_repr(fc, operand(fc, term.condition), Bool)
-            # on false: the condition's values are the results
-            push_val!(fc, c)
-            emit!(fc.b, :i32_eqz)
-            if!(fc.b); open_label!(fc)
-            assign_all!(fc, results, term.args)
-            br!(fc.b, br_depth(fc, exit))
-            end!(fc.b); close_label!(fc)
-            # on true: they are the arguments of the after region
-            afterargs = FlowVal[carry_val!(fc, a, nothing) for a in op.after.args]
-            assign_all!(fc, afterargs, term.args)
-            bind_block_args!(fc, op.after.args, afterargs)
-            # the after region yields the next carried values
-            push!(fc.yields, carries); push!(fc.yields_if, false)
-            emit_block!(fc, op.after)
-            pop!(fc.yields); pop!(fc.yields_if)
-            is_unreachable(fc.b) || br!(fc.b, br_depth(fc, cont))
-        else
-            emit_terminator!(fc, term)
-        end
-    end
-    pop!(fc.loops)
     is_unreachable(fc.b) || unreachable!(fc.b)
     end!(fc.b); close_label!(fc)
     end!(fc.b); close_label!(fc)

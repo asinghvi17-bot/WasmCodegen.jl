@@ -298,9 +298,10 @@ function task_entry(id::Int32)::Int32
         call_body(t.code, t)
     end
     finish!(t)
+    # (the task keeps its id while it idles: the host's loop turns by a switch to itself)
+    nxt = idle_next()
     TASKS[id] = nothing
     delete!(IDS, t)
-    nxt = idle_next()
     # (the next task's id first: it must differ from this one, which is free once its stack
     # can no longer run: no task runs before `host_exit`)
     nxt === nothing || set_task_tid(nxt, Cint(0))
@@ -400,24 +401,31 @@ function process_events(timeout_ns::Int64)
         # (closes to complete: no waiting)
         wait_ns = isempty(CLOSING) ? timeout_ns : Int64(0)
         if n <= POLL_MAX
-            got = poll!(1, n, wait_ns)
+            got = poll!(READY, INTEREST, 1, n, wait_ns)
             if got == -EINVAL && wait_ns == -1
                 fail_waiters!(Host.HostCallError(EINVAL, Host.errmsg(Int32(-1))))
                 got = Int32(0)
             end
             got < 0 && Host.throw_host(-got, Int32(-1))
         else
-            # (more handles than a poll takes: polls of each part of them, which do not wait;
-            # for a wait, while none is ready, a wait of a millisecond on the first part)
+            # (more handles than a poll takes: polls of each part of them, which do not wait,
+            # merged in the order they became ready; for a wait, while none is ready, a wait
+            # of a millisecond on the first part, then the polls again)
+            part = Int32[]
+            # (the host's loop turns before them: the timers started since its last turn
+            # are armed, and those due are in the polls' answers)
+            timeout_ns == 0 || (ct = current_task(); host_switch(task_id(ct), task_id(ct)))
             while true
                 for i in 1:POLL_MAX:n
-                    got = poll!(i, min(i + POLL_MAX - 1, n), Int64(0))
+                    empty!(part)
+                    got = poll!(part, INTEREST, i, min(i + POLL_MAX - 1, n), Int64(0))
                     got < 0 && Host.throw_host(-got, Int32(-1))
+                    merge_ready!(part)
                 end
                 (isempty(READY) && wait_ns != 0) || break
-                got = poll!(1, POLL_MAX, Int64(1_000_000))
+                empty!(part)
+                got = poll!(part, INTEREST, 1, POLL_MAX, Int64(1_000_000))
                 got < 0 && Host.throw_host(-got, Int32(-1))
-                isempty(READY) || break
             end
         end
         r = length(READY)
@@ -439,23 +447,54 @@ const POLLS = Ref(0)
 "The handles one `julia_io.poll` takes at most."
 const POLL_MAX = 1024
 
-# one `julia_io.poll` of `INTEREST[i:j]`, waiting `wait_ns`: the handles ready appended to
-# `READY` (all of them first: a timer's callback calls the host); their count, or the negated
-# errno
-function poll!(i::Int, j::Int, wait_ns::Int64)
+# one `julia_io.poll` of the handles `hs[i:j]`, waiting `wait_ns`: the handles ready appended
+# to `ready` (all of them first: a timer's callback calls the host); their count, or the
+# negated errno
+function poll!(ready::Vector{Int32}, hs::Vector{Int32}, i::Int, j::Int, wait_ns::Int64)
     n = j - i + 1
     return Staging.with_scope() do
         interest = Staging.alloc_record(4n)
         out = Staging.alloc_record(4n)
         for k in 0:n-1
-            Staging.store32(interest + UInt32(4k), INTEREST[i + k] % UInt32)
+            Staging.store32(interest + UInt32(4k), hs[i + k] % UInt32)
         end
         got = JuliaIO.poll(interest, Int32(n), wait_ns, out, Int32(n))
         for k in 0:Int(got)-1
-            push!(READY, Staging.load32(out + UInt32(4k)) % Int32)
+            push!(ready, Staging.load32(out + UInt32(4k)) % Int32)
         end
         got
     end
+end
+
+# Merge the ready handles `part` of a poll into `READY`, both in the order the host gave
+# them (the order they became ready), keeping it. Only the host knows that order, of at most
+# `POLL_MAX` handles a poll: the next handles of each, half a poll's, are polled together
+# (they are ready still), and of the answer, those up to the last of either's are in their
+# place, whatever follows them in the other.
+function merge_ready!(part::Vector{Int32})
+    (isempty(READY) || isempty(part)) && return append!(READY, part)
+    a = copy(READY)
+    empty!(READY)
+    half = POLL_MAX ÷ 2
+    i = j = 1
+    both, sorted = Int32[], Int32[]
+    while i <= length(a) && j <= length(part)
+        ia, jb = min(i + half - 1, length(a)), min(j + half - 1, length(part))
+        empty!(both); empty!(sorted)
+        append!(both, view(a, i:ia)); append!(both, view(part, j:jb))
+        got = poll!(sorted, both, 1, length(both), Int64(0))
+        got < 0 && Host.throw_host(-got, Int32(-1))
+        # (not all of them ready any more: as they were)
+        length(sorted) == length(both) || break
+        for h in sorted
+            push!(READY, h)
+            i <= ia && h == a[i] ? (i += 1) : (j += 1)
+            (i > ia || j > jb) && break
+        end
+    end
+    append!(READY, view(a, i:length(a)))
+    append!(READY, view(part, j:length(part)))
+    return READY
 end
 
 function fail_waiters!(e::Host.HostCallError)
@@ -524,6 +563,9 @@ function timer_ms(timeoutms::UInt64, intervalms::UInt64)
     TIMERS[h] = t
     return t
 end
+# (built field by field: Base's constructor starts a libuv timer)
+fieldnames(Timer) == (:handle, :cond, :isopen, :set, :timeout_ms, :interval_ms) ||
+    error("Base.Timer's fields changed: `new_timer` (runtime/tasks.jl) builds one by their order")
 @eval new_timer(h::Ptr{Cvoid}, tms::UInt64, ims::UInt64) =
     $(Expr(:new, Timer, :h, :(Base.ThreadSynchronizer()), true, false, :tms, :ims))
 

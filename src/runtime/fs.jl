@@ -99,8 +99,21 @@ path_link(oldfd::Int32, flags::UInt32, old::UInt32, oldlen::UInt32, newfd::Int32
 # 0o644, directories 0o755 and links 0o777 (`stat`), `chmod` fails with ENOTSUP and the modes
 # of new files are the host's; symbolic links through WASI's `path_symlink`.
 
+# the WASI errnos the file system tells apart, and the guest libc's of its own failures
+const WASI_EAGAIN = Errno.wasi(:EAGAIN)
+const WASI_EBADF = Errno.wasi(:EBADF)
+const WASI_EEXIST = Errno.wasi(:EEXIST)
+const WASI_EINTR = Errno.wasi(:EINTR)
+const WASI_ENAMETOOLONG = Errno.wasi(:ENAMETOOLONG)
+const WASI_ENOENT = Errno.wasi(:ENOENT)
+const WASI_ENOSYS = Errno.wasi(:ENOSYS)
+const WASI_ENOTSUP = Errno.wasi(:ENOTSUP)
+const WASI_ENOTCAPABLE = Errno.wasi(:ENOTCAPABLE)
+const EBADF = Errno.guest_errno(WASI_EBADF)
+const EINVAL = Errno.guest_errno(Errno.wasi(:EINVAL))
+
 "The errno of a host without file modes (ENOSYS)."
-const NO_MODES = Int32(52)
+const NO_MODES = WASI_ENOSYS
 # (read through a global, so that inference does not fold the defaults' results into their
 # callers: a replacement must still be called)
 const NO_MODES_RESULT = Ref(NO_MODES)
@@ -169,7 +182,7 @@ function preopens()
     fd = Int32(3)
     while true
         r = fd_prestat_get(fd, Staging.SCRATCH_OUT)
-        r == 8 && break # EBADF
+        r == WASI_EBADF && break
         Runtime.wasi_check(r, "fd_prestat_get")
         if Staging.load8(Staging.SCRATCH_OUT) == 0x00
             name = prestat_name(fd, Staging.load32(Staging.SCRATCH_OUT + UInt32(4)))
@@ -293,7 +306,7 @@ function read_link(fd::Int32, rel::String)
         result = readlink_result(fd, rel, cap)
         result === nothing || return result
         # A full buffer is ambiguous even for an exactly-capacity target.
-        cap == Staging.CHUNK && return uv(Int32(37)) # ENAMETOOLONG
+        cap == Staging.CHUNK && return uv(WASI_ENAMETOOLONG)
         cap *= UInt32(2)
     end
 end
@@ -495,6 +508,9 @@ store_le!(p::Ptr{UInt8}, off::Int, v::UInt64, n::Int) =
 load_le(p::Ptr{UInt8}, off::Int, n::Int) =
     foldl((acc, k) -> acc | UInt64(unsafe_load(p, off + k + 1)) << (8k), 0:n-1; init=UInt64(0))
 
+# a time of `ns` nanoseconds in seconds, rounded as `jl_stat_mtime` rounds a `timespec`
+stat_time(ns::UInt64) = Float64(ns ÷ UInt64(10^9)) + Float64(ns % UInt64(10^9)) * 1e-9
+
 # fill `buf` from the filestat at `fs` (in the linear memory) and the mode `mode`
 function fill_stat!(buf::Ptr{UInt8}, fs::UInt32, mode::UInt32)
     L = Staging.load64
@@ -509,8 +525,8 @@ function fill_stat!(buf::Ptr{UInt8}, fs::UInt32, mode::UInt32)
     store_le!(buf, 40, size, 8)
     store_le!(buf, 48, SYNTH_BLKSIZE, 8)
     store_le!(buf, 56, cld(size, UInt64(512)), 8)
-    store_le!(buf, 64, reinterpret(UInt64, L(fs + UInt32(48)) / 1e9), 8)
-    store_le!(buf, 72, reinterpret(UInt64, L(fs + UInt32(56)) / 1e9), 8)
+    store_le!(buf, 64, reinterpret(UInt64, stat_time(L(fs + UInt32(48)))), 8)
+    store_le!(buf, 72, reinterpret(UInt64, stat_time(L(fs + UInt32(56)))), 8)
     return nothing
 end
 
@@ -518,7 +534,7 @@ function stat_path(path::String, buf::Ptr{UInt8}, follow::Bool)
     # (a trailing separator follows the last component, as stat(2) of `link/`)
     follow |= trailing_sep(path)
     # the mode first: `with_abspath` checks the path, which uses the scratch the filestat is in
-    m = something(with_abspath((off, len) -> path_mode(off, len, Int32(follow)), path), -Int32(44))
+    m = something(with_abspath((off, len) -> path_mode(off, len, Int32(follow)), path), -WASI_ENOENT)
     fs = Staging.SCRATCH_OUT
     r = with_path(path) do fd, off, len
         path_filestat_get(fd, follow ? SYMLINK_FOLLOW : UInt32(0), off, len, fs)
@@ -528,7 +544,7 @@ function stat_path(path::String, buf::Ptr{UInt8}, follow::Bool)
     # the type with no permission)
     ft = Staging.load8(fs + UInt32(16))
     mode = m >= 0 ? UInt32(m) : m == -NO_MODES ? type_bits(ft) | default_perms(ft) : type_bits(ft)
-    m < 0 && m != -Int32(44) && m != -NO_MODES && return uv(-m)
+    m < 0 && m != -WASI_ENOENT && m != -NO_MODES && return uv(-m)
     fill_stat!(buf, fs, mode)
     return Int32(0)
 end
@@ -642,7 +658,7 @@ function host_allowed(dir::String)
     for _ in 1:10
         probe = string(dir, "/.jl_mode_probe_", string(Runtime.entropy() % 1_000_000_000))
         r = with_path((fd, off, len) -> path_create_directory(fd, off, len), probe)
-        r == 20 && continue          # (EEXIST: another name)
+        r == WASI_EEXIST && continue # (another name)
         r == 0 || return nothing
         m = perm_bits(probe)
         with_path((fd, off, len) -> path_remove_directory(fd, off, len), probe)
@@ -771,7 +787,7 @@ function jl_fs_chmod(path::Cstring, mode::Cint)
     r = with_abspath((off, len) -> path_chmod(off, len, Int32(mode)), p)
     r === nothing && return check_path(p)
     # (a host without modes: ENOTSUP)
-    r == NO_MODES && return uv(Int32(58))
+    r == NO_MODES && return uv(WASI_ENOTSUP)
     return r == 0 ? Int32(0) : uv(r)
 end
 
@@ -858,7 +874,7 @@ function read_dirents!(entries::Vector{Tuple{String,UInt8}}, dfd::Int32)
         used < cap && return Int32(0)
         if cookie == previous
             # No complete entry fit. Grow up to the staging chunk limit, then fail.
-            cap == Staging.CHUNK && return Int32(37) # ENAMETOOLONG
+            cap == Staging.CHUNK && return WASI_ENAMETOOLONG
             cap *= UInt32(2)
             buf = Staging.alloc_data(cap)
         end
@@ -1009,7 +1025,7 @@ function uv_fs_futime(loop::Ptr{Cvoid}, req::Ptr{Cvoid}, fd::RawFD, atime::Float
 end
 "`futimes(fd, NULL)` (libc, `touch`): both times now; times given (not NULL) are not supported."
 function futimes(fd::Cint, tv::Ptr{Cvoid})
-    tv == C_NULL || (ccall(:jl_set_errno, Cvoid, (Cint,), Cint(22)); return Cint(-1))
+    tv == C_NULL || (ccall(:jl_set_errno, Cvoid, (Cint,), Cint(EINVAL)); return Cint(-1))
     r = fd_filestat_set_times(Int32(fd), UInt64(0), UInt64(0), UInt32(2 | 8))
     r == 0 && return Cint(0)
     ccall(:jl_set_errno, Cvoid, (Cint,), Cint(libc_errno(r)))
@@ -1044,14 +1060,14 @@ copy_in!(off::UInt32, src::Ptr{UInt8}, i::Int, n::Int) =
 # `_enonfatal`: WASI's EINTR or EAGAIN, after which ios.c tries a read or a write again
 # (libuv only after EINTR; a host interrupting it endlessly is an error, never the end of the
 # input)
-enonfatal(r::Int32) = r == Int32(27) || r == Int32(6)
+enonfatal(r::Int32) = r == WASI_EINTR || r == WASI_EAGAIN
 const MAX_TRIES = 1_000_000
 
 # the WASI errno of a read or write of a descriptor: one without the right to it (WASI's
-# ENOTCAPABLE, 76, its rights those of how it was opened) is EBADF (8), as natively a
+# ENOTCAPABLE, its rights those of how it was opened) is EBADF, as natively a
 # descriptor not open for reading or writing is (for a path, ENOTCAPABLE is EACCES: one
 # leaving the preopens)
-fd_errno(r::Int32) = r == Int32(76) ? Int32(8) : r
+fd_errno(r::Int32) = r == WASI_ENOTCAPABLE ? WASI_EBADF : r
 
 # Synchronous hosts can retry EINTR, but cannot wait for readiness on EAGAIN: libuv reports
 # it; ios.c's `_os_read` and `_os_write` try again (`eagain`).
@@ -1069,7 +1085,7 @@ function write_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1); 
     while true
         r = offset < 0 ? fd_write(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT) :
             fd_pwrite(fd, Staging.SCRATCH_IOVEC, UInt32(1), UInt64(offset), Staging.SCRATCH_OUT)
-        if r == Int32(27) || (eagain && r == Int32(6))
+        if r == WASI_EINTR || (eagain && r == WASI_EAGAIN)
             (tries += 1) > MAX_TRIES && throw(Base._UVError("write", uv(r)))
             continue
         end
@@ -1086,7 +1102,7 @@ function read_once(fd::Int32, off::UInt32, n::UInt32, offset::Int64=Int64(-1); e
     while true
         r = offset < 0 ? fd_read(fd, Staging.SCRATCH_IOVEC, UInt32(1), Staging.SCRATCH_OUT) :
             fd_pread(fd, Staging.SCRATCH_IOVEC, UInt32(1), UInt64(offset), Staging.SCRATCH_OUT)
-        if r == Int32(27) || (eagain && r == Int32(6))
+        if r == WASI_EINTR || (eagain && r == WASI_EAGAIN)
             (tries += 1) > MAX_TRIES && throw(Base._UVError("read", uv(r)))
             continue
         end
@@ -1270,7 +1286,6 @@ end
 ## ios.c's system calls, over WASI: they set errno on failure, as the C library does; a
 ## negative fd (a closed stream's) is EBADF
 
-const EBADF = Int32(9)
 const SEEK_SET = UInt32(0)
 const SEEK_CUR = UInt32(1)
 const SEEK_END = UInt32(2)
@@ -1339,7 +1354,7 @@ end
 function ftruncate(fd::Int, length::Int64)
     wfd = wasi_fd(fd)
     wfd < 0 && (set_errno(EBADF); return Cint(-1))
-    length < 0 && (set_errno(22); return Cint(-1))
+    length < 0 && (set_errno(EINVAL); return Cint(-1))
     r = fd_filestat_set_size(wfd, UInt64(length))
     r == 0 || (set_errno(libc_errno(r)); return Cint(-1))
     return Cint(0)
@@ -2056,13 +2071,14 @@ end
 cwd_restore_wasm(h::SavedCwd) = cd_wasm(h.path)
 
 @noinline tempdir() = original(Base.Filesystem.tempdir)::String
-"`tempdir()`: `TMPDIR`, `TMP`, `TEMP`, `TEMPDIR` of the environment, else `/tmp`, as libuv's."
+"`tempdir()`: the first of `TMPDIR`, `TMP`, `TEMP`, `TEMPDIR` the environment has, even
+empty, else `/tmp`, as libuv's `uv_os_tmpdir`. (Base's warnings of a path that is not a
+directory are log messages, which a trimmed program does not print.)"
 function tempdir_wasm()
     for name in ("TMPDIR", "TMP", "TEMP", "TEMPDIR")
         v = FS.host_env(name)
-        if v !== nothing && !isempty(v)
-            return length(v) > 1 && endswith(v, '/') ? String(chop(v)) : v
-        end
+        v === nothing && continue
+        return length(v) > 1 && endswith(v, '/') ? String(chop(v)) : v
     end
     return "/tmp"
 end

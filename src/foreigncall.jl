@@ -676,6 +676,8 @@ end
 
 ## C library calls implemented by the runtime
 
+const RUNTIME_CCALL_KINDS = (:val, :ref, :array, :bytes, :skip)
+
 """
     RuntimeCcall(f, args)
 
@@ -687,6 +689,12 @@ Fortran passes them: the scalar), `:array` (a pointer into an array: a `MemoryRe
 struct RuntimeCcall
     f::Any
     args::Vector{Symbol}
+    function RuntimeCcall(@nospecialize(f), args::Vector{Symbol})
+        all(in(RUNTIME_CCALL_KINDS), args) ||
+            throw(ArgumentError(string("the arguments of a RuntimeCcall are each one of ",
+                                       join(RUNTIME_CCALL_KINDS, ", "), ", not ", args)))
+        return new(f, args)
+    end
 end
 
 const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
@@ -796,10 +804,10 @@ const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
 
 # BLAS (libblastrampoline's ILP64 names, `dgemm_64_`): an argument by reference is loaded
 # (`:ref`), an array is passed as a reference to its first element where possible
-# (`:array`), the lengths of character arguments Fortran adds are dropped (`:ignore`)
+# (`:array`), the lengths of character arguments Fortran adds are dropped (`:skip`)
 for (p, T) in (("d", Float64), ("s", Float32))
     B = Runtime.BLAS
-    r, a, v, x = :ref, :array, :val, :ignore
+    r, a, v, x = :ref, :array, :val, :skip
     for (name, f, kinds) in (
             ("$(p)copy_", B.copy!, [r, a, r, a, r]),
             ("$(p)scal_", B.scal!, [r, r, a, r]),
@@ -874,6 +882,7 @@ function emit_runtime_ccall!(fc::FnCtx, r::RuntimeCcall, args::Vector{Any}, @nos
             push!(vals, o !== nothing && !o.terminated && is_ptr_type(a.typ) && o.eltype === UInt8 ?
                         element_ref!(fc, o, const_value(fc, 1), UInt8) : a)
         end
+        # (`:skip`: dropped)
     end
     res = call_runtime!(fc, r.f, vals)
     return res.kind === Ghost ? ghost(Nothing, nothing) : res

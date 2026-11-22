@@ -26,12 +26,17 @@ struct Compilation
 end
 
 """
-    compile(entries; config=Config(), validate=true) -> Compilation
+    compile(entries; config=Config(), validate=true, world=nothing) -> Compilation
 
 Compile the entry points (`Entry`s, or `(f, argtypes)` tuples) and everything they call
 to a WebAssembly module, as juliac compiles a program: the closed world of the entry
 points is collected, compiled, and the objects it refers to are serialized into the
 module.
+
+The program is compiled as of the latest world, with juliac's patches (`config.trim_patches`).
+With `world`, as of that world, as it is: the patches would be methods of a later world,
+so none is applied (but those of an open session, [`with_trim_patches`](@ref), in the
+worlds it gives).
 """
 function compile(entries::Vector; config::Config=Config(), validate::Bool=true,
                  world::Union{Nothing,UInt}=nothing)
@@ -123,13 +128,18 @@ end
 The function the entry point `e` exports: the function of `info` where it takes the entry's
 argument types as they are; else (varargs, packed in a tuple; arguments of the method's
 signature wider than the entry's, `@nospecialize`) one taking the entry's arguments (a type
-object, a ghost, takes none) that calls it as a call does.
+object, a ghost, takes none) that calls it as a call does. Where exceptions are caught, the
+call runs with no current exception, as outside any handler (an earlier call a trap left
+from within a handler did not restore it), and its caller's is restored after, when it
+returns and when it throws (an import called in a handler may call an export).
 """
 function entry_function!(cgm::CGModule, info::FuncInfo, e::Entry)
     m = info.mi.def
     spec = Any[Base.unwrap_unionall(info.mi.specTypes).parameters...]
     sig = Any[spec[1], e.argtypes...]
-    (m isa Method && m.isva) || sig != spec || return info.func
+    # (a task's entry clears the current exception itself, and ends in another task)
+    reset = cgm.exceptions !== :none && e.f !== Runtime.Tasks.task_entry
+    (m isa Method && m.isva) || sig != spec || reset || return info.func
     params = ValType[]
     foreach(T -> append!(params, valtypes(cgm, T)), sig)
     f = add_func!(cgm.mod, helper_name(cgm, "entry"), params, info.func.results)
@@ -145,8 +155,31 @@ function entry_function!(cgm::CGModule, info::FuncInfo, e::Entry)
             k += length(l.leaves)
         end
     end
+    if reset
+        exc = current_exception_global!(cgm)
+        saved = new_local!(fc, jlvalue_ref(cgm.types))
+        emit!(fc.b, :global_get, exc); emit!(fc.b, :local_set, saved)
+        emit!(fc.b, :ref_null, cgm.types.jlvalue); emit!(fc.b, :global_set, exc)
+    end
+    if reset
+        # (whatever leaves the call, an exception of the module's or of the host's, is thrown
+        # on once the caller's is restored)
+        block!(fc.b, RefType(:exn, false))
+        try_table!(fc.b, :empty, [(3, nothing, 0)])
+    end
     r = emit_call_info!(fc, info, args)
-    is_unreachable(fc.b) || r.kind === Bottom || push_val!(fc, r)
+    if !is_unreachable(fc.b)
+        reset && (emit!(fc.b, :local_get, saved); emit!(fc.b, :global_set, exc))
+        r.kind === Bottom || push_val!(fc, r)
+        reset && emit!(fc.b, :return)
+    end
+    if reset
+        end!(fc.b)
+        unreachable!(fc.b)
+        end!(fc.b)
+        emit!(fc.b, :local_get, saved); emit!(fc.b, :global_set, exc)
+        throw_ref!(fc.b)
+    end
     finish!(fc.b)
     return f
 end
@@ -246,6 +279,8 @@ function finish_module!(cgm::CGModule)
     finish_cfunctions!(cgm)
     finish_image!(cgm)
     finish_type_maps!(cgm)
+    # (the tables by type id are of the types the module has from here on)
+    ntypes = length(cgm.types.typelist)
     finish_typeof!(cgm)
     t = time_ns()
     finish_apply_type!(cgm)
@@ -263,6 +298,9 @@ function finish_module!(cgm::CGModule)
     finish_types!(cgm)
     finish_subtype!(cgm)
     finish_host!(cgm)
+    length(cgm.types.typelist) == ntypes ||
+        error("WasmCodegen: ", length(cgm.types.typelist) - ntypes, " types added after the tables over types (",
+              join(cgm.types.typelist[ntypes+1:end], ", "), ")")
 end
 
 """

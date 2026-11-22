@@ -91,9 +91,10 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     elseif m.module === Runtime.Tasks && m.name in TASK_PRIMITIVES
         return emit_task_primitive!(fc, m.name, mi, ex)
     elseif fc.cgm.config.tasks === :none && m.module === Base &&
-           (m.name === :enq_work || (m.name === :wait && length(mi.specTypes.parameters) == 1))
+           (m.sig === Tuple{typeof(Base.enq_work),Task} || m.sig === Tuple{typeof(Base.wait)})
         # one task: waiting can only wait forever, and there is no other task to schedule (in
-        # place of the scheduler: task switches, the C runtime's queues and threads)
+        # place of the scheduler: task switches, the C runtime's queues and threads). Base's
+        # `enq_work(t::Task)` and `wait()`, by their signatures.
         msg = m.name === :wait ? "deadlock: waiting in a program of one task" : "scheduling a task in a program of one task"
         return throw_error!(fc, Runtime.throw_concurrency_error, () -> const_value(fc, msg))
     elseif m.module === Runtime.EqTables && m.name === :unset!

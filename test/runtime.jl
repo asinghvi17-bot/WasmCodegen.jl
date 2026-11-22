@@ -195,6 +195,10 @@ rt_typeintersect(x::Int) = (typeintersect(x > 0 ? Vector{Int} : Vector, Abstract
     @testset "rt_findprev_bytes" begin @wtest rt_findprev_bytes(35) end
     @testset "rt_symcmp" begin @wtest rt_symcmp(50) end
     @testset "rt_gensym" begin @wtest rt_gensym(20) end
+    @testset "the build process's gensym counter" begin
+        c = WasmCodegen.Runtime.native_gensym_counter()
+        @test String(gensym()) == string("##", c)
+    end
     @testset "rt_libc_rand" begin @wtest rt_libc_rand(0x000000000000002a) end
     @testset "rt_libc_rand" begin @wtest rt_libc_rand(0xffffffffffffffff) end
     @testset "rt_rand_seeded" begin @wtest rt_rand_seeded(1) end

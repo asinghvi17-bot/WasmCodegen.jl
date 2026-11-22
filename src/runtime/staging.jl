@@ -279,6 +279,9 @@ const WASI_NAMES = (:SUCCESS, :E2BIG, :EACCES, :EADDRINUSE, :EADDRNOTAVAIL, :EAF
     :EPROTOTYPE, :ERANGE, :EROFS, :ESPIPE, :ESRCH, :ESTALE, :ETIMEDOUT, :ETXTBSY, :EXDEV,
     :ENOTCAPABLE)
 
+"The WASI errno named `name` (`:ENOENT`)."
+wasi(name::Symbol) = Int32(something(findfirst(==(name), WASI_NAMES)) - 1)
+
 "The fixed guest libc errno of each WASI errno (index: the WASI errno + 1)."
 const LINUX = Int32[0, 7, 13, 98, 99, 97, 11, 114, 9, 74, 16, 125, 10, 103, 111,
     104, 35, 89, 33, 122, 17, 14, 27, 113, 43, 84, 115, 4, 22, 5, 106, 21, 40, 24,

@@ -476,3 +476,102 @@ end
     end
     @wtest rg_singleton_nested(1); @wtest rg_singleton_nested(2)
 end
+
+## builtins called as the runtime rejects them (as natively: the same exceptions)
+
+@noinline rb_op(x) = Base.inferencebarrier(x)
+mutable struct RBConst; const a::Int; b::Int; end
+struct RBImm; a::Int; end
+rb_sym(s::Symbol) = s === :getfield ? 1 : s === :setfield! ? 2 : s === :isdefined ? 3 : s === :fieldtype ? 4 : s === :<: ? 5 : s === :getglobal ? 6 : 9
+rb_exp(@nospecialize(T)) = T === Symbol ? 1 : T === Union{Int,Symbol} ? 2 : T === Type ? 3 : 9
+rb_got(@nospecialize(x)) = x isa Int32 ? 1 + Int(x) : x isa Bool ? 20 + Int(x) : x isa Int ? 40 + x :
+                           x isa Core.TypeofVararg ? 60 : x isa Type ? 61 : x isa String ? 62 : 99
+rb_ctx(@nospecialize(c)) = c isa String ? ncodeunits(c) : 7
+rb_msg(m::String) = (s = 0; for c in codeunits(m); s += Int(c); end; s)
+function rb_err(@nospecialize(e))::Int
+    e isa TypeError && return -(1000rb_sym(e.func) + 100rb_exp(e.expected) + rb_got(e.got) + 100000rb_ctx(e.context))
+    if e isa ErrorException
+        m = e.msg
+        return m isa String ? -10000 - rb_msg(m) : -4
+    end
+    return e isa UndefRefError ? -1 : e isa BoundsError ? -2 : -3
+end
+# splat of a vector with unset elements
+rb_splat_len(n::Int) = try v = Vector{Any}(undef, n); n > 2 && (v[1] = 1; v[2] = 2; v[3] = 3); t = (v...,); length(t) catch e; rb_err(e) end
+rb_splat_str(n::Int) = try v = Vector{String}(undef, n); n > 1 && fill!(v, "ab"); t = (v...,); length(t) + ncodeunits(t[1]) catch e; rb_err(e) end
+function rb_splat_union(n::Int)
+    v = Vector{Union{Nothing,Int}}(undef, n); n > 2 && (v[2] = 7)
+    t = (v...,); i = rb_op(1)::Int
+    Int(t[i] === nothing) + 2Int(t[i] isa Nothing) + 10(n > 2 ? t[2]::Int : 0) + 100length(t)
+end
+function rb_splat_missing(n::Int)
+    v = Vector{Union{Missing,Float64}}(undef, n); v[n] = 2.5
+    t = (v...,); i = rb_op(1)::Int
+    (t[i] === missing, t[n]::Float64, length(t))
+end
+rb_sizeof(n::Int) = (sizeof(Memory{Union{Nothing,Int}}(undef, n)), sizeof(Memory{Union{Missing,Bool}}(undef, n)),
+                     sizeof(Memory{Union{Nothing,Int8,Int}}(undef, n)), sizeof(Memory{Int}(undef, n)), sizeof(Memory{Int8}(undef, n)),
+                     sizeof(AtomicMemory{Union{Nothing,Int}}(undef, n)), sizeof(AtomicMemory{Int8}(undef, n)),
+                     sizeof(AtomicMemory{Union{Nothing,Int8}}(undef, n)))
+rb_getfield(i::Int) = try getfield(rb_op((i, 2.0))::Tuple{Int,Float64}, i % Int32) isa Int ? 1 : 2 catch e; rb_err(e) end
+rb_getfield_c(i::Int) = try getfield(rb_op((i, 2.0))::Tuple{Int,Float64}, Int32(1)) isa Int ? 1 : 2 catch e; rb_err(e) end
+rb_getfield_b(i::Int) = try getfield(rb_op(Ref(i))::Base.RefValue{Int}, i > 0)::Int catch e; rb_err(e) end
+rb_getfield_any(i::Int) = try getfield(rb_op((i, 2.0)), i % Int32) isa Int ? 1 : 2 catch e; rb_err(e) end
+rb_getfield_mod(i::Int) = try getfield(Base, i % Int32) isa Int ? 1 : 2 catch e; rb_err(e) end
+rb_getfield_anymod(i::Int) = try getfield(rb_op(Base), i % Int32) isa Int ? 1 : 2 catch e; rb_err(e) end
+rb_isdefined(i::Int) = try isdefined(rb_op(Ref(i))::Base.RefValue{Int}, i % Int32) ? 1 : 2 catch e; rb_err(e) end
+rb_isdefined_ok(i::Int) = try isdefined(rb_op(Ref(i))::Base.RefValue{Int}, i) ? 1 : 2 catch e; rb_err(e) end
+rb_fieldtype(i::Int) = try fieldtype(Base.RefValue{Int}, i % Int32) === Int ? 1 : 2 catch e; rb_err(e) end
+rb_fieldtype_ok(i::Int) = try fieldtype(Base.RefValue{Int}, i) === Int ? 1 : 2 catch e; rb_err(e) end
+rb_setfield_idx(i::Int) = try setfield!(rb_op(Ref(i))::Base.RefValue{Int}, i % Int32, 2)::Int catch e; rb_err(e) end
+function rb_setconst(i::Int)
+    c = rb_op(RBConst(i, 2))::RBConst
+    r = try setfield!(c, :a, 5)::Int catch e; rb_err(e) end
+    r2 = try setfield!(c, 1, 5)::Int catch e; rb_err(e) end
+    setfield!(c, :b, 9)
+    (r, r2, c.a, c.b)
+end
+rb_setimm(i::Int) = try setfield!(rb_op(RBImm(i))::RBImm, :a, 5)::Int catch e; rb_err(e) end
+rb_setmod(i::Int) = try setfield!(Base, i % Int32, 5)::Int catch e; rb_err(e) end
+rb_setmod_c(i::Int) = try setfield!(Base, Int32(1), i)::Int catch e; rb_err(e) end
+rb_setmod_s(i::Int) = try setfield!(Base, :rb_nothing, i)::Int catch e; rb_err(e) end
+rb_settuple(i::Int) = try setfield!(rb_op((i, 2))::Tuple{Int,Int}, 1, 5)::Int catch e; rb_err(e) end
+rb_sub(i::Int) = (x = rb_op(i == 1 ? 1 : i == 2 ? Vararg{Int} : i == 3 ? Int : String); try (x <: Integer) ? 1 : 0 catch e; rb_err(e) end)
+rb_sub_r(i::Int) = (x = rb_op(i == 1 ? 1 : i == 3 ? Int : Real); try (Int <: x) ? 1 : 0 catch e; rb_err(e) end)
+rb_sub_c(i::Int) = try Core.:(<:)(1, Int) ? 1 : 0 catch e; rb_err(e) end
+rb_sub_c2(i::Int) = try Core.:(<:)(Int, 1) ? 1 : 0 catch e; rb_err(e) end
+
+# a float of a primitive type that is not Wasm's
+rb_bfloat(a::UInt16, b::UInt16) = reinterpret(UInt16, Base.add_float(reinterpret(Core.BFloat16, a), reinterpret(Core.BFloat16, b)))
+
+# `muladd` of Float16s rounds the product, as natively (where it is not fused)
+rb_muladd16(a::Float16, b::Float16, c::Float16) = muladd(a, b, c)
+
+@testset "builtins on arguments they reject, unset elements, sizes" begin
+    @wtest rb_muladd16(Float16(3.3), Float16(0.7), Float16(-1.1))
+    @wtest rb_muladd16(Float16(1.1), Float16(1.3), Float16(0.4))
+    # `<:` of a value that is not a type: a TypeError
+    for i in 1:4; @wtest rb_sub(i); end
+    for i in (1, 3, 4); @wtest rb_sub_r(i); end
+    @wtest rb_sub_c(1); @wtest rb_sub_c2(1)
+    # a splat of a vector with unset elements: an UndefRefError (zero bits where the elements are bits)
+    for n in (0, 2, 3); @wtest rb_splat_len(n); end
+    for n in (0, 1, 3); @wtest rb_splat_str(n); end
+    for n in (1, 3); @wtest rb_splat_union(n); @wtest rb_splat_missing(n); end
+    # the size of a memory of a union of bits types counts its selector bytes
+    for n in (0, 3); @wtest rb_sizeof(n); end
+    # a field index that is neither an Int nor a Symbol, a const field, an immutable value
+    for f in (rb_getfield, rb_getfield_mod, rb_getfield_anymod, rb_getfield_c, rb_getfield_b, rb_getfield_any, rb_isdefined, rb_isdefined_ok, rb_fieldtype,
+              rb_fieldtype_ok, rb_setfield_idx, rb_setconst, rb_setimm, rb_settuple, rb_setmod, rb_setmod_c, rb_setmod_s)
+        @eval @wtest $f(1)
+    end
+    @wtest rb_isdefined_ok(2); @wtest rb_fieldtype_ok(2)
+    report = try
+        WasmCodegen.compile(rb_bfloat, (UInt16, UInt16); config = test_config(optimize = nothing))
+        ""
+    catch e
+        e isa WasmCodegen.UnsupportedConstructs || rethrow()
+        sprint(showerror, e)
+    end
+    @test occursin("a float intrinsic on values of type", report) && occursin("BFloat16", report)
+end

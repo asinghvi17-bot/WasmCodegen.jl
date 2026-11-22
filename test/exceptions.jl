@@ -362,7 +362,53 @@ end
 # an exception nothing catches
 uncaught(i::Int) = i > 0 ? throw(CodedError(i)) : (try i catch; -1 end)
 
+# an exception that leaves the module from within a handler: the next call has no current
+# exception
+function escapes_handler(k::Int)
+    if k == 1
+        try error("boom") catch; error("again") end
+    end
+    try rethrow() catch e; ncodeunits((e::ErrorException).msg::String) end
+end
+
+# an index of `memoryrefnew` that is no Int: a TypeError
+function memoryref_index(i)
+    try
+        r = Core.memoryrefnew(Memory{Int}(undef, 2))
+        Core.memoryrefnew(r, i, true)
+        return 0
+    catch e
+        return e isa TypeError && e.func === :memoryrefnew && e.expected === Int && e.got === i ? 1 : 2
+    end
+end
+
+# (an index whose type inference does not know; of 1.13's form from a Memory too)
+function memoryref_index_any(i)
+    j = Base.inferencebarrier(i)
+    try
+        m = Memory{Int}(undef, 2)
+        m[2] = 7
+        r = Core.memoryrefnew(Core.memoryrefnew(m), j, true)
+        @static VERSION >= v"1.13-" && (r = Core.memoryrefnew(m, j, true))
+        return Core.memoryrefget(r, :not_atomic, true)
+    catch e
+        return e isa TypeError && e.func === :memoryrefnew && e.expected === Int && e.got === i ? 1 : 2
+    end
+end
+
 @testset "exceptions" begin
+    for i in (UInt64(2), 2, 0x02, 3)
+        @wtest memoryref_index_any(i)
+    end
+    @wtest memoryref_index(UInt64(1))
+    @wtest memoryref_index(1)
+    @wtest memoryref_index(0x01)
+    let c = wcompile(escapes_handler, (Int,))
+        @test wasm_run(c, "escapes_handler", 2; rettype=Int) == escapes_handler(2) == 43
+        r = wasm_run(c, "escapes_handler", 1; rettype=Int)
+        @test r isa Tuple && r[1] === :trap
+        @test wasm_run(c, "escapes_handler", 2; rettype=Int) == 43
+    end
     for b in -1:1
         @wtest catch_div(7, b)
     end

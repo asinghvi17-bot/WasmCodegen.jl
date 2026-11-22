@@ -115,12 +115,12 @@ function trim_check_in_world(entries::Vector{Core.MethodInstance}, world::UInt, 
         # (and the methods of the overlay method tables the module compiles in place of the
         # native ones called, verified as entries)
         targets = filter(mi -> !(mi in roots),
-                         [uncompiled_invoke_targets(codeinfos); replacement_targets(codeinfos, replacement)])
+                         [uncompiled_invoke_targets(codeinfos, world); replacement_targets(codeinfos, replacement)])
         isempty(targets) && break
         append!(roots, targets)
         codeinfos = verify_inference(roots, world, extensions)
     end
-    link_invoke_targets!(codeinfos)
+    link_invoke_targets!(codeinfos, world)
     io = IOBuffer()
     try
         redirect_stdout(devnull) do
@@ -153,14 +153,13 @@ function verify_inference(roots::Vector{Any}, world::UInt, extensions=())
 end
 
 # the code instances of `codeinfos` the verifier links invokes to, by method instance: those
-# (native, or the module's interpreter's) valid in the current world, of the instance itself
-# (`get_verify_typeinf_trim`'s)
-function linkable_code(codeinfos::Vector{Any})
-    now = Base.get_world_counter()
+# (native, or the module's interpreter's) valid in the program's `world`, of the instance
+# itself (`get_verify_typeinf_trim`'s)
+function linkable_code(codeinfos::Vector{Any}, world::UInt)
     code = IdDict{Core.MethodInstance,Core.CodeInstance}()
     for item in codeinfos
         item isa Core.CodeInstance && (item.owner === nothing || item.owner isa WasmCacheOwner) &&
-            item.min_world <= now <= item.max_world &&
+            item.min_world <= world <= item.max_world &&
             CC.get_ci_mi(item) === item.def && (code[item.def] = item)
     end
     return code
@@ -174,8 +173,8 @@ function invoked_instance(@nospecialize(st))
 end
 
 # the method instances `codeinfos` invoke without a code instance of them in `codeinfos`
-function uncompiled_invoke_targets(codeinfos::Vector{Any})
-    code = linkable_code(codeinfos)
+function uncompiled_invoke_targets(codeinfos::Vector{Any}, world::UInt)
+    code = linkable_code(codeinfos, world)
     targets = Core.MethodInstance[]
     for i in 1:length(codeinfos)
         codeinfos[i] isa Core.CodeInstance || continue
@@ -189,8 +188,8 @@ end
 
 # the invokes of a bare method instance with a code instance in `codeinfos`, of that code
 # instance (in copies of the sources: they are inference's)
-function link_invoke_targets!(codeinfos::Vector{Any})
-    code = linkable_code(codeinfos)
+function link_invoke_targets!(codeinfos::Vector{Any}, world::UInt)
+    code = linkable_code(codeinfos, world)
     for i in 1:length(codeinfos)
         codeinfos[i] isa Core.CodeInstance || continue
         src = codeinfos[i + 1]::Core.CodeInfo
@@ -401,7 +400,7 @@ function verify_trim(io::IO, codeinfos::Vector{Any}, entries::Vector{Core.Method
     errors, parents = TV.get_verify_typeinf_trim(codeinfos)
     interp = WasmInterpreter(; world, extensions)
     compiled, native_only = compiled_instances(codeinfos, entries, replacement, interp)
-    code = linkable_code(codeinfos)
+    code = linkable_code(codeinfos, world)
     filter!(errors) do e
         d = e.second
         d isa TV.CallMissing || return true

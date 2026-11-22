@@ -348,6 +348,14 @@ which Base makes element by element through `Ref`s and pointers, are one `memmov
 bytes when neither element type has padding (`trim/wasm-base.jl`; a reinterpreted `Array` has
 all its parent's bytes, from its first).
 
+The bytes of memory hold addresses, not owners, so a pointer stored in a memory of bytes and
+loaded back cannot be dereferenced. A pointer field of a mutable object (a `Ref{Ptr{T}}`, the
+out-parameter of a C function) holds both leaves: a store of a pointer through a pointer to
+such a field stores its owner too, and a load gives it back (`jl_ptr_store_owner`,
+`jl_ptr_load_owner`, by the owner's type id as the byte helpers). A store of other bytes into
+the field's address (an integer, single bytes, a `memmove`) clears its owner: the field then
+holds an address alone, where natively it is a pointer to whatever is at that address.
+
 ## 6. The image: serializing objects
 
 Constants in the IR (literals, `QuoteNode`s, constant globals) and the values of global
@@ -452,6 +460,15 @@ compiled `cfunction` has a slot of its own, as natively a function of its own. T
 are the module's own (no interoperation with a host's or another module's functions), and the
 image holds none: a `cfunction`'s pointer in a value built at compile time is null or reported,
 as other pointers of the build process are.
+
+**Bounds checks.** An `Expr(:boundscheck)` is a constant of the module, decided when it is
+compiled as native code's is: by the `--check-bounds` of the Julia process that compiles the
+module. With `yes` every check is kept, `@inbounds` or not; with `no` none is; otherwise a
+check is kept but where `@inbounds` reaches it. So the same program can give two modules: one
+built by a process started with `--check-bounds=yes` (as `Pkg.test` starts its own, and CI
+through it) throws the `BoundsError` that one built by a plain `julia` leaves out under
+`@inbounds`. It is not an option of `Config`: the compiled code follows the process as its
+native code does.
 
 ## 8. The runtime
 

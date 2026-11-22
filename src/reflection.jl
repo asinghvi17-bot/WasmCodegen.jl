@@ -44,12 +44,27 @@ end
 """
     emit_subtype!(fc, a, b) -> CGVal
 
-`a <: b` of two types. Types are not made at run time: the type objects of the module are
-those of its image, and the subtyping of each pair of them is a table computed when the
-module is finished (`finish_subtype!`), which a helper looks up.
+`a <: b` of two types (of a value that is not one, a TypeError). Types are not made at run
+time: the type objects of the module are those of its image, and the subtyping of each pair
+of them is a table computed when the module is finished (`finish_subtype!`), which a helper
+looks up.
 """
 function emit_subtype!(fc::FnCtx, a::CGVal, b::CGVal)
-    isconstant(a) && isconstant(b) && return const_value(fc, constant_value(a) <: constant_value(b))
+    isconstant(a) && isconstant(b) && constant_value(a) isa Type && constant_value(b) isa Type &&
+        return const_value(fc, constant_value(a) <: constant_value(b))
+    # (a value that is not a type: a TypeError, as natively, of the first)
+    for x in (a, b)
+        x.typ <: Type && continue
+        t = emit_isa!(fc, x, Type)
+        notype() = throw_error!(fc, Runtime.throw_builtin_type_error, const_value(fc, :<:),
+                                () -> convert_repr(fc, const_value(fc, Type), Any), () -> convert_repr(fc, x, Any))
+        if isconstant(t)
+            constant_value(t) || return notype()
+        else
+            push_val!(fc, t); emit!(fc.b, :i32_eqz)
+            if!(fc.b); notype(); end!(fc.b)
+        end
+    end
     f = get!(fc.cgm.helpers, :subtype) do
         jl = jlvalue_ref(fc.cgm.types)
         add_func!(fc.cgm.mod, "jl_subtype", ValType[jl, jl], ValType[I32])
@@ -60,6 +75,9 @@ function emit_subtype!(fc::FnCtx, a::CGVal, b::CGVal)
     return pop_val!(fc, Bool)
 end
 
+"The number of types above which `finish_subtype!` warns of the size of its table (8 MiB)."
+const SUBTYPE_TABLE_WARN = 8192
+
 function finish_subtype!(cgm::CGModule)
     f = get(cgm.helpers, :subtype, nothing)
     f === nothing && return
@@ -67,6 +85,10 @@ function finish_subtype!(cgm::CGModule)
     types = type_objects(cgm)
     n = length(types)
     index = type_index(cgm, types)
+    # (a bit per pair of types: quadratic, 1 MiB of data for 2896 types)
+    n > SUBTYPE_TABLE_WARN &&
+        @warn string("WasmCodegen: the table of `<:` of types known only at run time is of ", n,
+                     " types, ", cld(n * n, 8) >> 20, " MiB of the module")
     bits = zeros(UInt8, cld(n * n, 8))
     for (i, A) in enumerate(types), (j, B) in enumerate(types)
         if A <: B
@@ -130,7 +152,9 @@ function finish_typeof!(cgm::CGModule)
     jl = jlvalue_ref(ts)
     refs = array_type!(ts, jl)
     n = length(ts.typelist)
-    n <= 10_000 || unsupported("typeof of a value of abstract type in a module of more than 10000 types")
+    # (the table is one `array.new_fixed` of an initializer, which engines limit)
+    n <= MAX_FIXED_ELEMENTS ||
+        unsupported("typeof of a value of abstract type in a module of more than ", MAX_FIXED_ELEMENTS, " types")
     elems = Inst[concrete(T) ? Inst(:global_get, object_global!(img, T)) : Inst(:ref_null, ts.jlvalue)
                  for T in ts.typelist]
     table = add_global!(cgm.mod, "jl_typeof_table", RefType(refs, false), false,
@@ -161,7 +185,12 @@ new one on each call (`Runtime.type_hash`: natively, in a session of patches, an
 `hash(::Type)` calls it, so it keeps no cache of its own).
 """
 map_value!(cgm::CGModule, @nospecialize(f), @nospecialize(T)) =
-    get!(() -> f(T), get!(() -> IdDict{Any,Any}(), cgm.helpers, (:map_values, f))::IdDict{Any,Any}, T)
+    get!(() -> map_call(cgm, f, T), get!(() -> IdDict{Any,Any}(), cgm.helpers, (:map_values, f))::IdDict{Any,Any}, T)
+
+# (`Runtime.typeinfo_implicit` is Base's, which has the methods of the program: called in the
+# program's world, which the code generator's does not follow)
+map_call(cgm::CGModule, @nospecialize(f), @nospecialize(T)) =
+    f === Runtime.typeinfo_implicit ? Base.invoke_in_world(cgm.world.world, f, T) : f(T)
 
 """
     emit_map_type!(fc, f, T) -> CGVal
@@ -529,15 +558,22 @@ const BY_TYPE_CASES = IdDict{Any,Function}(
         !(T <: Task) && !(T <: Base.UnwrapTaskFailedException) && hasmethod(Base.wait, Tuple{T}; world),
     Runtime.showerror_as => (world, @nospecialize(T)) -> T <: Exception && trim_safe_showerror(T, world))
 
-# whether `showerror(::IOBuffer, ::T)` is trim-safe in `world` (once per type and world)
-const SHOWERROR_TRIM_SAFE = Dict{Tuple{Any,UInt},Bool}()
-trim_safe_showerror(@nospecialize(T), world::UInt) = get!(SHOWERROR_TRIM_SAFE, (T, world)) do
-    try
-        mi = entry_instance(showerror, (IOBuffer, T); world)
-        isempty(trim_check([mi]; world, onlywarn=true))
-    catch
-        false
-    end
+# whether `showerror(::IOBuffer, ::T)` is trim-safe in `world` (once per type, for the world
+# last asked about: the answers of another world are dropped)
+const SHOWERROR_TRIM_SAFE = (world=Ref{UInt}(0), types=IdDict{Any,Bool}())
+function trim_safe_showerror(@nospecialize(T), world::UInt)
+    cache = SHOWERROR_TRIM_SAFE
+    cache.world[] == world || (empty!(cache.types); cache.world[] = world)
+    return get!(cache.types, T) do
+        try
+            mi = entry_instance(showerror, (IOBuffer, T); world)
+            isempty(trim_check([mi]; world, onlywarn=true))
+        catch err
+            # (no unique method, or code the verifier fails on)
+            err isa Union{ErrorException,TrimFailure} || rethrow()
+            false
+        end
+    end::Bool
 end
 
 """
@@ -1490,7 +1526,10 @@ function finish_tuple_elems!(cgm::CGModule)
     f = get(cgm.helpers, :type_layout, nothing)
     if f !== nothing
         n = length(ts.typelist)
-        n <= 10_000 || unsupported("objectid of a tuple of a type the module does not have in a module of more than 10000 types")
+        # (as `jl_typeof_table`: one `array.new_fixed`)
+        n <= MAX_FIXED_ELEMENTS ||
+            unsupported("objectid of a tuple of a type the module does not have in a module of more than ",
+                        MAX_FIXED_ELEMENTS, " types")
         i64s = array_type!(ts, I64)
         elems = Inst[Inst(:i64_const, reinterpret(Int64, Runtime.layout_info(T))) for T in ts.typelist]
         table = add_global!(cgm.mod, "jl_type_layout_table", RefType(i64s, false), false,

@@ -8,6 +8,14 @@
 @noinline throw_undefvar_error(s::Symbol, m::Module) = throw(UndefVarError(s, m))
 @noinline throw_type_error(@nospecialize(expected), @nospecialize(got)) =
     throw(TypeError(:typeassert, "", expected::Type, got))
+# (an argument of the builtin `f` of a type it does not take: a field index that is neither
+# an Int nor a Symbol, a value that is not a type)
+@noinline throw_builtin_type_error(f::Symbol, @nospecialize(expected), @nospecialize(got)) =
+    throw(TypeError(f, "", expected::Type, got))
+# (`getfield` of a field index that is neither an Int nor a Symbol: of a module, `getglobal`'s error)
+@noinline throw_getfield_index_error(@nospecialize(x), @nospecialize(i)) =
+    x isa Module ? throw(TypeError(:getglobal, "", Symbol, i)) : throw(TypeError(:getfield, "", Union{Int,Symbol}, i))
+@noinline throw_error_message(msg::String) = throw(ErrorException(msg))
 @noinline throw_method_error(@nospecialize(f), @nospecialize(args)) = throw(MethodError(f, args))
 @noinline throw_field_error(@nospecialize(T), s::Symbol) = throw(FieldError(T::DataType, s))
 @noinline throw_rethrow_error() = error("rethrow() not allowed outside a catch block")
