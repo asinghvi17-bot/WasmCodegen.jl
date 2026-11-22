@@ -41,6 +41,16 @@ using ..Runtime: @wasm_method, original
 
 const EINVAL = Int32(28)
 
+"""
+    enabled() -> Bool
+
+Whether the module has Julia Tasks (`Config(tasks = :jspi)`): `true` in such a module (the
+session's patches, `trim/wasm-tasks.jl`, define it so), else `false` (natively too). A constant
+of the compilation, for a package that waits on the host as a task does when it can
+(`Host.await_handle`, while the other tasks run) and otherwise as a program of one task does.
+"""
+enabled() = false
+
 ## host imports (`julia_task`)
 
 host_switch(from::Int32, to::Int32) = ccall((:switch, "julia_task"), Cvoid, (Int32, Int32), from, to)

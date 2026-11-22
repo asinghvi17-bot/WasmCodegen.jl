@@ -167,6 +167,12 @@ verified. The example pages' error message gives the versions that added WebAsse
 (Chrome 119, Firefox 120, Safari 18.2), which is not all a module may use. Browser support
 for `exnref` and JSPI hasn't been tested here.
 
+`js/julia_io.mjs`'s events and `js/julia_task.mjs` load in browsers: their macrotasks are a
+`MessageChannel`'s messages where there is no `setImmediate` (`js/macrotask.mjs`), and
+`julia_io.mjs` loads `node:fs` only for the paths (`makeJuliaIOPaths`), which a page replaces
+with its own. `Runtime.Tasks.enabled()` (a constant of the compilation) tells a package whether
+the module has tasks (`Config(tasks = :jspi)`).
+
 ### wasmtime
 
 Tested with wasmtime 50.0.1.

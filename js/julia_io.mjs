@@ -69,8 +69,17 @@
 // **Readiness** is level-triggered: a timer is ready from when it fires (or is cancelled)
 // until it is closed. Callers close every handle (in `finally` blocks).
 
-import fs from 'node:fs';
-import path from 'node:path';
+import { macrotask, cancelMacrotask } from './macrotask.mjs';
+
+// node:fs and node:path, for the paths only (loaded when a factory of them is called): the events
+// load in browsers too
+let fs = null, path = null;
+function nodeModules() {
+  if (fs) return;
+  const get = globalThis.process?.getBuiltinModule;
+  if (typeof get !== 'function') throw new Error('julia_io: the paths need node:fs (Node 22.3+, Bun or Deno); the events do not');
+  fs = get('node:fs'); path = get('node:path');
+}
 
 export const JULIA_IO_VERSION = 1;
 
@@ -132,6 +141,7 @@ const components = (s) => s.split('/').filter((c) => c !== '');
 const MAX_LINKS = 40;
 
 export function makeResolve(preopens) {
+  nodeModules();
   // each preopen by its path and by its real path, as components
   const roots = preopens.map((p) => {
     if (typeof p !== 'string' || !path.isAbsolute(p)) throw new Error('julia_io: preopen must be an absolute path: ' + p);
@@ -245,6 +255,7 @@ function makeMemory(initial) {
 // The file modes and symbolic links: `path_mode`, `path_chmod`, `path_symlink`. Synchronous
 // (no JSPI). Options: `preopens` (WASI's), `memory` (or `bindMemory` later).
 export function makeJuliaIOPaths(opts = {}) {
+  nodeModules();
   const { readBytes, readPath, bindMemory } = makeMemory(opts.memory);
   const resolve = makeResolve(opts.preopens || []);
   let lastError = '';
@@ -390,7 +401,7 @@ export function makeJuliaIOEvents(opts = {}) {
     // (first in the event loop's next turn, even when due: libuv runs a timer of 0 there, so
     // that `sleep(0)` lets the host's other events progress)
     starting.push(x);
-    if (turn === null) turn = setImmediate(turned);
+    if (turn === null) turn = macrotask(turned);
     return h;
   }
   // the event loop turned: the timers started since its last turn are all armed at once (a
@@ -556,7 +567,7 @@ export function makeJuliaIOEvents(opts = {}) {
       waker = null;
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
       for (const x of handles.values()) disarm(x);
-      if (turn !== null) { clearImmediate(turn); turn = null; }
+      if (turn !== null) { cancelMacrotask(turn); turn = null; }
       starting.length = 0;
     },
   };

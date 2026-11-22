@@ -787,6 +787,9 @@ function shared_handle()::Int32
     return Int32(0)
 end
 
+"Whether the module has tasks (`Runtime.Tasks.enabled()`, a constant of the compilation)."
+tasks_enabled()::Int32 = WasmCodegen.Runtime.Tasks.enabled() ? Int32(1) : Int32(0)
+
 # returns while a task waits forever: the host keeps it parked (the next root call may run)
 function early_return()::Int32
     c = Condition()

@@ -33,6 +33,8 @@ let T = WasmCodegen.Runtime.Tasks
     # the runtime's host waits as tasks' waits; `sleep` on a `Timer`, as Base's
     @eval WasmCodegen.Runtime.Host await_handle(h::Int32) = $(T.await)(h)
     @eval WasmCodegen.Runtime.Host sleep_ms(ms::UInt64) = $(T.sleep_ms)(ms)
+    # (a constant of the compilation, for packages: the module has tasks)
+    @eval WasmCodegen.Runtime.Tasks enabled() = true
 end
 
 # `Threads.@threads`: Base's `threading_run`, specialized on the loop's body (`threadsfor_fun`), so
