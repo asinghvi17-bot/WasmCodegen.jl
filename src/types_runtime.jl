@@ -61,10 +61,12 @@ above_predicate!(cgm::CGModule, @nospecialize(L)) = get!(cgm.helpers, (:isa_abov
     add_func!(cgm.mod, string("jl_isa_above_", length(cgm.mod.funcs) + 1), ValType[I32], ValType[I32])
 end
 
-# `Tuple{S} <: Tuple{P}` (false where `S` cannot be a parameter)
+# `Tuple{S} <: Tuple{P}` (false where `S` or `P` cannot be a tuple's parameter: a TypeError
+# of a value that is not a type's parameter, an ErrorException of `Union{}`)
 elem_subtype(@nospecialize(S), @nospecialize(P)) = try
     (Tuple{S} <: Tuple{P})::Bool
-catch
+catch err
+    err isa Union{TypeError,ErrorException} || rethrow()
     false
 end
 

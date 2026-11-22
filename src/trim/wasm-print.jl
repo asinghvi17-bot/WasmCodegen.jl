@@ -20,5 +20,7 @@ let file = joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "base", "strings", "i
         (Meta.isexpr(ex, :function) || Meta.isexpr(ex, :(=))) && ex.args[1] in sigs && push!(found, ex)
     end
     length(found) == length(sigs) || error("wasm-print.jl: not every printing method found in $file")
+    foreach(def -> WasmCodegen.check_base_source("wasm-print.jl", def.args[1], file,
+                                                  (def.args[2].args[1]::LineNumberNode).line), found)
     foreach(def -> Core.eval(Base, def), found)
 end

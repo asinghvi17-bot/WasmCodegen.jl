@@ -7,7 +7,7 @@
 
 module LAPACK
 
-using ..BLAS: ArrayArg, ld, st!, elem, setelem!, notrans, isupper, trsm!
+using ..BLAS: ArrayArg, ld, st!, elem, setelem!, notrans, isupper, trsm!, norm2
 
 setinfo!(info, v::Int) = st!(info, 1, v)
 
@@ -99,8 +99,9 @@ function getri!(n::Int, A::ArrayArg{T}, lda::Int, ipiv::ArrayArg{Int}, work::Arr
     setinfo!(info, 0)
 end
 
-"`potrf`: the Cholesky factor (A = UᵀU or L Lᵀ) in the `uplo` triangle; `info` > 0 where A
-is not positive definite."
+"`potrf`: the Cholesky factor (A = UᵀU or L Lᵀ) in the `uplo` triangle; `info` > 0 at the
+first pivot that is not positive. (A NaN one is not reported, as OpenBLAS's, which Julia
+runs natively, does not: the factor has NaNs from there on. The reference LAPACK reports it.)"
 function potrf!(uplo::UInt8, n::Int, A::ArrayArg{T}, lda::Int, info) where {T}
     up = isupper(uplo)
     # (the factor's element (k, j) of the stored triangle)
@@ -110,7 +111,7 @@ function potrf!(uplo::UInt8, n::Int, A::ArrayArg{T}, lda::Int, info) where {T}
         for k in 1:j-1
             s -= f(k, j)^2
         end
-        if !(s > 0)
+        if s <= 0
             setelem!(A, lda, j, j, s)
             setinfo!(info, j)
             return
@@ -173,21 +174,32 @@ end
 # (beta, tau) with H [alpha; x] = [beta; 0], H = I - tau [1; v] [1; v]ᵀ, x overwritten by v
 function larfg!(n::Int, alpha::T, A, lda::Int, i, j) where {T}
     n <= 1 && return alpha, zero(T)
-    scale, ssq = zero(T), one(T)
-    for k in 1:n-1
-        x = elem(A, lda, i(k), j(k))
-        if x != 0
-            a = abs(x)
-            scale < a ? (ssq = one(T) + ssq * (scale / a)^2; scale = a) : (ssq += (a / scale)^2)
-        end
+    x(k) = elem(A, lda, i(k), j(k))
+    scalx!(f) = for k in 1:n-1
+        setelem!(A, lda, i(k), j(k), f * x(k))
     end
-    xnorm = scale * sqrt(ssq)
+    xnorm = norm2(x, T, n - 1)
     xnorm == 0 && return alpha, zero(T)
     beta = -copysign(hypot(alpha, xnorm), alpha)
+    # a beta too small for 1 / (alpha - beta): the values scaled up first, beta back down after
+    # (`dlarfg`'s)
+    safmin = floatmin(T) / (eps(T) / 2)
+    knt = 0
+    if abs(beta) < safmin
+        while true
+            knt += 1
+            scalx!(inv(safmin))
+            beta *= inv(safmin)
+            alpha *= inv(safmin)
+            (abs(beta) < safmin && knt < 20) || break
+        end
+        xnorm = norm2(x, T, n - 1)
+        beta = -copysign(hypot(alpha, xnorm), alpha)
+    end
     tau = (beta - alpha) / beta
-    f = one(T) / (alpha - beta)
-    for k in 1:n-1
-        setelem!(A, lda, i(k), j(k), f * elem(A, lda, i(k), j(k)))
+    scalx!(one(T) / (alpha - beta))
+    for _ in 1:knt
+        beta *= safmin
     end
     return beta, tau
 end
@@ -233,8 +245,9 @@ function swapcols!(A, lda::Int, p::Int, q::Int, m::Int)
     end
 end
 
+# the 2-norm of A[i0:m, j]
 colnorm(A::ArrayArg{T}, lda::Int, i0::Int, m::Int, j::Int) where {T} =
-    sqrt(sum(k -> abs2(elem(A, lda, k, j)), i0:m; init=zero(T)))
+    norm2(k -> elem(A, lda, i0 + k - 1, j), T, m - i0 + 1)
 
 "`geqp3`: A P = Q R with column pivoting (`dlaqp2`'s), the columns marked in `jpvt` first."
 function geqp3!(m::Int, n::Int, A::ArrayArg{T}, lda::Int, jpvt::ArrayArg{Int}, tau::ArrayArg{T},
@@ -593,15 +606,80 @@ function jacobi_scale!(X::Matrix{T}) where {T}
     return e
 end
 
+# the same for the one-sided method, which squares no element (the norms and the cosines are
+# of scaled elements): a matrix of small elements is scaled up (its rotations are of
+# subnormal numbers otherwise), one within a factor 1/eps of overflowing down by eps (to
+# largest magnitude 1, the small elements of a matrix as [1e200 0; 0 1e-200] would underflow)
+function jacobi_svd_scale!(X::Matrix{T}) where {T}
+    amax = maximum(abs, X; init=zero(T))
+    (iszero(amax) || !isfinite(amax)) && return 0
+    e = amax < sqrt(floatmin(T) / eps(T)) ? -exponent(amax) :
+        amax > floatmax(T) * eps(T) ? exponent(eps(T)) : 0
+    e == 0 || (X .= ldexp.(X, e))
+    return e
+end
+
+# the singular value s of the matrix scaled by 2^e, of the matrix itself: one that rounding
+# alone took past the scaled largest number is the largest number, not infinite
+function jacobi_svd_unscale(s::T, e::Int) where {T}
+    x = ldexp(s, -e)
+    return isinf(x) && s <= nextfloat(ldexp(floatmax(T), e)) ? floatmax(T) : x
+end
+
+# the norm of the column j of G, of elements scaled by its largest: their squares neither
+# overflow nor underflow
+function column_norm(G::Matrix{T}, j::Int) where {T}
+    m = maximum(abs, view(G, :, j); init=zero(T))
+    m == 0 && return m
+    # (by a power of two, which rounds nothing; summed pairwise, as `sum`: a long column of
+    # small elements is not rounded away)
+    e = max(exponent(m), exponent(floatmin(T)) + 1)
+    c = ldexp(one(T), -e)
+    return ldexp(sqrt(sum(x -> (x * c)^2, view(G, :, j))), e)
+end
+
+# the sum of the magnitudes of the elements of the column j of G, over n
+column_sum(G::Matrix{T}, j::Int, n::T) where {T} = sum(x -> abs(x / n), view(G, :, j))
+
+# the exponent of the power of two that scales a column of norm n to about one (and not
+# beyond what is a number, of a subnormal norm)
+column_exponent(n::T) where {T} = max(exponent(n), exponent(floatmin(T)) + 1)
+
+# the squares of the norms of the columns a and b of G and their product, of elements scaled
+# by ca and cb (powers of two: nothing is rounded, and no square underflows or overflows),
+# each summed with compensation (Neumaier's): the rounding of the terms of long columns
+# does not add up to an angle
+function column_dots(G::Matrix{T}, a::Int, b::Int, ca::T, cb::T) where {T}
+    alpha = beta = gamma = zero(T)
+    ra = rb = rg = zero(T)
+    for i in axes(G, 1)
+        x, y = G[i, a] * ca, G[i, b] * cb
+        alpha, ra = compensated(alpha, ra, x^2)
+        beta, rb = compensated(beta, rb, y^2)
+        gamma, rg = compensated(gamma, rg, x * y)
+    end
+    return alpha + ra, beta + rb, gamma + rg
+end
+function compensated(s::T, r::T, x::T) where {T}
+    t = s + x
+    return t, r + (abs(s) >= abs(x) ? (s - t) + x : (x - t) + s)
+end
+
+# the sweeps of rotations after which Jacobi's methods give up (they converge quadratically:
+# a matrix of finite elements takes about ten)
+const JACOBI_SWEEPS = 100
+
 # the eigenvalues (ascending) and eigenvectors (columns of V, n×n) of the symmetric n×n S,
-# by cyclic Jacobi rotations, until the off-diagonal elements are negligible
-function jacobi_eigen!(S::Matrix{T}, n::Int) where {T}
+# by cyclic Jacobi rotations, until the off-diagonal elements are negligible, and whether
+# they are after `sweeps` sweeps
+function jacobi_eigen!(S::Matrix{T}, n::Int, sweeps::Int=JACOBI_SWEEPS) where {T}
     V = zeros(T, n, n)
     for i in 1:n
         V[i, i] = one(T)
     end
     e = jacobi_scale!(S)
-    for sweep in 1:100
+    converged = false
+    for sweep in 0:sweeps
         off = dia = zero(T)
         for q in 1:n
             dia += S[q, q]^2
@@ -609,7 +687,8 @@ function jacobi_eigen!(S::Matrix{T}, n::Int) where {T}
                 off += S[p, q]^2
             end
         end
-        off <= (eps(T) / 2)^2 * (dia + off) && break
+        (converged = off <= (eps(T) / 2)^2 * (dia + off)) && break
+        sweep == sweeps && break
         for q in 2:n, p in 1:q-1
             apq = S[p, q]
             apq == 0 && continue
@@ -637,21 +716,21 @@ function jacobi_eigen!(S::Matrix{T}, n::Int) where {T}
     end
     w = T[ldexp(S[i, i], -e) for i in 1:n]
     perm = sortperm(w)
-    return w[perm], V[:, perm]
+    return w[perm], V[:, perm], converged
 end
 
 """`syevr`: the eigenvalues (ascending) and, with `jobz` 'V', eigenvectors of the symmetric
 A (stored in its `uplo` triangle): all of them (`range` 'A'), those in (vl, vu] ('V'), or
 the il-th to iu-th ('I'). A's triangle is destroyed. A workspace query where `lwork` or
-`liwork` is -1."""
+`liwork` is -1. `info` is 1 where the iteration did not converge (LAPACK's: an internal error)."""
 function syevr!(jobz::UInt8, range::UInt8, uplo::UInt8, n::Int, A::ArrayArg{T}, lda::Int,
                 vl::T, vu::T, il::Int, iu::Int, abstol::T, m::ArrayArg{Int}, W::ArrayArg{T},
                 Z::ArrayArg{T}, ldz::Int, isuppz::ArrayArg{Int}, work::ArrayArg{T}, lwork::Int,
                 iwork::ArrayArg{Int}, liwork::Int, info) where {T}
     setinfo!(info, 0)
     if lwork == -1 || liwork == -1
-        st!(work, 1, T(max(1, 26n)))
-        st!(iwork, 1, max(1, 10n))
+        st!(work, 1, one(T))  # (no workspace is used)
+        st!(iwork, 1, 1)
         return
     end
     S = Matrix{T}(undef, n, n)
@@ -659,7 +738,8 @@ function syevr!(jobz::UInt8, range::UInt8, uplo::UInt8, n::Int, A::ArrayArg{T}, 
     for j in 1:n, i in 1:n
         S[i, j] = (up ? i <= j : i >= j) ? elem(A, lda, i, j) : elem(A, lda, j, i)
     end
-    w, V = jacobi_eigen!(S, n)
+    w, V, converged = jacobi_eigen!(S, n)
+    converged || setinfo!(info, 1)
     sel = range == UInt8('V') || range == UInt8('v') ? [k for k in 1:n if vl < w[k] <= vu] :
           range == UInt8('I') || range == UInt8('i') ? collect(il:iu) : collect(1:n)
     st!(m, 1, length(sel))
@@ -674,13 +754,15 @@ function syevr!(jobz::UInt8, range::UInt8, uplo::UInt8, n::Int, A::ArrayArg{T}, 
 end
 
 """
-    jacobi_svd(m, n, A, lda, fullu, fullv) -> (S, U, V)
+    jacobi_svd(m, n, A, lda, fullu, fullv, sweeps=JACOBI_SWEEPS) -> (S, U, V, converged)
 
 The singular values (descending) of the m×n A, and its left and right singular vectors: the
 first min(m, n) of each, or all (`fullu`, `fullv`, completed to orthonormal bases), by
-one-sided Jacobi rotations.
+one-sided Jacobi rotations, and whether they converged in `sweeps` sweeps. Of an A with
+elements that are not finite, the singular values are NaN (as LAPACK's), without iterating.
 """
-function jacobi_svd(m::Int, n::Int, A::ArrayArg{T}, lda::Int, fullu::Bool, fullv::Bool) where {T}
+function jacobi_svd(m::Int, n::Int, A::ArrayArg{T}, lda::Int, fullu::Bool, fullv::Bool,
+                    sweeps::Int=JACOBI_SWEEPS) where {T}
     k = min(m, n)
     # (on Aᵀ if wider than tall: its columns are the rows)
     tall = m >= n
@@ -693,21 +775,56 @@ function jacobi_svd(m::Int, n::Int, A::ArrayArg{T}, lda::Int, fullu::Bool, fullv
     for i in 1:q
         V[i, i] = one(T)
     end
-    e = jacobi_scale!(G)
-    tol = eps(T) * p
-    for sweep in 1:100
+    finite = all(isfinite, G)
+    e = jacobi_svd_scale!(G)
+    # (the cosine of two columns that counts as none, as LAPACK's `gesvj`)
+    tol = eps(T) * sqrt(T(p))
+    converged = !finite
+    for sweep in 1:(finite ? sweeps : 0)
         rotated = false
         for b in 2:q, a in 1:b-1
-            alpha = beta = gamma = zero(T)
-            for i in 1:p
-                alpha += G[i, a]^2; beta += G[i, b]^2; gamma += G[i, a] * G[i, b]
+            na, nb = column_norm(G, a), column_norm(G, b)
+            (na == 0 || nb == 0) && continue
+            # (of each column scaled to a norm of about one: the columns are 2^d apart)
+            ea, eb = column_exponent(na), column_exponent(nb)
+            d = eb - ea
+            alpha, beta, gamma = column_dots(G, a, b, ldexp(one(T), -ea), ldexp(one(T), -eb))
+            # (a column of subnormal elements is orthogonal to another to what their
+            # rounding to multiples of the smallest leaves of it)
+            lim = tol
+            if min(na, nb) < floatmin(T)
+                sa, sb = column_sum(G, a, na), column_sum(G, b, nb)
+                tiny = nextfloat(zero(T))
+                lim += (tiny / nb) * sa + (tiny / na) * sb
             end
-            # (the norms' product, and zeta's, without overflow: G is scaled only to below
-            # sqrt(floatmax), its squares' sums to below floatmax)
-            (gamma == 0 || abs(gamma) <= tol * (sqrt(alpha) * sqrt(beta))) && continue
+            (gamma == 0 || abs(gamma) <= lim * (sqrt(alpha) * sqrt(beta))) && continue
+            zeta = (ldexp(beta, d) - ldexp(alpha, -d)) / (2gamma)
+            t = zero(T)
+            if isfinite(zeta)
+                t = copysign(one(T), zeta) / (abs(zeta) + hypot(one(T), zeta))
+            end
+            if abs(t) < floatmin(T)
+                # zeta overflows or the tangent underflows (a column small beside the
+                # other): the tangent is 1 / 2zeta, tau over the 2^|d| of the columns. The
+                # rotation leaves the large column as it is and takes from the small one its
+                # projection on it (as `gesvj`'s; the product is scaled, not the element,
+                # which may underflow)
+                tau = gamma / (d >= 0 ? beta - ldexp(alpha, -2d) : ldexp(beta, 2d) - alpha)
+                t = ldexp(tau, -abs(d))
+                for i in 1:p
+                    d >= 0 ? (G[i, a] -= ldexp(tau * ldexp(G[i, b], -2), 2 - d)) :
+                             (G[i, b] += ldexp(tau * ldexp(G[i, a], -2), 2 + d))
+                end
+                for i in 1:q
+                    va, vb = V[i, a], V[i, b]
+                    V[i, a] = va - t * vb
+                    V[i, b] = vb + t * va
+                end
+                rotated = true
+                continue
+            end
+            t == 0 && continue
             rotated = true
-            zeta = (beta - alpha) / (2gamma)
-            t = copysign(one(T), zeta) / (abs(zeta) + hypot(one(T), zeta))
             c = one(T) / sqrt(one(T) + t^2)
             s = c * t
             for i in 1:p
@@ -721,44 +838,71 @@ function jacobi_svd(m::Int, n::Int, A::ArrayArg{T}, lda::Int, fullu::Bool, fullv
                 V[i, b] = s * va + c * vb
             end
         end
-        rotated || break
+        rotated || (converged = true; break)
     end
-    sv = T[sqrt(sum(abs2, view(G, :, j))) for j in 1:q]
+    sv = T[finite ? column_norm(G, j) : T(NaN) for j in 1:q]
     perm = sortperm(sv; rev=true)
-    S = T[ldexp(sv[perm[j]], -e) for j in 1:k]
+    S = T[jacobi_svd_unscale(sv[perm[j]], e) for j in 1:k]
     # the left vectors of G (normalized columns, completed to an orthonormal basis), the right
     # ones V; for Aᵀ they swap
     fulll, fullr = tall ? (fullu, fullv) : (fullv, fullu)
     L = zeros(T, p, fulll ? p : k)
+    # (a column of subnormal elements is orthogonal to the others only to their precision:
+    # its vector is completed as well, from its direction)
+    done = falses(size(L, 2))
     for j in 1:k
         c = perm[j]
-        sv[c] > 0 && (L[:, j] .= view(G, :, c) ./ sv[c])
+        sv[c] > 0 || continue
+        L[:, j] .= view(G, :, c) ./ sv[c]
+        done[j] = sv[c] >= 2 * floatmin(T)
+        # (normalized again: the norm of a column of subnormal elements is rounded)
+        done[j] || (L[:, j] ./= column_norm(L, j))
     end
     ncols = size(L, 2)
-    next = 1
-    for j in 1:ncols
-        sv_j = j <= k ? sv[perm[j]] : zero(T)
-        (j <= k && sv_j > 0) && continue
-        # a unit vector orthogonal to the previous columns (Gram-Schmidt on e_next)
-        while next <= p
-            v = zeros(T, p); v[next] = one(T); next += 1
-            for r in 1:ncols
-                r == j && continue
-                d = sum(i -> L[i, r] * v[i], 1:p)
-                v .-= d .* view(L, :, r)
-            end
-            nv = sqrt(sum(abs2, v))
-            if nv > T(0.1)
-                L[:, j] .= v ./ nv
-                break
-            end
+    # v orthogonal to the columns that are done (Gram-Schmidt, twice), and what is left of it
+    function rest!(v::Vector{T})
+        for _ in 1:2, r in 1:ncols
+            done[r] || continue
+            d = sum(i -> L[i, r] * v[i], 1:p)
+            v .-= d .* view(L, :, r)
         end
+        return sqrt(sum(abs2, v))
+    end
+    for j in 1:ncols
+        done[j] && continue
+        v = L[:, j]
+        nv = rest!(v)
+        if !(nv > T(0.5))
+            # the unit vector farthest from the span of the columns done (one is not in it)
+            far, at = -one(T), 1
+            for i in 1:p
+                d = one(T)
+                for r in 1:ncols
+                    done[r] && (d -= L[i, r]^2)
+                end
+                d > far && ((far, at) = (d, i))
+            end
+            fill!(v, zero(T)); v[at] = one(T)
+            nv = rest!(v)
+        end
+        nv > 0 && (L[:, j] .= v ./ nv)
+        done[j] = true
     end
     R = zeros(T, q, fullr ? q : k)
     for j in 1:size(R, 2)
         R[:, j] .= view(V, :, perm[j])
     end
-    return tall ? (S, L, R) : (S, R, L)
+    return tall ? (S, L, R, converged) : (S, R, L, converged)
+end
+
+# what a job character of `gesdd` and `gesvd` asks of the singular vectors of a side: none
+# ('N'), the first min(m, n) ('S'), those written over A ('O') or all ('A'); `JOB_INVALID`
+# for another character (in either case, as LAPACK's `lsame`)
+const JOB_NONE, JOB_THIN, JOB_OVER, JOB_ALL, JOB_INVALID = 0, 1, 2, 3, -1
+function svd_job(c::UInt8)
+    c |= 0x20
+    return c == UInt8('n') ? JOB_NONE : c == UInt8('s') ? JOB_THIN : c == UInt8('o') ? JOB_OVER :
+           c == UInt8('a') ? JOB_ALL : JOB_INVALID
 end
 
 # the m×c matrix U into the array X (leading dimension ldx), and Vᵀ of the n×r V
@@ -774,45 +918,54 @@ function put_vt!(X::ArrayArg{T}, ldx::Int, V::Matrix{T}) where {T}
 end
 
 """`gesdd`: the singular values (descending) of the m×n A and, by `jobz`, none of the
-singular vectors ('N'), the first min(m, n) of each ('S', U m×k, Vᵀ k×n) or all ('A', U
-m×m, Vᵀ n×n). A is destroyed. A workspace query where `lwork` is -1."""
+singular vectors ('N'), the first min(m, n) of each ('S', U m×k, Vᵀ k×n; 'O', the same with
+A overwritten by U where m >= n, else by Vᵀ) or all ('A', U m×m, Vᵀ n×n). A is destroyed. A
+workspace query where `lwork` is -1. `info` is -1 for another `jobz`, -4 where A has a NaN (as LAPACK's `gesdd`,
+not its `gesvd`), 1 where the iteration did not converge."""
 function gesdd!(jobz::UInt8, m::Int, n::Int, A::ArrayArg{T}, lda::Int, S::ArrayArg{T},
                 U::ArrayArg{T}, ldu::Int, VT::ArrayArg{T}, ldvt::Int, work::ArrayArg{T},
                 lwork::Int, iwork::ArrayArg{Int}, info) where {T}
     setinfo!(info, 0)
+    jz = svd_job(jobz)
+    jz == JOB_INVALID && (setinfo!(info, -1); return)
     if lwork == -1
-        st!(work, 1, T(max(1, 4 * (m + n)^2)))
+        st!(work, 1, one(T))  # (no workspace is used)
         return
     end
-    full = jobz == UInt8('A') || jobz == UInt8('a')
-    sv, Uc, Vc = jacobi_svd(m, n, A, lda, full, full)
+    for j in 1:n, i in 1:m
+        isnan(elem(A, lda, i, j)) && (setinfo!(info, -4); return)
+    end
+    sv, Uc, Vc, converged = jacobi_svd(m, n, A, lda, jz == JOB_ALL, jz == JOB_ALL)
+    converged || setinfo!(info, 1)
     for j in eachindex(sv)
         st!(S, j, sv[j])
     end
-    (jobz == UInt8('N') || jobz == UInt8('n')) && return
-    put_u!(U, ldu, Uc)
-    put_vt!(VT, ldvt, Vc)
+    jz == JOB_NONE && return
+    jz == JOB_OVER && m >= n ? put_u!(A, lda, Uc) : put_u!(U, ldu, Uc)
+    jz == JOB_OVER && m < n ? put_vt!(A, lda, Vc) : put_vt!(VT, ldvt, Vc)
 end
 
 """`gesvd`: as `gesdd`, the left and right singular vectors chosen separately (`jobu`,
-`jobvt`): none ('N'), the first min(m, n) ('S', or 'O': written over A) or all ('A')."""
+`jobvt`): none ('N'), the first min(m, n) ('S', or 'O': written over A) or all ('A'). `info`
+is -1 for another `jobu`, -2 for another `jobvt` or where both are 'O'."""
 function gesvd!(jobu::UInt8, jobvt::UInt8, m::Int, n::Int, A::ArrayArg{T}, lda::Int,
                 S::ArrayArg{T}, U::ArrayArg{T}, ldu::Int, VT::ArrayArg{T}, ldvt::Int,
                 work::ArrayArg{T}, lwork::Int, info) where {T}
     setinfo!(info, 0)
+    ju, jv = svd_job(jobu), svd_job(jobvt)
+    ju == JOB_INVALID && (setinfo!(info, -1); return)
+    (jv == JOB_INVALID || (ju == JOB_OVER && jv == JOB_OVER)) && (setinfo!(info, -2); return)
     if lwork == -1
-        st!(work, 1, T(max(1, 4 * (m + n)^2)))
+        st!(work, 1, one(T))  # (no workspace is used)
         return
     end
-    job(c) = c | 0x20  # (lowercase)
-    sv, Uc, Vc = jacobi_svd(m, n, A, lda, job(jobu) == UInt8('a'), job(jobvt) == UInt8('a'))
+    sv, Uc, Vc, converged = jacobi_svd(m, n, A, lda, ju == JOB_ALL, jv == JOB_ALL)
+    converged || setinfo!(info, 1)
     for j in eachindex(sv)
         st!(S, j, sv[j])
     end
-    job(jobu) in (UInt8('a'), UInt8('s')) && put_u!(U, ldu, Uc)
-    job(jobvt) in (UInt8('a'), UInt8('s')) && put_vt!(VT, ldvt, Vc)
-    job(jobu) == UInt8('o') && put_u!(A, lda, Uc)
-    job(jobvt) == UInt8('o') && put_vt!(A, lda, Vc)
+    ju == JOB_OVER ? put_u!(A, lda, Uc) : ju != JOB_NONE && put_u!(U, ldu, Uc)
+    jv == JOB_OVER ? put_vt!(A, lda, Vc) : jv != JOB_NONE && put_vt!(VT, ldvt, Vc)
 end
 
 

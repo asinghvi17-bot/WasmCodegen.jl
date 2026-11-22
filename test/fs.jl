@@ -549,6 +549,16 @@ function unknown_umask(k::Int)
 end
 
 # a host without file modes: files 0o644, directories 0o755, chmod is ENOTSUP
+# the times of files the test runner wrote: the bits of the seconds natively
+function stat_times(k::Int)
+    h = UInt64(k)
+    for i in 1:20
+        st = stat(joinpath(ROOT, "times", string("f", i)))
+        h = h * UInt64(31) + reinterpret(UInt64, st.mtime) + UInt64(7) * reinterpret(UInt64, st.ctime)
+    end
+    return (h % UInt32) % Int32
+end
+
 function fs_modes(k::Int)
     dir = joinpath(ROOT, string("m", k))
     mkpath(dir)
@@ -893,6 +903,16 @@ strerror_sum(k::Int) = Int32(sum(codeunits(Base.Libc.strerror(k))))
     native = withenv(() -> dirs(1), env...)
     c = WasmCodegen.compile(dirs, (Int,); config=cfg)
     @test wasm_run(c, "dirs", 1; rettype=Int32, wasi_env=env) == native
+    # an empty variable is the directory (libuv's `uv_os_tmpdir`), not skipped; an unset one is
+    for tmpdir in ("", nothing)
+        env = Dict("TMP" => "/foo/", "HOME" => "/h")
+        tmpdir === nothing || (env["TMPDIR"] = tmpdir)
+        native = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+            withenv(() -> dirs(1), "TMPDIR" => tmpdir, env...)
+        end
+        @test native == (tmpdir === nothing ? 402 : 2)
+        @test wasm_run(c, "dirs", 1; rettype=Int32, wasi_env=env) == native
+    end
     # the seams of a host with file modes: methods of `WASM_METHODS`, for this test only
     F = WasmCodegen.Runtime.FS
     methods_of(mt) = (ms = Method[]; Base.visit(m -> push!(ms, m), mt); ms)
@@ -909,6 +929,9 @@ strerror_sum(k::Int) = Int32(sum(codeunits(Base.Libc.strerror(k))))
     end
     # (and without them, the defaults again: the code inferred with them is not reused)
     @test run_fs(fs_modes, 1) == 15
+    mkpath(joinpath(ROOT, "times"))
+    foreach(i -> write(joinpath(ROOT, "times", string("f", i)), "x"), 1:20)
+    @test run_fs(stat_times, 1) == stat_times(1)
     @test file_wrappers(1) == 1
     @test run_fs(file_wrappers, 2) == 1
     @test retry_write(1) == 1

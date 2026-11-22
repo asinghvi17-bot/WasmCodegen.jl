@@ -222,7 +222,8 @@ function makeMemory(initial) {
   }
   function view() { mem(); return new DataView(memory.buffer); }
   function checkRange(off, len, align = 1) {
-    off >>>= 0; len >>>= 0;
+    // (a length is an i32 of the module, or a product of one: unsigned, and not wrapped to 32 bits)
+    off >>>= 0; if (len < 0) len >>>= 0;
     if (off % align) throw new GuestError(E.INVAL, `offset ${off} is not ${align}-byte aligned`);
     if (off + len > mem().byteLength) throw new GuestError(E.INVAL, `range [${off}, ${off + len}) outside linear memory`);
     return [off, len];
@@ -369,7 +370,7 @@ export function makeJuliaIOEvents(opts = {}) {
   // poll sees a timer due before its callback ran, as libuv runs the timers due when it
   // runs); pending: may become ready without the module doing anything
   function isReady(x) {
-    if (!x.fired && !x.immediate && performance.now() >= x.deadline) { disarm(x); x.fired = true; }
+    if (!x.fired && !x.starting && performance.now() >= x.deadline) { disarm(x); x.fired = true; }
     return x.fired;
   }
   const isPending = (x) => !x.fired;
@@ -379,22 +380,31 @@ export function makeJuliaIOEvents(opts = {}) {
     ns = BigInt.asIntN(64, BigInt(ns));
     if (ns < 0n) throw new GuestError(E.INVAL, `timer_start: negative duration ${ns}`);
     const deadline = performance.now() + Number(ns) / 1e6;
-    const x = { kind: 'timer', fired: false, cancelled: false, t: null, immediate: false, deadline, errmsg: '', closed: false };
-    const arm = () => {
-      x.immediate = false;
+    const x = { kind: 'timer', fired: false, cancelled: false, t: null, starting: true, arm: null, deadline, errmsg: '', closed: false };
+    x.arm = () => {
       const ms = deadline - performance.now();
       if (ms <= 0) { x.t = null; x.fired = true; notify(); return; }
-      x.t = setTimeout(arm, Math.min(Math.ceil(ms), 0x7fffffff));
+      x.t = setTimeout(x.arm, Math.min(Math.ceil(ms), 0x7fffffff));
     };
     const h = newHandle(x);
     // (first in the event loop's next turn, even when due: libuv runs a timer of 0 there, so
     // that `sleep(0)` lets the host's other events progress)
-    x.t = setImmediate(arm);
-    x.immediate = true;
+    starting.push(x);
+    if (turn === null) turn = setImmediate(turned);
     return h;
   }
+  // the event loop turned: the timers started since its last turn are all armed at once (a
+  // poll woken by one of them then sees each of them that is due, in the order of deadlines)
+  const starting = [];
+  let turn = null;
+  function turned() {
+    turn = null;
+    const xs = starting.splice(0);
+    for (const x of xs) x.starting = false;
+    for (const x of xs) if (!x.fired && !x.closed) x.arm();
+  }
   function disarm(x) {
-    if (x.t !== null) (x.immediate ? clearImmediate : clearTimeout)(x.t);
+    if (x.t !== null) clearTimeout(x.t);
     x.t = null;
   }
 
@@ -412,6 +422,12 @@ export function makeJuliaIOEvents(opts = {}) {
     ready.sort((a, b) => a.at - b.at || a.h - b.h);
     return ready.slice(0, cap).map((r) => r.h);
   }
+  // a timer due that waits for the event loop's turn still: a poll that waits returns after
+  // it, so that the timers due are all in its answer, in their order
+  const startingDue = (interest) => interest.some((h) => {
+    const x = handles.get(h);
+    return x && x.starting && !x.fired && performance.now() >= x.deadline;
+  });
   const anyPending = (interest) => interest.some((h) => { const x = handles.get(h); return x && isPending(x); });
   function writeReady(list, off) {
     const dv = view();
@@ -432,8 +448,8 @@ export function makeJuliaIOEvents(opts = {}) {
       const interest = Array.from({ length: n_interest }, (_, i) => idv.getInt32(4 * i, true));
       checkRange(out_off, 4 * cap, 4);
       const ready = readyOf(interest, cap);
-      if (ready.length || timeout_ns === 0n) return writeReady(ready, out_off);
-      if (timeout_ns === -1n && !anyPending(interest))
+      if (timeout_ns === 0n || (ready.length && !startingDue(interest))) return writeReady(ready, out_off);
+      if (!ready.length && timeout_ns === -1n && !anyPending(interest))
         throw new GuestError(E.INVAL, 'poll: waiting indefinitely, but no handle of the interest set can become ready');
       return suspend(interest, timeout_ns, out_off, cap);
     } catch (e) {
@@ -449,18 +465,20 @@ export function makeJuliaIOEvents(opts = {}) {
       if (timeout_ns > 0n) {
         // (armed again until the deadline: a timeout is at most 2^31 - 1 ms, 24.8 days)
         const deadline = performance.now() + Number(timeout_ns) / 1e6;
-        const arm = () => {
+        // (the first time in a turn of its own, whatever is left: the poll waits by then)
+        const arm = (first) => {
           const ms = deadline - performance.now();
-          if (ms <= 0) { pollTimer = null; timedOut = true; notify(); return; }
-          pollTimer = setTimeout(arm, Math.min(Math.ceil(ms), 0x7fffffff));
+          if (ms <= 0 && first !== true) { pollTimer = null; timedOut = true; notify(); return; }
+          pollTimer = setTimeout(arm, Math.min(Math.max(Math.ceil(ms), 0), 0x7fffffff));
         };
-        arm();
+        arm(true);
       }
       for (;;) {
         await new Promise((r) => { waker = r; });
         waker = null;
         const ready = readyOf(interest, cap);
-        if (ready.length || timedOut) return writeReady(ready, out_off);
+        // (a starting timer that is due is armed, and wakes the poll, within a turn)
+        if ((ready.length || timedOut) && !startingDue(interest)) return writeReady(ready, out_off);
         if (timeout_ns === -1n && !anyPending(interest)) {
           lastError = 'poll: no handle of the interest set can become ready any more';
           return -E.INVAL;
@@ -538,6 +556,8 @@ export function makeJuliaIOEvents(opts = {}) {
       waker = null;
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
       for (const x of handles.values()) disarm(x);
+      if (turn !== null) { clearImmediate(turn); turn = null; }
+      starting.length = 0;
     },
   };
 }

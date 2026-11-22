@@ -17,6 +17,8 @@ operation depends on belong in `key`, not in `args`.
 function call_outlined!(fc::FnCtx, key, name, args::Vector{CGVal}, @nospecialize(T), body)
     cgm = fc.cgm
     lt = layout(fc, T)
+    failed = get(cgm.helpers, (:outline_unsupported, key), nothing)
+    failed === nothing || throw(Unsupported(failed...))
     f = get(cgm.helpers, key, nothing)
     if f === nothing
         params = ValType[]
@@ -41,12 +43,15 @@ function call_outlined!(fc::FnCtx, key, name, args::Vector{CGVal}, @nospecialize
         end
         r = try
             body(hfc, hargs)
-        catch
-            # (a helper whose body cannot be compiled traps, should its caller trap instead)
+        catch err
+            err isa Unsupported || rethrow()
+            # (a helper whose body cannot be compiled traps, as its callers do: each of them
+            # reports the construct)
             empty!(f.body)
             hb = Builder(cgm.mod, f)
             unreachable!(hb)
             finish!(hb)
+            cgm.helpers[(:outline_unsupported, key)] = copy(err.parts)
             rethrow()
         end
         if !is_unreachable(hfc.b)
@@ -109,6 +114,7 @@ function outlined_memoryrefnew!(fc::FnCtx, args::Vector{Any})
     x = args[1]::CGVal
     (length(args) >= 2 && is_memoryref_type(x.typ)) || return emit_memoryrefnew!(fc, args)
     R = x.typ
+    check_memory_index!(fc, args[2]::CGVal) || return bottom()
     i = convert_repr(fc, args[2]::CGVal, Int)
     b = length(args) >= 3 ? boundscheck_value(args[3]) : true
     return call_outlined!(fc, (:memoryrefnew, R, b), () -> "memoryrefnew_" * typename_str(ref_eltype(R)),

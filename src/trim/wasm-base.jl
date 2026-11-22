@@ -18,9 +18,11 @@ let Runtime = WasmCodegen.Runtime
                 return _reinterpret_padding(Out, x)
             end
         end
-        # a call in the latest world (to keep it unspecialized natively): a direct call, which
-        # specializes it on the type, so its reflection is done at compile time
-        _typeinfo_implicit(@nospecialize(T)) = typeinfo_implicit(T)::Bool
+        # a call in the latest world (to keep it unspecialized natively): a table of the
+        # module's types (`typeinfo_implicit` reflects on the type, and packages add methods
+        # to it, so its calls on the types of fields are dynamic)
+        _typeinfo_implicit(@nospecialize(T)) =
+            $(Runtime.map_type)($(Runtime.typeinfo_implicit), T) === $(Runtime.ImplicitTypeinfo)
         # printing a type: juliac's (which reflects on the type, see juliac-trim-base.jl),
         # computed at compile time: a constant for a type known then, else from a table of
         # the module's types (`Runtime.simple_type_name`, the same text as `_show_type`)

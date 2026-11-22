@@ -13,6 +13,23 @@ struct ImplibError <: Exception end
 Base.showerror(io::IO, ::ImplibError) = (ccall((:note, "implib_test"), Cvoid, (UInt32,), UInt32(9)); print(io, "noted"))
 implib_error_text(x::UInt32) = UInt32(length(WasmCodegen.Runtime.Host.error_text(ImplibError()))) + x
 
+# an import called in a handler calls an export that throws, and catches it: the handler's
+# exception is the current one still
+struct ImplibOuter <: Exception end
+implib_boom() = error("inner")
+function implib_reentrant()
+    try
+        try
+            throw(ImplibOuter())
+        catch
+            ccall((:callback, "implib_test"), Cvoid, ())
+            rethrow()
+        end
+    catch e
+        return e isa ImplibOuter ? 1 : 2
+    end
+end
+
 import_list(c) = sort!([(f.imported[1], f.imported[2], f.params, f.results)
                         for f in c.cgm.mod.funcs if f.imported !== nothing &&
                             f.imported[1] != "wasi_snapshot_preview1"]; by = x -> (x[1], x[2]))
@@ -98,6 +115,13 @@ function jsb_log(line)
     name == "text" && return (name, parse.(Int, w[2:3]), join(w[4:end], ' '))
     nints = length(w) - 1 - nbytes
     return (name, parse.(Int, w[2:1+nints]), [base64decode(x) for x in w[2+nints:end]])
+end
+
+@testset "an export that throws, called in a handler" begin
+    c = WasmCodegen.compile([(implib_reentrant, ()), (implib_boom, ())];
+                            config = WasmCodegen.Config(host = :wasi, import_libraries = ["implib_test"]))
+    libs = "{ implib_test: { callback: () => { try { instance.exports.implib_boom(); } catch { log.push('caught'); } } } }"
+    @test run_import_libraries(c, "implib_reentrant", libs) == ("1", ["caught"])
 end
 
 @testset "bytes for the host" begin

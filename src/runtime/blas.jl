@@ -49,19 +49,17 @@ function dot(n::Int, X::ArrayArg{T}, incx::Int, Y::ArrayArg{T}, incy::Int) where
     return s
 end
 
-# the 2-norm, scaled against overflow and underflow
-function nrm2(n::Int, X::ArrayArg{T}, incx::Int) where {T}
-    (n < 1 || incx < 1) && return zero(T)
-    n == 1 && return abs(ld(X, 1))
+# the 2-norm of the `n` values `x(1)`...`x(n)`, scaled against overflow and underflow
+@inline function norm2(x, ::Type{T}, n::Int) where {T}
     scale, ssq = zero(T), one(T)
     inf = false
     for j in 1:n
-        x = ld(X, 1 + (j - 1) * incx)
+        v = x(j)::T
         # (an infinity makes the norm infinite, unless there is a NaN)
-        isinf(x) && (inf = true; continue)
-        isnan(x) && return x
-        if x != 0
-            a = abs(x)
+        isinf(v) && (inf = true; continue)
+        isnan(v) && return v
+        if v != 0
+            a = abs(v)
             if scale < a
                 ssq = one(T) + ssq * (scale / a)^2
                 scale = a
@@ -72,6 +70,14 @@ function nrm2(n::Int, X::ArrayArg{T}, incx::Int) where {T}
     end
     inf && return T(Inf)
     return scale * sqrt(ssq)
+end
+
+# (a negative increment takes the elements from the end; a zero one the first `n` times, as
+# reference BLAS does: versions of OpenBLAS differ there)
+function nrm2(n::Int, X::ArrayArg{T}, incx::Int) where {T}
+    n < 1 && return zero(T)
+    n == 1 && return abs(ld(X, 1))
+    return norm2(j -> ld(X, pos(j, n, incx)), T, n)
 end
 
 function asum(n::Int, X::ArrayArg{T}, incx::Int) where {T}

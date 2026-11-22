@@ -2,8 +2,8 @@
 #
 # Integers narrower than 32 bits live in an `i32`, zero-extended (their bits, and zeros
 # above): the arithmetic that can set the bits above masks its result, and operations that
-# depend on the sign sign-extend their operands first. 128-bit integers are not supported
-# yet.
+# depend on the sign sign-extend their operands first. 128-bit integers are two `i64`s
+# (`intrinsics128.jl`).
 
 const II = Core.Intrinsics
 
@@ -48,6 +48,13 @@ end
 function push_signed!(fc::FnCtx, v::CGVal)
     push_val!(fc, v)
     sext!(fc, v.typ)
+end
+
+# the Wasm type of the float type `T` of a float intrinsic: of Float32 and Float64 (Float16
+# is `emit_float16!`'s); the floats of other primitive types (`Core.BFloat16`) are not Wasm's
+function float_wtype(fc::FnCtx, @nospecialize(T))
+    T === Float32 || T === Float64 || unsupported("a float intrinsic on values of type ", T)
+    return prim_wtype(fc, T)
 end
 
 const INT_BINOPS = Dict(II.add_int => "add", II.sub_int => "sub", II.mul_int => "mul",
@@ -100,11 +107,14 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         return is_ptr_type(typ) ? int_ptr!(fc, typ, r) : r
     end
     if all(isconstant, args) && !(f in NO_FOLD)
-        # fold (as inference would have, had it known)
-        try
-            return const_value(fc, f(map(constant_value, args)...))
+        # fold (as inference would have, had it known); an intrinsic that throws on its
+        # constants is emitted, to throw at run time
+        v = try
+            Some(f(map(constant_value, args)...))
         catch
+            nothing
         end
+        v === nothing || return const_value(fc, something(v))
     end
     if !(f in NO_FOLD) && (any(a -> is128(a.typ), args) || (typ isa Type && is128(typ) && f !== II.bitcast))
         r = emit_intrinsic128!(fc, f, args, typ)
@@ -139,19 +149,19 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         return pop_val!(fc, Bool)
     elseif haskey(FLOAT_BINOPS, f)
         a, b = args
-        t = prim_wtype(fc, a.typ)
+        t = float_wtype(fc, a.typ)
         push_val!(fc, a); push_val!(fc, b)
         emit!(fc.b, wop(t, FLOAT_BINOPS[f]))
         return pop_val!(fc, a.typ)
     elseif haskey(FLOAT_CMPS, f)
         a, b = args
-        t = prim_wtype(fc, a.typ)
+        t = float_wtype(fc, a.typ)
         push_val!(fc, a); push_val!(fc, b)
         emit!(fc.b, wop(t, FLOAT_CMPS[f]))
         return pop_val!(fc, Bool)
     elseif haskey(FLOAT_UNOPS, f)
         a = args[1]
-        t = prim_wtype(fc, a.typ)
+        t = float_wtype(fc, a.typ)
         push_val!(fc, a)
         emit!(fc.b, wop(t, FLOAT_UNOPS[f]))
         return pop_val!(fc, a.typ)
@@ -160,7 +170,7 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         return call_runtime!(fc, Base.fma_emulated, args)
     elseif f === II.muladd_float
         a, b, c = args
-        t = prim_wtype(fc, a.typ)
+        t = float_wtype(fc, a.typ)
         push_val!(fc, a); push_val!(fc, b)
         emit!(fc.b, wop(t, "mul"))
         push_val!(fc, c)
@@ -194,7 +204,7 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         return emit_int_conversion!(fc, f, constant_value(args[1]), args[2])
     elseif f === II.sitofp || f === II.uitofp
         R = constant_value(args[1]); a = args[2]
-        tr, ta = prim_wtype(fc, R), prim_wtype(fc, a.typ)
+        tr, ta = float_wtype(fc, R), prim_wtype(fc, a.typ)
         f === II.sitofp ? push_signed!(fc, a) : push_val!(fc, a)
         emit!(fc.b, Symbol(wprefix(tr), "_convert_", wprefix(ta), f === II.sitofp ? "_s" : "_u"))
         return pop_val!(fc, R)
@@ -202,7 +212,7 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         # Julia checks the range before converting (`trunc`): the saturating conversions
         # never trap where the result is undefined
         R = constant_value(args[1]); a = args[2]
-        tr, ta = prim_wtype(fc, R), prim_wtype(fc, a.typ)
+        tr, ta = prim_wtype(fc, R), float_wtype(fc, a.typ)
         push_val!(fc, a)
         emit!(fc.b, Symbol(wprefix(tr), "_trunc_sat_", wprefix(ta), f === II.fptosi ? "_s" : "_u"))
         mask!(fc, R)
@@ -220,7 +230,7 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
     elseif f === II.fpiseq
         # isequal on floats: the same bits, or both NaN
         a, b = args
-        t = prim_wtype(fc, a.typ)
+        t = float_wtype(fc, a.typ)
         it = t === F64 ? I64 : I32
         push_val!(fc, a); emit!(fc.b, Symbol(wprefix(it), "_reinterpret_", wprefix(t)))
         push_val!(fc, b); emit!(fc.b, Symbol(wprefix(it), "_reinterpret_", wprefix(t)))
@@ -547,7 +557,8 @@ end
 
 The intrinsic `f` on Float16 values (Wasm has no half-precision arithmetic): computed in
 Float32 and rounded back to Float16, as LLVM legalizes it, which is exact for the basic
-operations (Float32 has more than twice the bits). Conversions round once.
+operations (Float32 has more than twice the bits). Conversions round once, and `muladd`
+rounds its product (it is not fused, as where LLVM legalizes it to a product and a sum).
 """
 function emit_float16!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{CGVal}, @nospecialize(typ))
     if f === II.fptrunc
@@ -575,6 +586,8 @@ function emit_float16!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{CGVal}
             emit!(fc.b, :i32_or)
         end
         return emit_bitcast!(fc, Float16, pop_val!(fc, UInt16))
+    elseif f === II.muladd_float
+        return emit_float16!(fc, II.add_float, CGVal[emit_float16!(fc, II.mul_float, args[1:2], typ), args[3]], typ)
     end
     xs = Any[a.typ === Float16 ? float16_to_32!(fc, a) : (isconstant(a) && constant_value(a) === Float16 ? const_value(fc, Float32) : a)
              for a in args]
@@ -600,13 +613,31 @@ end
 const ATOMICRMW_OPS = Dict("add" => II.add_int, "sub" => II.sub_int, "and" => II.and_int,
                            "or" => II.or_int, "xor" => II.xor_int)
 
+# The LLVM IR of `Threads.Atomic`'s operations, as Julia 1.12 writes it (`base/atomics.jl`),
+# its lines joined by single spaces: the kind of operation => the whole text, with the LLVM
+# type of the value (`T`), of its bits (`I`, for the operations on floats through their
+# bits) and the `atomicrmw` operation (`op`) captured.
+const ATOMIC_LLVMCALLS = [
+    :load => r"^%ptr = bitcast i8\* %0 to (?<T>\w+)\* %rv = load atomic \k<T>, \k<T>\* %ptr acquire, align \d+ ret \k<T> %rv$",
+    :store => r"^%ptr = bitcast i8\* %0 to (?<T>\w+)\* store atomic \k<T> %1, \k<T>\* %ptr release, align \d+ ret void$",
+    :cmpxchg => r"^%ptr = bitcast i8\* %0 to (?<T>\w+)\* %rs = cmpxchg \k<T>\* %ptr, \k<T> %1, \k<T> %2 acq_rel acquire %rv = extractvalue \{ \k<T>, i1 \} %rs, 0 ret \k<T> %rv$",
+    :cmpxchg => r"^%iptr = bitcast i8\* %0 to (?<I>\w+)\* %icmp = bitcast (?<T>\w+) %1 to \k<I> %inew = bitcast \k<T> %2 to \k<I> %irs = cmpxchg \k<I>\* %iptr, \k<I> %icmp, \k<I> %inew acq_rel acquire %irv = extractvalue \{ \k<I>, i1 \} %irs, 0 %rv = bitcast \k<I> %irv to \k<T> ret \k<T> %rv$",
+    :atomicrmw => r"^%ptr = bitcast i8\* %0 to (?<T>\w+)\* %rv = atomicrmw (?<op>\w+) \k<T>\* %ptr, \k<T> %1 acq_rel ret \k<T> %rv$",
+    :atomicrmw => r"^%iptr = bitcast i8\* %0 to (?<I>\w+)\* %ival = bitcast (?<T>\w+) %1 to \k<I> %irv = atomicrmw (?<op>xchg) \k<I>\* %iptr, \k<I> %ival acq_rel %rv = bitcast \k<I> %irv to \k<T> ret \k<T> %rv$",
+]
+
+# the LLVM type of the primitive type `T` in `Threads.Atomic`'s IR
+llvm_type_name(@nospecialize(T)) =
+    T === Float16 ? "half" : T === Float32 ? "float" : T === Float64 ? "double" : string("i", 8sizeof(T))
+
 """
     emit_llvmcall!(fc, args, R) -> CGVal
 
 `llvmcall(ir, R, argtypes, args...)`, of the LLVM IR of `Threads.Atomic`'s operations (Julia
-1.12 writes them so): an atomic load, store, `cmpxchg` or `atomicrmw` through the pointer
-that is the first argument. With one thread, the loads and stores they are. Other IR is
-unsupported.
+1.12 writes them so, `ATOMIC_LLVMCALLS`): an atomic load, store, `cmpxchg` or `atomicrmw`
+through the pointer that is the first argument. With one thread, the loads and stores they
+are. Other IR is unsupported: the IR is not interpreted, it is recognized whole, with the
+types of its arguments and result.
 """
 function emit_llvmcall!(fc::FnCtx, args::Vector{CGVal}, @nospecialize(R))
     ir = isconstant(args[1]) ? constant_value(args[1]) : nothing
@@ -615,15 +646,26 @@ function emit_llvmcall!(fc::FnCtx, args::Vector{CGVal}, @nospecialize(R))
     (ir isa String && !isempty(vals) && is_ptr_type(vals[1].typ)) || unsupported("the intrinsic llvmcall")
     p = vals[1]
     T = eltype(p.typ)
+    text = join(split(ir), ' ')
+    kind = m = nothing
+    for (k, re) in ATOMIC_LLVMCALLS
+        m = match(re, text)
+        m === nothing || (kind = k; break)
+    end
+    # (the value's type is the pointer's, and the arguments and the result are of it)
+    (kind !== nothing && isprimitivetype(T) && m[:T] == llvm_type_name(T) &&
+     length(vals) == (kind === :load ? 1 : kind === :cmpxchg ? 3 : 2) &&
+     all(v -> v.typ === T, vals[2:end]) && R === (kind === :store ? Nothing : T)) ||
+        unsupported("the intrinsic llvmcall (only the LLVM IR of Threads.Atomic's operations is)")
     one_ = const_value(fc, 1)
-    if occursin("load atomic", ir)
+    if kind === :load
         return ptr_load!(fc, p, one_, T)
-    elseif occursin("store atomic", ir)
+    elseif kind === :store
         ptr_store!(fc, p, convert_repr(fc, vals[2], T), one_)
         return ghost(Nothing, nothing)
     end
     old = ptr_load!(fc, p, one_, T)
-    if occursin("cmpxchg", ir)
+    if kind === :cmpxchg
         # (compared by their bits, as `cmpxchg` compares)
         I = T <: AbstractFloat ? Base.uinttype(T) : T
         bits(v) = I === T ? v : emit_intrinsic!(fc, II.bitcast, Any[const_value(fc, I), v], I)
@@ -632,9 +674,7 @@ function emit_llvmcall!(fc::FnCtx, args::Vector{CGVal}, @nospecialize(R))
         if!(fc.b); ptr_store!(fc, p, convert_repr(fc, vals[3], T), one_); end!(fc.b)
         return old
     end
-    m = match(r"atomicrmw (\w+)", ir)
-    m === nothing && unsupported("the intrinsic llvmcall")
-    op, v = m[1], convert_repr(fc, vals[2], T)
+    op, v = m[:op], convert_repr(fc, vals[2], T)
     new = if op == "xchg"
         v
     elseif haskey(ATOMICRMW_OPS, op)

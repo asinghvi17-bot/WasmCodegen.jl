@@ -71,7 +71,7 @@ dyn_count(n::Int) = dyn_eq(cyc_id(Any[Any[n], Int[2]]), cyc_id(Any[Any[n], Int[2
     args = VERSION >= v"1.13-" ? (WasmCodegen.CC.TRIM_UNSAFE, false) : (WasmCodegen.CC.TRIM_UNSAFE,)
     raw = WasmCodegen.CC.typeinf_ext_toplevel(Any[mi], UInt[Base.get_world_counter()], args...)
     # (the case: native inference leaves invokes of instances without code)
-    @test !isempty(WasmCodegen.uncompiled_invoke_targets(raw))
+    @test !isempty(WasmCodegen.uncompiled_invoke_targets(raw, Base.get_world_counter()))
     report = WasmCodegen.trim_check([mi])
     @test !occursin("unresolved invoke", report)
     @wtest cyc_count(3)
@@ -92,4 +92,21 @@ dyn_count(n::Int) = dyn_eq(cyc_id(Any[Any[n], Int[2]]), cyc_id(Any[Any[n], Int[2
         e
     end
     @test err isa WasmCodegen.TrimFailure && occursin("unresolved invoke", err.report)
+end
+
+# the code a program's invokes are linked to is the code of the program's world: of a world
+# before a method was redefined, the code that redefinition invalidated
+@noinline world_callee(x) = x + 1
+world_caller(x) = world_callee(x) * 2
+
+@testset "trim_check: the code of the program's world" begin
+    w = Base.get_world_counter()
+    mi = WasmCodegen.entry_instance(world_caller, (Int,); world = w)
+    code = Base.invoke_in_world(WasmCodegen.COMPILER_WORLD[], WasmCodegen.verify_inference, Any[mi], w, ())
+    @test haskey(WasmCodegen.linkable_code(code, w), mi)
+    @eval world_callee(x) = x + 2
+    @test haskey(WasmCodegen.linkable_code(code, w), mi)
+    @test !haskey(WasmCodegen.linkable_code(code, Base.get_world_counter()), mi)
+    c = WasmCodegen.compile(world_caller, (Int,); world = w, config = test_config(verify = :error))
+    @test wasm_run(c, "world_caller", 3; rettype = Int) === 8
 end

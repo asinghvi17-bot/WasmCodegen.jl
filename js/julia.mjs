@@ -30,7 +30,7 @@
 //     imports: (host) => ({ mylib: { send: (p, n) => deliver(host.bytes(p, n).slice()) } }),
 //   });
 
-const WASI_EBADF = 8, WASI_EINVAL = 28, WASI_ENOSYS = 52, WASI_ENOTDIR = 54, WASI_ENOTSOCK = 57,
+const WASI_EBADF = 8, WASI_EFAULT = 21, WASI_EINVAL = 28, WASI_ENOSYS = 52, WASI_ENOTDIR = 54, WASI_ENOTSOCK = 57,
   WASI_ENOTSUP = 58, WASI_ESPIPE = 70;
 const FILETYPE_CHARACTER_DEVICE = 2;
 const FDFLAG_APPEND = 1, FDFLAG_NONBLOCK = 4;
@@ -106,6 +106,22 @@ export function createHost({ write, args = [], env = {}, imports = {} } = {}) {
   const environ = cStrings(Object.entries(env).filter(([, v]) => v !== undefined).map(([k, v]) => `${k}=${v}`));
   let memory = null;
   const view = () => new DataView(memory.buffer);
+  // whether the `len` bytes at `ptr` are in the module's memory. An offset or a length the
+  // module gives is an i32, which is signed here: `>>> 0` of it first. A function checks all
+  // its ranges before it writes any (WASI's EFAULT for one outside the memory).
+  const has = (ptr, len) => ptr + len <= memory.buffer.byteLength;
+  // the ranges of the `n` iovecs at `iovs`, as [offset, length]s; null with one, or the
+  // iovecs, outside the memory
+  const iovecs = (iovs, n) => {
+    if (!has(iovs, 8 * n)) return null;
+    const v = view(), ranges = [];
+    for (let i = 0; i < n; i++) {
+      const ptr = v.getUint32(iovs + 8 * i, true), len = v.getUint32(iovs + 8 * i + 4, true);
+      if (!has(ptr, len)) return null;
+      ranges.push([ptr, len]);
+    }
+    return ranges;
+  };
   const julia = {
     write_byte: (fd, b) => out(fd, Uint8Array.of(b)),
     entropy: () => {
@@ -121,12 +137,16 @@ export function createHost({ write, args = [], env = {}, imports = {} } = {}) {
     },
   };
   const sizes = (strs, countPtr, sizePtr) => {
+    countPtr >>>= 0; sizePtr >>>= 0;
+    if (!has(countPtr, 4) || !has(sizePtr, 4)) return WASI_EFAULT;
     const v = view();
     v.setUint32(countPtr, strs.length, true);
     v.setUint32(sizePtr, strs.reduce((n, x) => n + x.length, 0), true);
     return 0;
   };
   const strings = (strs, ptrs, buf) => {
+    ptrs >>>= 0; buf >>>= 0;
+    if (!has(ptrs, 4 * strs.length) || !has(buf, strs.reduce((n, x) => n + x.length, 0))) return WASI_EFAULT;
     const v = view(), bytes = new Uint8Array(memory.buffer);
     strs.forEach((x, i) => {
       v.setUint32(ptrs + 4 * i, buf, true);
@@ -151,24 +171,27 @@ export function createHost({ write, args = [], env = {}, imports = {} } = {}) {
     environ_get: (ptrs, buf) => strings(environ, ptrs, buf),
     fd_write: onFd((fd, iovs, iovsLen, nwrittenPtr) => {
       if (fd === 0) return WASI_EBADF;
+      nwrittenPtr >>>= 0;
+      const ranges = iovecs(iovs >>> 0, iovsLen >>> 0);
+      if (ranges === null || !has(nwrittenPtr, 4)) return WASI_EFAULT;
+      // (the bytes copied before any is written: `write` may grow the memory)
+      const chunks = ranges.map(([ptr, len]) => new Uint8Array(memory.buffer, ptr, len).slice());
       let n = 0;
-      // (the memory read again after each write: `write` may grow it)
-      for (let i = 0; i < iovsLen; i++) {
-        const v = view();
-        const ptr = v.getUint32(iovs + 8 * i, true), len = v.getUint32(iovs + 8 * i + 4, true);
-        out(fd, new Uint8Array(memory.buffer, ptr, len).slice());
-        n += len;
-      }
+      for (const chunk of chunks) { out(fd, chunk); n += chunk.length; }
       view().setUint32(nwrittenPtr, n, true);
       return 0;
     }),
     // (stdin is empty: the end of the file)
     fd_read: onFd((fd, iovs, iovsLen, nreadPtr) => {
       if (fd !== 0) return WASI_EBADF;
+      nreadPtr >>>= 0;
+      if (iovecs(iovs >>> 0, iovsLen >>> 0) === null || !has(nreadPtr, 4)) return WASI_EFAULT;
       view().setUint32(nreadPtr, 0, true);
       return 0;
     }),
     fd_fdstat_get: onFd((fd, ptr) => {
+      ptr >>>= 0;
+      if (!has(ptr, 24)) return WASI_EFAULT;
       const v = view();
       new Uint8Array(memory.buffer, ptr, 24).fill(0);
       v.setUint8(ptr, FILETYPE_CHARACTER_DEVICE);
@@ -178,6 +201,8 @@ export function createHost({ write, args = [], env = {}, imports = {} } = {}) {
       return 0;
     }),
     fd_filestat_get: onFd((fd, ptr) => {
+      ptr >>>= 0;
+      if (!has(ptr, 64)) return WASI_EFAULT;
       new Uint8Array(memory.buffer, ptr, 64).fill(0);
       const v = view(), s = streams[fd];
       v.setUint8(ptr + 16, FILETYPE_CHARACTER_DEVICE);
@@ -202,18 +227,24 @@ export function createHost({ write, args = [], env = {}, imports = {} } = {}) {
     fd_prestat_get: () => WASI_EBADF,
     fd_prestat_dir_name: () => WASI_EBADF,
     random_get(ptr, len) {
+      ptr >>>= 0; len >>>= 0;
+      if (!has(ptr, len)) return WASI_EFAULT;
       fillRandom(new Uint8Array(memory.buffer, ptr, len));
       return 0;
     },
     clock_time_get(id, precision, ptr) {
       const t = clockNs(id);
       if (t === null) return WASI_EINVAL;
+      ptr >>>= 0;
+      if (!has(ptr, 8)) return WASI_EFAULT;
       view().setBigUint64(ptr, t, true);
       return 0;
     },
     // (a millisecond: hosts may coarsen `performance.now()` to it)
     clock_res_get(id, ptr) {
       if (clockNs(id) === null) return WASI_EINVAL;
+      ptr >>>= 0;
+      if (!has(ptr, 8)) return WASI_EFAULT;
       view().setBigUint64(ptr, 1000000n, true);
       return 0;
     },

@@ -58,6 +58,23 @@ read_state() = state
 untrimmable(n::Int) = Base.inferencebarrier(n) + 1
 end
 
+# a method of `Base.typeinfo_implicit` defined in the session, after its patches: the program's
+@testset "a method defined in a session" begin
+    WasmCodegen.with_trim_patches() do _, _
+        @eval PatchTarget begin
+            struct Mark
+                n::Int
+            end
+            Base.show(io::IO, m::Mark) = print(io, "Mark(", m.n, ")")
+            Base.typeinfo_implicit(::Type{Mark}) = true
+            marks(n::Int) = (show(Core.stdout, [Mark(n)]); Int32(0))
+        end
+        c = Base.invokelatest(wcompile, Base.invokelatest(getglobal, PatchTarget, :marks), (Int,))
+        @test wasm_run(c, "marks", 3; rettype=Int32) == 0
+        @test LAST_OUTPUT[] == "[Mark(3)]"
+    end
+end
+
 @testset "pre-image hooks and the interface version" begin
     H = HookTarget
     calls = String[]

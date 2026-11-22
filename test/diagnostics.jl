@@ -57,6 +57,22 @@ end
           occursin(r"in MethodInstance for \S*apply_dynamic\(::", report)
     @test sizeof(report) < 10maxlen
 
+    # a helper whose body is unsupported: every caller reports it (none calls the trapping
+    # helper unseen), and an error that is not an unsupported construct is not taken for one
+    let cgm = WasmCodegen.compile(B.loop, (Int,); config = test_config(optimize = nothing)).cgm
+        info = first(values(cgm.funcs))
+        ctx() = WasmCodegen.FnCtx(cgm, info, nothing, WasmCodegen.Builder(cgm.mod,
+                    WasmCodegen.add_func!(cgm.mod, WasmCodegen.helper_name(cgm, "t"), WasmCodegen.ValType[], WasmCodegen.ValType[])))
+        outlined(key, body) = WasmCodegen.call_outlined!(ctx(), key, "t_helper", WasmCodegen.CGVal[], Nothing, body)
+        for _ in 1:2
+            @test try outlined(:t_unsupported, (hfc, hargs) -> WasmCodegen.unsupported("a thing")); false catch e
+                e isa WasmCodegen.Unsupported && sprint(showerror, e) == sprint(showerror, WasmCodegen.Unsupported("a thing")) && isempty(e.context)
+            end
+        end
+        @test_throws ErrorException outlined(:t_error, (hfc, hargs) -> error("a bug"))
+        @test !haskey(cgm.helpers, (:outline_unsupported, :t_error))
+    end
+
     # method and code instances in a statement: printed as `show` prints them, rendering no more
     # of their signatures than is printed
     B.id(1)
@@ -106,4 +122,8 @@ end
     @test occursin("boxing the ghost Nothing without its value", msg)
     @test occursin("in the result of :(\$(Expr(:invoke, MethodInstance for ", msg) && occursin("id(::", msg)
     @test sizeof(msg) < 3maxlen
+
+    # the kind of an argument of a C function the runtime implements, misspelled
+    @test WasmCodegen.RuntimeCcall(identity, [:val, :skip]).args == [:val, :skip]
+    @test_throws ArgumentError WasmCodegen.RuntimeCcall(identity, [:val, :ignore])
 end

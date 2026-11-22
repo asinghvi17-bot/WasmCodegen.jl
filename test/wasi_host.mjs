@@ -127,4 +127,71 @@ gh.attach({ exports: { memory: growing } });
 }
 check('fd_write growing the memory', gh.imports.wasi_snapshot_preview1.fd_write(1, 0, 2, 16), 0);
 check('written', [grown, new DataView(growing.buffer).getUint32(16, true)], [[[104, 105], [33]], 3]);
+
+// a range outside the memory: EFAULT, nothing written to the stream or the memory
+{
+  const EFAULT = 21, END = memory.buffer.byteLength, out = [];
+  const fh = createHost({ env: { A: '1' }, write: (fd, b) => out.push([fd, ...b]) });
+  fh.attach({ exports: { memory } });
+  const w = fh.imports.wasi_snapshot_preview1;
+  fresh();
+  view().setUint32(0, 100, true); view().setUint32(4, 2, true);          // a good iovec
+  view().setUint32(8, END - 4, true); view().setUint32(12, 100, true);   // its bytes past the end
+  check('fd_write: bytes outside the memory', w.fd_write(1, 0, 2, 16), EFAULT);
+  check('fd_write: iovecs outside the memory', w.fd_write(1, END - 4, 1, 16), EFAULT);
+  check('fd_write: count outside the memory', w.fd_write(1, 0, 1, END - 2), EFAULT);
+  check('fd_write: more iovecs than the memory holds', w.fd_write(1, 0, 0x7fffffff, 16), EFAULT);
+  check('nothing written', out, []);
+  for (const [what, f] of [['fd_read', () => w.fd_read(0, 0, 0, END - 2)], ['random_get', () => w.random_get(END - 4, 100)],
+                           ['random_get, negative', () => w.random_get(-8, 4)],
+                           ['clock_time_get', () => w.clock_time_get(0, 0n, END - 4)], ['clock_res_get', () => w.clock_res_get(0, END - 4)],
+                           ['fd_fdstat_get', () => w.fd_fdstat_get(1, END - 8)], ['fd_filestat_get', () => w.fd_filestat_get(1, END - 8)],
+                           ['args_sizes_get', () => w.args_sizes_get(END - 2, 0)], ['environ_get', () => w.environ_get(END - 2, 0)]]) {
+    check(`${what}: outside the memory`, f(), EFAULT);
+  }
+  // (nothing written before the range that is outside: the count, the pointers, the strings)
+  const ah = createHost({ args: ['a', 'b'] });
+  ah.attach({ exports: { memory } });
+  const aw = ah.imports.wasi_snapshot_preview1;
+  fresh();
+  check('args_sizes_get: the size outside the memory', aw.args_sizes_get(0, END - 2), EFAULT);
+  check('args_get: the strings outside the memory', aw.args_get(0, END - 2), EFAULT);
+  check('args_get: the pointers outside the memory', aw.args_get(END - 4, 16), EFAULT);
+  check('nothing written to the memory', Array.from(new Uint8Array(memory.buffer, 0, 32)), Array(32).fill(SENTINEL));
+  // (the iovecs of a read, and their buffers, though nothing is read into them)
+  check('fd_read: iovecs outside the memory', w.fd_read(0, END - 4, 1, 0), EFAULT);
+  view().setUint32(32, END - 4, true); view().setUint32(36, 100, true);
+  check('fd_read: a buffer outside the memory', w.fd_read(0, 32, 1, 0), EFAULT);
+  check('fd_read: no count written', view().getUint32(0, true), 0xa5a5a5a5);
+  view().setUint32(36, 4, true);
+  check('fd_read: a buffer at the end of the memory', [w.fd_read(0, 32, 1, 0), view().getUint32(0, true)], [0, 0]);
+  check('random_get: an empty range at the end of the memory', w.random_get(END, 0), 0);
+  check('random_get: an empty range past it', w.random_get(END + 1, 0), EFAULT);
+}
+// offsets of the upper half of a memory of more than 2 GiB: negative i32s here
+{
+  const big = new WebAssembly.Memory({ initial: 32769 }), out = [];
+  const bh = createHost({ write: (fd, b) => out.push([fd, ...b]) });
+  bh.attach({ exports: { memory: big } });
+  const w = bh.imports.wasi_snapshot_preview1, v = new DataView(big.buffer);
+  const HALF = 0x80000000, END = big.buffer.byteLength, i32 = (x) => x | 0;
+  check('clock_res_get: an offset over 2^31', [w.clock_res_get(0, i32(HALF)), v.getBigUint64(HALF, true)], [0, 1000000n]);
+  check('random_get: an offset over 2^31', w.random_get(i32(HALF), 1), 0);
+  check('random_get: an empty range at the end of the memory', w.random_get(i32(END), 0), 0);
+  check('random_get: past the end of the memory', w.random_get(i32(END - 4), 8), 21);
+  check('fd_fdstat_get: an offset over 2^31', [w.fd_fdstat_get(1, i32(HALF + 64)), v.getUint8(HALF + 64)], [0, 2]);
+  v.setUint32(HALF + 16, HALF + 32, true); v.setUint32(HALF + 20, 2, true);
+  new Uint8Array(big.buffer).set([104, 105], HALF + 32);
+  check('fd_write: offsets over 2^31', [w.fd_write(1, i32(HALF + 16), 1, i32(HALF + 40)), v.getUint32(HALF + 40, true), out], [0, 2, [[1, 104, 105]]]);
+  check('environ_sizes_get: offsets over 2^31', [w.environ_sizes_get(i32(HALF + 48), i32(HALF + 52)), v.getUint32(HALF + 48, true)], [0, 0]);
+}
+{
+  // (an error of the host's `write` is not the module's)
+  const failing = createHost({ write: () => { throw new RangeError('host'); } });
+  failing.attach({ exports: { memory } });
+  view().setUint32(0, 100, true); view().setUint32(4, 2, true);
+  let thrown = null;
+  try { failing.imports.wasi_snapshot_preview1.fd_write(1, 0, 1, 16); } catch (e) { thrown = e.message; }
+  check('an error of write', thrown, 'host');
+}
 process.stdout.write(failures.map((f) => f + '\n').join(''));

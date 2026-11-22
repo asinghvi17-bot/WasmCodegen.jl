@@ -232,8 +232,13 @@ the sequence and never repeat a generated symbol the image holds.
 """
 const GENSYM_COUNTER = Ref{UInt32}(0)
 
-"The build process's next gensym number (natively; it takes one)."
-native_gensym_counter() = parse(UInt32, String(Base.gensym())[3:end]) + 0x1
+"The build process's next gensym number (natively; it takes one: the C runtime has no other way to read its counter)."
+function native_gensym_counter()
+    s = String(Base.gensym())
+    n = startswith(s, "##") ? tryparse(UInt32, SubString(s, 3)) : nothing
+    n === nothing && error("gensym() gave `$s`, not `##` and its counter: the C runtime's `jl_gensym` changed (see `GENSYM_COUNTER`)")
+    return n + 0x1
+end
 "Set `GENSYM_COUNTER` (natively) to the build process's next gensym number."
 sync_gensym_counter!() = (GENSYM_COUNTER[] = native_gensym_counter(); nothing)
 

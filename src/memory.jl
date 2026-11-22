@@ -67,6 +67,20 @@ end
 `memoryrefnew(mem)` (a reference to the first element) or `memoryrefnew(ref, i,
 boundscheck)` (to the element `i` from `ref`, 1-based).
 """
+# The index `i` of `memoryrefnew` is an Int: natively a TypeError for another value (a UInt64
+# has an Int's representation), thrown here for one that is not; `false` where no value of
+# its type is an Int (the error is all there is).
+function check_memory_index!(fc::FnCtx, i::CGVal)
+    i.typ <: Int && return true
+    t = emit_isa!(fc, i, Int)
+    err() = throw_error!(fc, Runtime.throw_builtin_type_error, const_value(fc, :memoryrefnew),
+                         () -> convert_repr(fc, const_value(fc, Int), Any), () -> convert_repr(fc, i, Any))
+    isconstant(t) && (err(); return false)
+    push_val!(fc, t); emit!(fc.b, :i32_eqz)
+    if!(fc.b); err(); end!(fc.b)
+    return true
+end
+
 function emit_memoryrefnew!(fc::FnCtx, args::Vector{Any})
     x = args[1]::CGVal
     orig = x
@@ -85,7 +99,8 @@ function emit_memoryrefnew!(fc::FnCtx, args::Vector{Any})
     end
     R = x.typ
     is_memoryref_type(R) || unsupported("memoryrefnew of ", R)
-    i = convert_repr(fc, args[2]::CGVal, Int)
+    check_memory_index!(fc, args[2]::CGVal) || return bottom()
+    i = index_value(fc, args[2]::CGVal)
     bc = length(args) >= 3 ? args[3]::CGVal : const_value(fc, true)
     ml = memory_layout(fc.cgm.types, ref_eltype(R))
     # the new index: ref.index + i - 1, as an i64 to check it

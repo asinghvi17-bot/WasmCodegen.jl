@@ -4,7 +4,7 @@
 
 module VersionTests
 
-using Test
+using Test, WasmCodegen
 using ..Main: wcompile, wasm_run, @wtest
 
 const VS = [v"1.2.3", v"1.2.3-alpha", v"1.2.3-alpha.1", v"1.2.3+build.7", v"1.2.3-rc.2+b5",
@@ -92,6 +92,11 @@ end
         for i in 1:N
             @test wasm_run(c, "vn_parts_hash", i; rettype=Tuple{UInt,UInt}) ==
                   (ref_hash(VS[i].prerelease, UInt(3)), ref_hash(VS[i].build, UInt(0)))
+        end
+        # (and Base's own method, which the patches' replaces: before them)
+        for i in 1:N, h in (HASH_SEED, UInt(42))
+            @test WasmCodegen.Runtime.original(hash, VS[i], h) == ref_vhash(VS[i], h)
+            @test hash(VS[i], h) == ref_vhash(VS[i], h)
         end
         c = wcompile(vn_vhash, (Int,))
         for i in 1:N

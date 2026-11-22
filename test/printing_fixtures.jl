@@ -49,6 +49,11 @@ func_printed(i::Int) = func_str(i, true)
 
 # values shown in the context of their type: a Set{String}, a Dict{String,Float64}
 # (Pair{String,Float64}), nested Dicts, a Pair in a context of another Pair type
+struct Stamp
+    t::Int
+end
+Base.show(io::IO, s::Stamp) = print(io, "Stamp(", s.t, ")")
+Base.typeinfo_implicit(::Type{Stamp}) = true
 @noinline pt_names(n::Int) = n > 1 ? Set(["a", "b"]) : Set(["c"])
 @noinline pt_values(n::Int) = n > 1 ? Dict("A" => 1.5, "B" => -2.0) : Dict("C" => 0.25)
 @noinline pt_nested(n::Int) = Dict("x" => Dict("y" => n), "z" => Dict{String,Int}())
@@ -60,6 +65,11 @@ function show_typeinfo(io::IO, n::Int)
     show(IOContext(io, :typeinfo => Pair{String,Float64}), "y" => 2.0); println(io)
     show(IOContext(io, :typeinfo => Pair{Any,Any}), "z" => n); println(io)
     show(IOContext(io, :typeinfo => Pair{String,Int}), "w" => 1 => 2); println(io)
+    # (the type of the elements is implied by their values: `typeinfo_implicit`, which has
+    # methods of packages, as Dates')
+    show(io, [n => 2.0, 3 => 4.0]); println(io)
+    show(io, [Stamp(n)]); println(io)
+    show(io, [Stamp(n) => 1]); println(io)
 end
 show_typeinfo_wasm(n::Int) = (show_typeinfo(Core.stdout, n); Int32(0))
 
